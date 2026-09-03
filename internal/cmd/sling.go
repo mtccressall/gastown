@@ -575,7 +575,19 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		// A bare formula name is not a task bead. Without this the 1-arg path
 		// misclassifies it and rejects the documented Deacon bootstrap (gt-h8j).
-		if isStandaloneFormula("") {
+		//
+		// GUARDED ON --on, AND THE GUARD IS LOAD-BEARING. The pre-existing
+		// standalone-formula return further down sits in the ELSE of
+		// `if slingOnTarget != ""`, i.e. the original structure says that when
+		// --on is set, standalone slinging is NOT the destination: the formula
+		// is meant to be attached to that bead. Without this condition,
+		// `gt sling <formula> --on <bead>` with the scheduler INACTIVE would
+		// return here and silently do a different thing.
+		//
+		// The deferred case cannot reach this — `deferred && slingOnTarget != ""`
+		// has already returned above — so this only bites with deferred false,
+		// which is precisely the configuration gt-h8j's repro never exercised.
+		if slingOnTarget == "" && isStandaloneFormula("") {
 			return runSlingFormula(ctx, args)
 		}
 		// task bead with deferred + no rig: error — must specify a rig
