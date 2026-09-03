@@ -2014,9 +2014,45 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		// Codex trust screens include a leading ">" banner line, so prompt
 		// detection alone would exit too early.
 		if containsWorkspaceTrustDialog(content) {
-			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
-			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-				return err
+			// DO NOT press Enter blindly. The old code did, on the stated
+			// assumption that "option 1 is pre-selected" and that option 1
+			// accepts. On Claude's dialog the options render as:
+			//
+			//     > No, exit
+			//       Yes, I trust this folder
+			//       Enter to confirm - Esc to cancel
+			//
+			// "No, exit" is FIRST and carries the cursor, so a bare Enter
+			// DECLINED and exited the agent — the acceptor did the opposite of
+			// its name, silently, and the session simply died. (gt-ma1)
+			//
+			// Find what is actually selected and act on that. If the selection
+			// cannot be determined, press NOTHING: leaving the dialog up stalls
+			// the agent visibly, which is recoverable, while a wrong keypress
+			// kills it silently. That asymmetry is the whole point.
+			switch trustDialogSelection(content) {
+			case trustSelectionAccept:
+				if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+					return err
+				}
+			case trustSelectionDecline:
+				// Move off the decline option, then confirm.
+				if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+					return err
+				}
+				time.Sleep(150 * time.Millisecond)
+				if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+					return err
+				}
+			default:
+				// Options not readable YET. The banner often renders a beat
+				// before the option list, so keep polling rather than deciding.
+				// If the deadline passes with the selection still unreadable we
+				// fall out of the loop and send NOTHING, which leaves the dialog
+				// up: a stalled agent is visible and recoverable, a declined one
+				// is dead and silent.
+				time.Sleep(constants.DialogPollInterval)
+				continue
 			}
 			// Wait for dialog to dismiss before proceeding
 			time.Sleep(500 * time.Millisecond)
@@ -2035,6 +2071,44 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 
 	// Timeout — no dialog detected, safe to proceed
 	return nil
+}
+
+
+// trustDialogSelection reports which option the cursor is on in a workspace
+// trust dialog, so the acceptor never presses Enter on "No, exit" (gt-ma1).
+//
+// Returns trustSelectionUnknown when the layout cannot be read. Callers must
+// treat that as "do nothing" rather than "probably fine": a stalled agent is
+// visible and recoverable, a declined one is dead and silent.
+type trustSelection int
+
+const (
+	trustSelectionUnknown trustSelection = iota
+	trustSelectionAccept
+	trustSelectionDecline
+)
+
+func trustDialogSelection(content string) trustSelection {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		// The cursor marker varies by renderer; check the common ones.
+		if !strings.HasPrefix(trimmed, ">") && !strings.HasPrefix(trimmed, "❯") &&
+			!strings.HasPrefix(trimmed, "*") && !strings.HasPrefix(trimmed, "▶") {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		// Order matters: match the decline phrasing first, because "No, exit"
+		// and "Yes, I trust this folder" can both appear on screen and only the
+		// cursor line is being examined here.
+		if strings.Contains(lower, "no, exit") || strings.Contains(lower, "no, ") {
+			return trustSelectionDecline
+		}
+		if strings.Contains(lower, "yes, i trust") || strings.Contains(lower, "trust this folder") ||
+			strings.Contains(lower, "yes") {
+			return trustSelectionAccept
+		}
+	}
+	return trustSelectionUnknown
 }
 
 func containsWorkspaceTrustDialog(content string) bool {

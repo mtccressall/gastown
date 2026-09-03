@@ -46,7 +46,11 @@ func TestAcceptWorkspaceTrustDialog_DetectsDialog(t *testing.T) {
 	defer func() { _ = tm.KillSession(sessionName) }()
 
 	// Simulate the trust dialog by echoing its text into the pane
-	if err := tm.SendKeys(sessionName, "echo 'Quick safety check - do you trust this folder?'"); err != nil {
+	// Render the OPTIONS as well as the banner. The acceptor is now
+	// selection-aware (gt-ma1): it will not press Enter unless it can see which
+	// option carries the cursor, because on the real dialog "No, exit" is first
+	// and a blind Enter declined and killed the session.
+	if err := tm.SendKeys(sessionName, "printf 'Quick safety check - do you trust this folder?\\n  No, exit\\n> Yes, I trust this folder\\n'"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	// Give the echo a moment to execute
@@ -73,7 +77,7 @@ func TestAcceptWorkspaceTrustDialog_DetectsCodexDialog(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	if err := tm.SendKeys(sessionName, "echo '> You are in /tmp/demo'; echo 'Do you trust the contents of this directory?'"); err != nil {
+	if err := tm.SendKeys(sessionName, "printf '> You are in /tmp/demo\\nDo you trust the contents of this directory?\\n  No, exit\\n> Yes, I trust this folder\\n'"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)

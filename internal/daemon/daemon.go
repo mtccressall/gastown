@@ -1755,6 +1755,12 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 		// Without this, sessions started before the rig was docked survive until
 		// the next explicit 'gt rig dock' command. (hq-snx61)
 		name := session.WitnessSessionName(session.PrefixFor(rigName))
+		// Same guard as the refinery path — an unverifiable rig state must not
+		// destroy a running witness. (gt-365)
+		if rigStateUnverifiable(reason) {
+			d.logger.Printf("Not killing witness %s: rig state is unverifiable, not known-docked (%s)", name, reason)
+			return
+		}
 		if exists, _ := d.tmux.HasSession(name); exists {
 			d.logger.Printf("Killing leftover witness %s (rig %s)", name, reason)
 			if err := d.tmux.KillSessionWithProcesses(name); err != nil {
@@ -1815,6 +1821,13 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 		// Without this, sessions started before the rig was docked survive until
 		// the next explicit 'gt rig dock' command. (hq-snx61)
 		name := session.RefinerySessionName(session.PrefixFor(rigName))
+		// Do NOT kill on an unverifiable verdict — see rigStateUnverifiable.
+		// Skipping the start is the correct response to not knowing; killing a
+		// running agent is not. (gt-365)
+		if rigStateUnverifiable(reason) {
+			d.logger.Printf("Not killing refinery %s: rig state is unverifiable, not known-docked (%s)", name, reason)
+			return
+		}
 		if exists, _ := d.tmux.HasSession(name); exists {
 			d.logger.Printf("Killing leftover refinery %s (rig %s)", name, reason)
 			if err := d.tmux.KillSessionWithProcesses(name); err != nil {
@@ -2190,6 +2203,23 @@ func (d *Daemon) getPatrolRigs(patrol string) []string {
 // shared package (e.g. internal/rig) would eliminate the third implementation
 // and reduce drift risk. Not done here due to circular import constraints
 // (daemon cannot import cmd).
+// rigStateUnverifiable reports whether a non-operational verdict came from an
+// inability to CHECK rather than from a rig that is actually parked or docked.
+//
+// isRigOperational returns false for both, and that conflation is safe for its
+// original caller — declining to START an agent you cannot verify only delays
+// work. It is NOT safe for callers that KILL a running session on the same
+// boolean: "I could not determine the state" and "the state is docked" are
+// opposite situations, and only one of them justifies destroying a live agent.
+//
+// gt-365: on 2026-09-01 a transient Dolt hiccup produced "cannot verify rig
+// status" and the daemon killed a healthy liveop refinery that was mid-work. The
+// fail-safe comment above the return says the intent was to avoid burning credits
+// on a start. Nobody intended it to reach a kill.
+func rigStateUnverifiable(reason string) bool {
+	return strings.Contains(reason, "cannot verify rig status")
+}
+
 func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	cfg := wisp.NewConfig(d.config.TownRoot, rigName)
 
