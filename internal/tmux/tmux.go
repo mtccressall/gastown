@@ -3610,6 +3610,38 @@ func (t *Tmux) IsIdle(session string) bool {
 	return false
 }
 
+// ListSessionActivity returns each session's last-activity time in ONE tmux call.
+//
+// Callers that decide whether an agent is WORKING need this: session EXISTENCE
+// is not activity, and treating it as such is gt-fy6. A polecat frozen on a
+// permission prompt has a live session, a hooked bead, and no progress — the
+// inventory reported it WORKING while it consumed a capacity slot indefinitely.
+//
+// One call rather than one per session, because the list path already makes
+// exactly one and must stay cheap.
+func (t *Tmux) ListSessionActivity() (map[string]time.Time, error) {
+	out, err := t.run("list-sessions", "-F", "#{session_name}|#{session_activity}")
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]time.Time)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		secs, convErr := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if convErr != nil {
+			continue
+		}
+		result[parts[0]] = time.Unix(secs, 0)
+	}
+	return result, nil
+}
+
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"

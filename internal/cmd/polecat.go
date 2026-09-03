@@ -545,6 +545,15 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listing tmux sessions: %w", err)
 	}
 	sessions := newPolecatSessionSet(sessionNames)
+	// One extra tmux call for the whole list, so WORKING can mean "producing
+	// output" rather than "has a session". A failure here is non-fatal: isQuiet
+	// treats missing activity as not-quiet, so the verdict falls back to the old
+	// behaviour rather than mislabelling a busy polecat as stalled. (gt-fy6)
+	if activity, actErr := t.ListSessionActivity(); actErr == nil {
+		polecatSessionActivity = activity
+	} else {
+		polecatSessionActivity = nil
+	}
 	allPolecats := make([]PolecatListItem, 0)
 
 	for _, r := range rigs {
