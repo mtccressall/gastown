@@ -943,6 +943,9 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 	defer ticker.Stop()
 
 	responded := false
+	// Whether ANY liveness signal could actually be read this run. A check that
+	// could not run is not evidence of a dead agent (gt-28k).
+	signalsReadable := false
 
 	for {
 		select {
@@ -951,9 +954,12 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 		case <-ticker.C:
 			// Primary signal: bead update (structured response channel)
 			newTime, err := getAgentBeadUpdateTime(townRoot, beadID)
-			if err == nil && newTime.After(baselineTime) {
-				responded = true
-				goto Done
+			if err == nil {
+				signalsReadable = true
+				if newTime.After(baselineTime) {
+					responded = true
+					goto Done
+				}
 			}
 
 			// Secondary signal: tmux session activity (prose/command response)
@@ -962,9 +968,12 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 			// Session activity is a reliable liveness signal for these agents.
 			if activityErr == nil {
 				newActivity, err := t.GetSessionActivity(sessionName)
-				if err == nil && newActivity.After(baselineActivity) {
-					responded = true
-					goto Done
+				if err == nil {
+					signalsReadable = true
+					if newActivity.After(baselineActivity) {
+						responded = true
+						goto Done
+					}
 				}
 			}
 		}
@@ -979,6 +988,22 @@ Done:
 		}
 		fmt.Printf("%s Agent %s responded (failures reset to 0)\n",
 			style.Bold.Render("✓"), agent)
+		return nil
+	}
+
+	// INDETERMINATE IS NOT A FAILURE. If neither signal could be READ — the bead
+	// lookup errored every tick and session activity was unavailable — then we
+	// learned nothing about this agent, and recording a failure would advance a
+	// counter that force-kills at three.
+	//
+	// gt-28k: gastown/witness was logged as non-responsive while its pane showed
+	// a full patrol report completing 19 seconds after the ping. "I could not
+	// check" was written down as "it did not answer", and three of those kill a
+	// healthy agent. Same shape as gt-365, where an unverifiable rig state
+	// reached a kill path.
+	if !signalsReadable {
+		fmt.Printf("%s Agent %s: could not read either liveness signal — recording NOTHING rather than a failure\n",
+			style.Dim.Render("?"), agent)
 		return nil
 	}
 
