@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"github.com/steveyegge/gastown/internal/refinery"
+	"sync"
 	"time"
 	"fmt"
 	"sort"
@@ -124,16 +126,14 @@ const (
 	mrStatusClosed
 )
 
-// openMRSet is the set of MR ids currently open for the rig being listed,
-// populated once per run. A nil set means the lookup did not run or failed, and
-// is deliberately distinct from an EMPTY set, which means "the queue really is
-// empty and every recorded MR is therefore closed".
+// openMRSet is the set of MR ids currently open for one rig. A nil/unloaded set
+// means the lookup did not run or failed, and is deliberately distinct from an
+// EMPTY set, which means "the queue really is empty and every recorded MR is
+// therefore closed".
 type openMRSet struct {
 	ids    map[string]bool
 	loaded bool
 }
-
-var openMRLookup openMRSet
 
 func (s openMRSet) statusOf(mr string) mrStatus {
 	if !s.loaded {
@@ -143,6 +143,49 @@ func (s openMRSet) statusOf(mr string) mrStatus {
 		return mrStatusOpen
 	}
 	return mrStatusClosed
+}
+
+// openMRCache resolves lazily, PER RIG, on first use.
+//
+// It is deliberately not a value any caller has to remember to populate. The
+// first version of this fix put the lookup in `gt polecat list`'s rig loop and
+// left buildPolecatInventoryItem reading a global — so the capacity gate, which
+// calls the very same builder, silently saw an unloaded set and kept blocking.
+// The list said the pool was free and the scheduler refused to dispatch against
+// it, which is precisely the gt-b3a2 split this file already carries a comment
+// about, reintroduced by the fix for a different bug.
+//
+// A shared helper whose correctness depends on the CALLER having initialised
+// something will eventually be called from somewhere that did not. Resolving on
+// demand removes the requirement instead of documenting it.
+var openMRCache = struct {
+	mu   sync.Mutex
+	byRig map[string]openMRSet
+}{byRig: map[string]openMRSet{}}
+
+// openMRsForRig returns the open-MR set for a rig, querying at most once per
+// process. A failed query is cached as UNLOADED, so callers keep the safe
+// blocking behaviour rather than retrying per polecat.
+func openMRsForRig(rigName string) openMRSet {
+	openMRCache.mu.Lock()
+	defer openMRCache.mu.Unlock()
+	if got, ok := openMRCache.byRig[rigName]; ok {
+		return got
+	}
+	set := openMRSet{}
+	if _, r, err := getRig(rigName); err == nil && r != nil {
+		if mrs, mrErr := refinery.NewEngineer(r).ListAllOpenMRs(); mrErr == nil {
+			ids := make(map[string]bool, len(mrs))
+			for _, mr := range mrs {
+				if mr != nil {
+					ids[strings.TrimSpace(mr.ID)] = true
+				}
+			}
+			set = openMRSet{ids: ids, loaded: true}
+		}
+	}
+	openMRCache.byRig[rigName] = set
+	return set
 }
 
 func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) polecatInventoryItem {
@@ -219,7 +262,7 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		// polecats sat PENDING_MR while `gt refinery ready --all` reported an
 		// EMPTY queue, so the whole pool was jammed on MRs that no longer
 		// existed and no work could be dispatched.
-		switch openMRLookup.statusOf(item.ActiveMR) {
+		switch openMRsForRig(rigName).statusOf(item.ActiveMR) {
 		case mrStatusClosed:
 			// Absent from the open-MR set: it is genuinely finished, so it must
 			// not block. This is the case that frees the pool.

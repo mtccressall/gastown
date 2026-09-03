@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"github.com/steveyegge/gastown/internal/refinery"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -560,26 +559,12 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 	for _, r := range rigs {
 		bd := beads.New(r.Path)
 
-		// Which MRs are actually open for THIS rig, so a recorded-but-finished
-		// MR stops pinning its polecat. Loaded only on success: a nil set leaves
-		// every MR "unknown" and preserves the old blocking behaviour, so a
-		// lookup failure can never free a worktree that might hold unpushed work.
-		openMRLookup = openMRSet{}
-		if mrs, mrErr := refinery.NewEngineer(r).ListAllOpenMRs(); mrErr == nil {
-			ids := make(map[string]bool, len(mrs))
-			for _, mr := range mrs {
-				if mr != nil {
-					ids[strings.TrimSpace(mr.ID)] = true
-				}
-			}
-			openMRLookup = openMRSet{ids: ids, loaded: true}
-		}
-
 		polecatNames, err := listPolecatDirectoryNames(r.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to list polecats in %s: %v\n", r.Name, err)
 			continue
 		}
+
 		agents, agentErr := bd.ListAgentBeads()
 		if agentErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to list agent beads in %s: %v\n", r.Name, agentErr)
