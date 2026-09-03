@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"time"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,31 @@ import (
 const polecatSessionKeySep = "\x00"
 
 type polecatSessionSet map[string]string
+
+// polecatSessionActivity carries last-activity per session key, populated from a
+// single tmux call. Separate from polecatSessionSet so the existing map's shape
+// and every caller of it stay unchanged.
+var polecatSessionActivity map[string]time.Time
+
+// isQuiet reports whether this polecat's session has produced NOTHING for
+// WorkingActivityWindow.
+//
+// Absence of data is NOT quiet. If activity could not be read — the bulk call
+// failed, or this session was not in it — this returns false and the caller
+// keeps its previous verdict. Reporting a polecat blocked because we could not
+// measure it would be the same defect as gt-365 and gt-28k, where an unverifiable
+// check was recorded as a definite negative and something got killed for it.
+func (s polecatSessionSet) isQuiet(rigName, polecatName string) bool {
+	sessionName, ok := s.lookup(rigName, polecatName)
+	if !ok || polecatSessionActivity == nil {
+		return false
+	}
+	last, ok := polecatSessionActivity[sessionName]
+	if !ok || last.IsZero() {
+		return false
+	}
+	return time.Since(last) > WorkingActivityWindow
+}
 
 type polecatInventoryItem struct {
 	Rig            string
@@ -73,6 +99,22 @@ func polecatSessionKey(rigName, polecatName string) string {
 	return rigName + polecatSessionKeySep + polecatName
 }
 
+
+// WorkingActivityWindow is how recently a session must have produced output for
+// its polecat to count as WORKING rather than blocked.
+//
+// gt-fy6: the inventory decided WORKING from session EXISTENCE alone. A polecat
+// frozen on a permission prompt has a live session and a hooked bead and makes no
+// progress, so it was reported WORKING while holding a capacity slot — observed
+// 2026-09-03 on liveop/brahmin, stuck on approval for a read-only grep and
+// counted as busy for as long as it sat there.
+//
+// Fifteen minutes is deliberately generous. A polecat legitimately goes quiet
+// while a long test suite or a build runs, and calling that blocked would be the
+// same error in the other direction. This is meant to catch the agent that will
+// NEVER move again without a human, not the one that is merely slow.
+const WorkingActivityWindow = 15 * time.Minute
+
 func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) polecatInventoryItem {
 	return buildPolecatInventoryItemFromEvidence(rigName, polecatName, fields, assessPolecatAssignedIssueWork(activeWork), sessions)
 }
@@ -110,10 +152,18 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 	if activeWorkEvidence.BlocksCleanup {
 		item.Issue = activeWorkEvidence.AssignedIssue
 		if activeWorkEvidence.RequiresRestart || activeWorkEvidence.CountsTowardCapacity {
-			if running {
-				item.State = polecat.StateWorking
-			} else {
+			switch {
+			case !running:
 				item.State = polecat.StateStalled
+			case sessions.isQuiet(rigName, polecatName):
+				// Session is alive with hooked work but has produced nothing for
+				// WorkingActivityWindow. Report STALLED, not WORKING: an agent
+				// waiting on a prompt nobody will answer is not doing work, and
+				// calling it WORKING hides it from every surface that would
+				// surface it. (gt-fy6)
+				item.State = polecat.StateStalled
+			default:
+				item.State = polecat.StateWorking
 			}
 		} else if running && !polecat.CleanupStatus(item.CleanupStatus).IsSafe() {
 			item.State = polecat.StateReviewNeeded
