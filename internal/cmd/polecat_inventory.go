@@ -115,6 +115,36 @@ func polecatSessionKey(rigName, polecatName string) string {
 // NEVER move again without a human, not the one that is merely slow.
 const WorkingActivityWindow = 15 * time.Minute
 
+
+type mrStatus int
+
+const (
+	mrStatusUnknown mrStatus = iota
+	mrStatusOpen
+	mrStatusClosed
+)
+
+// openMRSet is the set of MR ids currently open for the rig being listed,
+// populated once per run. A nil set means the lookup did not run or failed, and
+// is deliberately distinct from an EMPTY set, which means "the queue really is
+// empty and every recorded MR is therefore closed".
+type openMRSet struct {
+	ids    map[string]bool
+	loaded bool
+}
+
+var openMRLookup openMRSet
+
+func (s openMRSet) statusOf(mr string) mrStatus {
+	if !s.loaded {
+		return mrStatusUnknown
+	}
+	if s.ids[strings.TrimSpace(mr)] {
+		return mrStatusOpen
+	}
+	return mrStatusClosed
+}
+
 func buildPolecatInventoryItem(rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) polecatInventoryItem {
 	return buildPolecatInventoryItemFromEvidence(rigName, polecatName, fields, assessPolecatAssignedIssueWork(activeWork), sessions)
 }
@@ -180,7 +210,32 @@ func buildPolecatInventoryItemFromEvidence(rigName, polecatName string, fields *
 		}
 	}
 	if item.ActiveMR != "" {
-		input.ActiveMRBlocker = "active_mr=" + item.ActiveMR + " status=unknown"
+		// Resolve the MR rather than assuming it is open.
+		//
+		// This used to unconditionally block with "status=unknown" — the code
+		// recorded that it did not know, and then pinned the worker anyway. An
+		// MR id that was written once and later merged or closed held its
+		// polecat forever. Measured 2026-09-03 on liveop: SEVEN of seventeen
+		// polecats sat PENDING_MR while `gt refinery ready --all` reported an
+		// EMPTY queue, so the whole pool was jammed on MRs that no longer
+		// existed and no work could be dispatched.
+		switch openMRLookup.statusOf(item.ActiveMR) {
+		case mrStatusClosed:
+			// Absent from the open-MR set: it is genuinely finished, so it must
+			// not block. This is the case that frees the pool.
+		case mrStatusOpen:
+			input.ActiveMRBlocker = "active_mr=" + item.ActiveMR + " status=open"
+		default:
+			// Lookup unavailable. Keep blocking, and say so honestly.
+			//
+			// This fails CLOSED, opposite to the activity check in isQuiet, and
+			// the asymmetry is deliberate: wrongly reusing a polecat destroys a
+			// worktree that may hold unpushed work (nearly lost a 295-line
+			// security test on raider), while wrongly blocking one costs an idle
+			// worker until the next run. When the two errors are that unequal,
+			// the guess goes toward the recoverable one.
+			input.ActiveMRBlocker = "active_mr=" + item.ActiveMR + " status=unknown"
+		}
 	}
 
 	input.State = item.State
