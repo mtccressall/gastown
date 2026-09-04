@@ -30,6 +30,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -49,8 +50,18 @@ func pollerPidDir(townRoot string) string {
 
 // pollerPidFile returns the PID file path for a session's poller.
 func pollerPidFile(townRoot, session string) string {
-	safe := strings.ReplaceAll(session, "/", "_")
-	return filepath.Join(pollerPidDir(townRoot), safe+".pid")
+	return filepath.Join(pollerPidDir(townRoot), safePollerName(session)+".pid")
+}
+
+// pollerStartLockFile returns the lock path guarding StartPoller's
+// check-then-start for a session.
+func pollerStartLockFile(townRoot, session string) string {
+	return filepath.Join(pollerPidDir(townRoot), safePollerName(session)+".start.lock")
+}
+
+// safePollerName turns a session name into a single path segment.
+func safePollerName(session string) string {
+	return strings.ReplaceAll(session, "/", "_")
 }
 
 // StartPoller launches a background `gt nudge-poller <session>` process.
@@ -61,6 +72,24 @@ func StartPoller(townRoot, session string) (int, error) {
 	if err := os.MkdirAll(pidDir, 0755); err != nil {
 		return 0, fmt.Errorf("creating poller pid dir: %w", err)
 	}
+
+	// Serialize check-then-start across processes. Every wait-idle nudge now
+	// calls StartPoller, so two senders can both observe the same stale PID
+	// file and each spawn a poller. Only the last PID written is tracked, so
+	// StopPoller would leave the others running until the session dies.
+	//
+	// Try, do not block: if another process holds this lock it is starting a
+	// poller for this session right now, which is the outcome we wanted. A
+	// blocking acquire would hang `gt nudge` behind a stuck starter.
+	// (gastown-ku3)
+	release, locked, lockErr := lock.FlockTryAcquire(pollerStartLockFile(townRoot, session))
+	if lockErr != nil {
+		return 0, fmt.Errorf("locking poller start: %w", lockErr)
+	}
+	if !locked {
+		return 0, nil // another process is starting one
+	}
+	defer release()
 
 	// Check if a poller is already running for this session.
 	if pid, alive := pollerAlive(townRoot, session); alive {

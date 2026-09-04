@@ -167,7 +167,15 @@ var startNudgePoller = nudge.StartPoller
 //
 // StartPoller is idempotent (it early-returns while a poller is alive), so this
 // costs nothing on the healthy path. It is called only after a successful
-// Enqueue: with nothing in the queue there is nothing to drain. (gastown-ku3)
+// Enqueue: with nothing in the queue there is nothing to drain.
+//
+// A poller-start failure is warned about, not returned. Returning it would send
+// the caller down its immediate-delivery fallback while the entry is still in
+// the queue — a duplicate, delivered destructively, and immediate delivery into
+// a session holding unsubmitted composer text destroys it (gt-sglq). That is
+// the interruption wait-idle exists to avoid. Warning leaves every call site
+// exactly where it stood before this helper existed, so the failure path is
+// never worse than the behaviour it replaced. (gastown-ku3)
 func enqueueAndEnsurePoller(townRoot, sessionName string, n nudge.QueuedNudge) error {
 	if err := nudge.Enqueue(townRoot, sessionName, n); err != nil {
 		return err
