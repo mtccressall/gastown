@@ -1,6 +1,7 @@
 package nudge
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -143,5 +144,106 @@ func TestRemovePollerPidFileClearsAnUnparseableEntry(t *testing.T) {
 	}
 	if _, err := os.Stat(pollerPidFile(townRoot, session)); !os.IsNotExist(err) {
 		t.Errorf("corrupt pid file still present, stat err = %v", err)
+	}
+}
+
+// Every reader of this index reads it unlocked. os.WriteFile truncates before it
+// writes, so a concurrent pollerAlive could read an empty file, fail to parse a
+// pid, report no poller and let StartPoller spawn a duplicate. The write must be
+// a rename, so a reader sees either the old pid or the new one and never a
+// half-written file.
+func TestWritePollerPidFileIsAtomicForConcurrentReaders(t *testing.T) {
+	t.Parallel()
+
+	townRoot := t.TempDir()
+	const session = "gastown-witness"
+	path := pollerPidFile(townRoot, session)
+
+	if err := WritePollerPidFile(townRoot, session, 1111111); err != nil {
+		t.Fatalf("WritePollerPidFile: %v", err)
+	}
+
+	done := make(chan struct{})
+	bad := make(chan string, 1)
+
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			pid := 2000000 + i
+			if err := WritePollerPidFile(townRoot, session, pid); err != nil {
+				bad <- fmt.Sprintf("WritePollerPidFile: %v", err)
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			select {
+			case msg := <-bad:
+				t.Fatal(msg)
+			default:
+			}
+			return
+		default:
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			// A rename never unlinks the destination, so the path is always there.
+			t.Fatalf("reading %s during concurrent writes: %v", path, err)
+		}
+		if _, err := strconv.Atoi(string(data)); err != nil {
+			t.Fatalf("reader observed a non-pid %q mid-write; the write is not atomic", string(data))
+		}
+	}
+}
+
+// The temp files the atomic write uses must not pile up in the index directory —
+// a census that lists the directory would count them as pollers.
+func TestWritePollerPidFileLeavesNoTempFiles(t *testing.T) {
+	t.Parallel()
+
+	townRoot := t.TempDir()
+	const session = "li-refinery"
+
+	for i := 0; i < 5; i++ {
+		if err := WritePollerPidFile(townRoot, session, 4242+i); err != nil {
+			t.Fatalf("WritePollerPidFile: %v", err)
+		}
+	}
+
+	entries, err := os.ReadDir(pollerPidDir(townRoot))
+	if err != nil {
+		t.Fatalf("reading pid dir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("pid dir holds %d entries %v, want exactly 1", len(entries), names)
+	}
+}
+
+func TestWritePollerPidFileIsWorldReadable(t *testing.T) {
+	t.Parallel()
+
+	townRoot := t.TempDir()
+	const session = "hq-boot"
+
+	if err := WritePollerPidFile(townRoot, session, 4242); err != nil {
+		t.Fatalf("WritePollerPidFile: %v", err)
+	}
+
+	// os.CreateTemp makes files 0600; StartPoller's own writes are 0644 and other
+	// agents' censuses read this directory.
+	info, err := os.Stat(pollerPidFile(townRoot, session))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0644 {
+		t.Errorf("pid file mode = %o, want 0644", got)
 	}
 }
