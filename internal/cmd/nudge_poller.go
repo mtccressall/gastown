@@ -86,6 +86,14 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Record ourselves in the pid-file index. StartPoller writes this file for
+	// the pollers it spawns; a direct invocation used to write nothing, so the
+	// "already running" guard could not see us and a later StartPoller would put
+	// a second poller on the same queue (gt-di75). Cleanup is deferred so it also
+	// runs on SIGTERM and on the session-died exit, not only the clean return.
+	untrack := trackPollerPidFile(townRoot, sessionName, os.Getpid())
+	defer untrack()
+
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -138,4 +146,23 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
 	return hasPromptDetection && waitErr != nil
+}
+
+// trackPollerPidFile publishes pid as session's poller and returns the cleanup
+// that withdraws it again.
+//
+// Failing to write the file is not fatal: the poller still drains the queue, and
+// a poller that runs untracked is what we have today. It is reported on stderr
+// rather than swallowed, so the next person asking why a census came up short
+// has something to read.
+func trackPollerPidFile(townRoot, session string, pid int) func() {
+	if err := nudge.WritePollerPidFile(townRoot, session, pid); err != nil {
+		fmt.Fprintf(os.Stderr, "nudge-poller: %v\n", err)
+	}
+
+	return func() {
+		if err := nudge.RemovePollerPidFile(townRoot, session, pid); err != nil {
+			fmt.Fprintf(os.Stderr, "nudge-poller: %v\n", err)
+		}
+	}
 }
