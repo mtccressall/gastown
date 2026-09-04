@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -103,9 +106,10 @@ func TestPatrolCycleEntry(t *testing.T) {
 
 func TestParseStepResults(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		expected map[string]string
+		name          string
+		input         string
+		expected      map[string]string
+		wantMalformed []string
 	}{
 		{
 			name:     "empty input",
@@ -151,11 +155,35 @@ func TestParseStepResults(t *testing.T) {
 				"heartbeat": "OK",
 			},
 		},
+		{
+			name:  "entry without a status is reported as malformed",
+			input: "heartbeat:OK,inbox-check",
+			expected: map[string]string{
+				"heartbeat": "OK",
+			},
+			wantMalformed: []string{"inbox-check"},
+		},
+		{
+			name:  "empty status is reported as malformed, not recorded blank",
+			input: "heartbeat:OK,inbox-check:",
+			expected: map[string]string{
+				"heartbeat": "OK",
+			},
+			wantMalformed: []string{"inbox-check:"},
+		},
+		{
+			name:  "empty step id is reported as malformed, not an unrecognized empty id",
+			input: "heartbeat:OK,:OK",
+			expected: map[string]string{
+				"heartbeat": "OK",
+			},
+			wantMalformed: []string{":OK"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseStepResults(tt.input)
+			got, malformed := parseStepResults(tt.input)
 			if len(got) != len(tt.expected) {
 				t.Errorf("parseStepResults(%q) returned %d entries, want %d", tt.input, len(got), len(tt.expected))
 				return
@@ -164,6 +192,9 @@ func TestParseStepResults(t *testing.T) {
 				if got[k] != v {
 					t.Errorf("parseStepResults(%q)[%q] = %q, want %q", tt.input, k, got[k], v)
 				}
+			}
+			if !slices.Equal(malformed, tt.wantMalformed) {
+				t.Errorf("parseStepResults(%q) malformed = %v, want %v", tt.input, malformed, tt.wantMalformed)
 			}
 		})
 	}
@@ -183,14 +214,14 @@ func TestBuildStepAudit(t *testing.T) {
 			formulaName: "mol-deacon-patrol",
 			stepsFlag:   "",
 			wantPrefix:  "Steps: NOT REPORTED",
-			wantContain: "/26)",
+			wantContain: "/28)",
 		},
 		{
 			name:        "deacon patrol with all steps OK",
 			formulaName: "mol-deacon-patrol",
-			stepsFlag:   "heartbeat:OK,inbox-check:OK,orphan-process-cleanup:OK,test-pollution-cleanup:OK,gate-evaluation:OK,dispatch-gated-molecules:OK,check-convoy-completion:OK,resolve-external-deps:OK,fire-notifications:OK,heartbeat-mid:OK,health-scan:OK,dolt-health:OK,zombie-scan:OK,plugin-run:OK,dog-pool-maintenance:OK,dog-health-check:OK,orphan-check:OK,session-gc:OK,wisp-compact:OK,compact-report:OK,costs-digest:OK,patrol-digest:OK,log-maintenance:OK,patrol-cleanup:OK,context-check:OK,loop-or-exit:OK",
+			stepsFlag:   "heartbeat:OK,inbox-check:OK,orphan-process-cleanup:OK,test-pollution-cleanup:OK,gate-evaluation:OK,dispatch-gated-molecules:OK,check-convoy-completion:OK,resolve-external-deps:OK,fire-notifications:OK,heartbeat-mid:OK,health-scan:OK,dolt-health:OK,zombie-scan:OK,plugin-run:OK,dog-pool-maintenance:OK,dog-health-check:OK,orphan-check:OK,session-gc:OK,wisp-compact:OK,compact-report:OK,costs-digest:OK,observed-vs-concluded:OK,patrol-digest:OK,log-maintenance:OK,patrol-cleanup:OK,context-check:OK,dispatch-ready-work:OK,loop-or-exit:OK",
 			wantPrefix:  "Steps:",
-			wantSuffix:  "(26/26)",
+			wantSuffix:  "(28/28)",
 			wantContain: "heartbeat OK",
 		},
 		{
@@ -198,7 +229,7 @@ func TestBuildStepAudit(t *testing.T) {
 			formulaName: "mol-deacon-patrol",
 			stepsFlag:   "heartbeat:OK,inbox-check:OK,loop-or-exit:OK",
 			wantPrefix:  "Steps:",
-			wantSuffix:  "(3/26)",
+			wantSuffix:  "(3/28)",
 			wantContain: "heartbeat OK",
 		},
 		{
@@ -206,6 +237,31 @@ func TestBuildStepAudit(t *testing.T) {
 			formulaName: "mol-deacon-patrol",
 			stepsFlag:   "heartbeat:OK",
 			wantContain: "inbox-check SKIP",
+		},
+		{
+			name:        "unrecognized id named in the audit line, not silently dropped",
+			formulaName: "mol-deacon-patrol",
+			stepsFlag:   "heartbeat:OK,not-a-real-step:OK",
+			wantContain: "[1 unrecognized: not-a-real-step]",
+		},
+		{
+			name:        "unrecognized ids do not count toward the score",
+			formulaName: "mol-deacon-patrol",
+			stepsFlag:   "not-a-real-step:OK,also-not-real:OK",
+			wantContain: "(0/28)",
+		},
+		{
+			name:        "steps added to the live formula are graded, not dropped",
+			formulaName: "mol-deacon-patrol",
+			stepsFlag:   "dispatch-ready-work:OK,observed-vs-concluded:OK",
+			wantSuffix:  "(2/28)",
+			wantContain: "dispatch-ready-work OK",
+		},
+		{
+			name:        "malformed entry named in the audit line, not only on stderr",
+			formulaName: "mol-deacon-patrol",
+			stepsFlag:   "heartbeat:OK,inbox-check",
+			wantContain: "[1 malformed: inbox-check]",
 		},
 		{
 			name:        "nonexistent formula with no steps",
@@ -223,7 +279,9 @@ func TestBuildStepAudit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildStepAudit(tt.formulaName, tt.stepsFlag)
+			// Empty townRoot/rigName keeps the test hermetic: ResolveFormulaContent
+			// skips both override tiers and falls through to the embedded copy.
+			got := buildStepAudit(tt.formulaName, "", "", tt.stepsFlag)
 			if tt.wantPrefix != "" && !strings.HasPrefix(got, tt.wantPrefix) {
 				t.Errorf("buildStepAudit() = %q, want prefix %q", got, tt.wantPrefix)
 			}
@@ -234,5 +292,53 @@ func TestBuildStepAudit(t *testing.T) {
 				t.Errorf("buildStepAudit() = %q, want to contain %q", got, tt.wantContain)
 			}
 		})
+	}
+}
+
+// TestBuildStepAuditUsesResolvedFormula pins the root of gastown-c1x: the audit
+// must grade against the formula the patrol was RENDERED from, not the embedded
+// fallback. gt prime resolves rig override, then town override, then embedded
+// (formula.ResolveFormulaContent); buildStepAudit used to read only the embedded
+// copy, so any step a town added to its own formula was reported by the agent,
+// discarded by the audit, and scored as if it had never been claimed.
+//
+// This is the property, not the instance: it fails for ANY town-only step, so it
+// does not go quiet the moment the embedded copy is synced.
+func TestBuildStepAuditUsesResolvedFormula(t *testing.T) {
+	townRoot := t.TempDir()
+	formulaDir := filepath.Join(townRoot, ".beads", "formulas")
+	if err := os.MkdirAll(formulaDir, 0o755); err != nil {
+		t.Fatalf("creating town formula dir: %v", err)
+	}
+	override := `formula = "mol-deacon-patrol"
+description = "town override"
+type = "workflow"
+
+[[steps]]
+id = "heartbeat"
+title = "Heartbeat"
+description = "beat"
+
+[[steps]]
+id = "town-only-step"
+title = "A step only this town defines"
+needs = ["heartbeat"]
+description = "the embedded copy has never heard of this"
+`
+	path := filepath.Join(formulaDir, "mol-deacon-patrol.formula.toml")
+	if err := os.WriteFile(path, []byte(override), 0o644); err != nil {
+		t.Fatalf("writing town formula: %v", err)
+	}
+
+	got := buildStepAudit("mol-deacon-patrol", townRoot, "", "heartbeat:OK,town-only-step:OK")
+
+	if !strings.Contains(got, "town-only-step OK") {
+		t.Errorf("buildStepAudit() = %q, want the town-only step graded", got)
+	}
+	if !strings.HasSuffix(got, "(2/2)") {
+		t.Errorf("buildStepAudit() = %q, want suffix %q — the town formula's 2 steps, not the embedded copy's", got, "(2/2)")
+	}
+	if strings.Contains(got, "unrecognized") {
+		t.Errorf("buildStepAudit() = %q, want no unrecognized ids: a town-only step is a real step", got)
 	}
 }

@@ -1057,9 +1057,357 @@ See: GH#24, gt-7awfj
 **Exit criteria:** Skip this step - proceed to next."""
 
 [[steps]]
+id = "observed-vs-concluded"
+title = "Separate what you OBSERVED from what you CONCLUDED"
+needs = ["compact-report"]
+description = """
+Before writing the patrol digest or nudging anyone, split every claim you are
+about to make into two buckets, and label them differently in the text:
+
+- **OBSERVED** - a command you ran and its actual output. Quote it.
+- **CONCLUDED** - anything you inferred from that output.
+
+State conclusions as conclusions. "X is gone" is an observation.
+"X was killed by the restart" is a conclusion, and it needs the word.
+
+## Why this step exists
+
+On 2026-08-31 three agents made this mistake inside one hour, and all three
+were caught only because someone else went and checked:
+
+- The Witness inferred a session was LIVE because tmux listed it and
+  capture-pane returned content. It was a stale final frame; the session was
+  already dead.
+- The Deacon (me) inferred a session died IN THE 17:40 RESTART from its
+  absence at 17:47. Never observed the death, only the absence.
+- The Mayor inferred a gt/bd VERSION SKEW from a version string. The binary
+  reporting 1.2.1 was 1.2.2 by content hash; the skew did not exist.
+
+## The trap, and it is the important half
+
+TWO OF THOSE THREE INFERENCES TURNED OUT TO BE CORRECT ANYWAY.
+
+That is what makes this dangerous rather than merely untidy. A correct
+conclusion drawn by an unsound method gets CONFIRMED, and the confirmation
+teaches you the method works. The Deacon's restart attribution was right -
+verified afterwards from the transcript, last record 17:40:07 MDT, fourteen
+seconds before the first session_death event. Being right did not make the
+reasoning sound, and it nearly cost a real correction: the Deacon retracted a
+TRUE claim under push-back, because neither side could tell an observation
+from an inference.
+
+Getting the right answer is not evidence that you checked.
+
+## How to satisfy this step
+
+For each claim heading into the digest or a nudge:
+
+1. Can you name the command and paste the output? Then it is OBSERVED.
+2. If not, say "I infer", "this suggests", or "I did not observe X, only Y".
+3. If a claim matters - it goes to a human, it closes a bead, it justifies a
+   destructive act - go get the direct evidence before sending it. Parse the
+   file, read the transcript, hash the binary.
+
+Cheap and worth it: when you catch yourself about to write a CAUSE
+("killed by", "caused by", "because of"), that is almost always a conclusion
+wearing an observation's clothes.
+
+## Relationship to the false-green family
+
+The same defect in our tooling: gt-6tr, gt-fy6, gt-df2, gt-anp all report
+INTENT rather than verified OUTCOME. This step is that rule turned on
+ourselves. We documented the tools doing it while doing it ourselves in the
+same hour.
+
+## CONFIDENCE ASYMMETRY: the expensive error is a TRUE claim withdrawn
+
+Everything above is about how ONE agent reports. This is about how two reports
+INTERACT, and it is a distinct failure with a worse cost.
+
+**The more confident-sounding claim wins, independent of which is right.**
+
+On 2026-08-31 the Witness held the disproving evidence - a file mtime, in
+their own output. They said the discrepancy out loud. Then they surrendered
+it, because
+
+    "847 records, 0 malformed, last timestamp 23:40:07.241Z"
+
+READS as verification, while
+
+    "the mtime looks off"
+
+READS as a hunch. Precision of presentation was mistaken for strength of
+evidence. The precise number was the blind one.
+
+COUNT THE COST HONESTLY, because it says which behaviour to change:
+  - The Deacon was WRONG once, and self-corrected twice.
+  - The Witness was RIGHT, and retracted anyway.
+  - The town lost its correct answer for about an hour, during a live
+    incident, and recovered it only because a third agent happened to hold an
+    unrelated primary source.
+
+The expensive error was NOT the false claim. It was the TRUE one being
+withdrawn. A wrong claim gets corrected; a withdrawn right one leaves nothing
+behind to correct.
+
+What to do about it:
+- When you state a measurement, state its BLIND SPOTS in the same breath.
+  "Last timestamped record is X" is honest; "verified, the session ended at X"
+  is not, when untimestamped records exist.
+- When someone's confident number contradicts your rough observation, DO NOT
+  fold. Say what you have and ask them to reconcile it. A number that cannot
+  explain your observation has not beaten it.
+- Weight evidence by what it can SEE, not by how precise it sounds. Three
+  decimal places on a blind measurement is still blind.
+- If you are the confident one, you carry the burden: invite the check, and
+  make it easy for someone to show you wrong.
+
+THE TWO HALVES ARE INDEPENDENT AND NEITHER CANCELS THE OTHER. There is a
+failure on each side of this exchange - overstating a measurement as
+verification, and discarding your own correct data because someone else
+sounded surer - and each party owns theirs outright.
+
+Resist the generous move of absorbing both. When I offered to take the whole
+fault for the 2026-08-31 episode, the Witness declined it, and they were
+right: "someone else was overconfident" is not a lesson a future agent can
+act on, because it describes a condition they do not control. It quietly
+teaches that discarding your own evidence is forgivable when the other party
+is assertive. It is not.
+
+So: if you are reading this as the confident one, your half is the overstated
+measurement. If you are reading it holding a rough observation that a
+polished number contradicts, your half is the folding, and no amount of
+someone else's false certainty discharges it. Own your half completely and
+leave theirs alone.
+
+## DO NOT MEASURE A COMMAND'S EXIT STATUS THROUGH A PIPE
+
+A pipeline's exit status is the LAST stage's, not your command's. Redirect and
+test the status directly, or use PIPESTATUS.
+
+This was the most-reproduced error of 2026-08-31: three agents, three
+independent instances, one of which reached ratified town policy. Mine:
+
+    bd remember --list 2>&1 | head -20 || bd memories 2>&1 | head -20
+
+THE FALLBACK NEVER RAN. head exited 0, so `||` saw success and skipped the
+probe entirely. I saw only the --list error, concluded no enumeration existed,
+and wrote "neither of us could have checked" into a bead and into town policy.
+`bd memories` had worked the whole time. I read the SILENCE OF A COMMAND THAT
+NEVER EXECUTED as an answer.
+
+## WHAT ACTUALLY CATCHES THIS - never the status code
+
+Across every instance that night, the thing that caught the error was NEVER an
+exit code. It was always a SECOND OBSERVATION THAT DISAGREED:
+
+  - a memory inventory that should have been empty and was not
+  - a file mtime four minutes past the death window
+  - a phrase missing from output that should have contained it
+  - unchanged memory counts after a write reported as successful
+
+The corroborating observation did the job the status signal was supposed to
+do. That is an argument for ALWAYS HAVING ONE, not for reading exit codes more
+carefully. A status code tells you what a program believes about itself; a
+second observation tells you what happened.
+
+So for any check that matters: pair the primary signal with one independent
+observation that would DISAGREE if the primary were lying. If you cannot think
+of one, you do not yet have a check - you have an assertion with a number
+attached.
+
+### The word INDEPENDENT is load-bearing, and agreement can mislead
+
+Two measurements agreeing is worth something ONLY if they can fail
+differently. If both are downstream of the same process, agreement tells you
+the process is consistent - not that the answer is right - and it will make
+you MORE confident precisely when you should be less.
+
+Worked example, 2026-08-31, mine: I estimated wisp growth at ~24/hour from a
+7-minute sample. I flagged the sample as thin and then published the number
+anyway, because a second signal agreed - strand events in daemon.log running
+at 27-31/hour. Both figures were downstream of the SAME bursty ticker process,
+and my 7 minutes had landed in a trough between bursts. The true rate,
+measured from pour events across whole hours, was ~100/hour. I was wrong by
+4x, and the corroboration is what talked me into publishing.
+
+Test before you rely on agreement: ASK WHAT WOULD MAKE THE TWO SIGNALS
+DISAGREE. If you cannot describe a plausible world where one is right and the
+other wrong, they are one observation wearing two hats.
+
+Cheap independence in practice comes from a different LAYER, not a different
+command: filesystem mtime against application logs, a bead enumeration against
+a log line count, process state against a status report. Same-layer probes
+tend to share blind spots.
+
+## THE EMPTY-RESULT PROCEDURE - run it, do not merely believe it
+
+Credit: gastown/witness, who argued these lines must be PROCEDURAL. They made
+the empty-result error while writing up the bead ABOUT the empty-result error,
+an hour after documenting it, WHILE BEING CAREFUL. Awareness demonstrably does
+not transfer. A checklist might.
+
+WHENEVER A QUERY, SEARCH, GREP OR LISTING COMES BACK EMPTY - before you write
+the words "none", "absent", "not found", "zero" or "gone", run these four:
+
+  1. NAME THE STORE. Which file, directory, database, table or field did that
+     command actually read? If you cannot name it, you have not got a result.
+       missed: searched liveop/polecats; heartbeats were at the town root
+       missed: checked `comments`; the write went to `notes`
+       missed: `bd list`; wisps live behind `bd mol wisp list`
+  2. PROVE THE PROBE WORKS. Run it against something you KNOW is present. A
+     probe that finds nothing and a probe that is broken look identical.
+       missed: grep -F "correct anyway" against text reading CORRECT ANYWAY
+       missed: `bd remember --list | head || fallback` - the fallback never
+               ran, because a pipeline's status is head's
+  3. CHECK WHAT THE COMMAND EXCLUDES BY DEFAULT. Filtered views read as
+     populations.
+       missed: `bd mol wisp list` shows OPEN only; --all revealed 896 vs 544
+       missed: `bd list | grep wisp` matched BUG TITLES, not wisps
+  4. ASK A SECOND SOURCE AT A DIFFERENT LAYER. Filesystem vs application,
+     log vs store, process table vs status command.
+       worked: du and mtimes located 546M of beads while bd reported 0 issues
+       worked: reading another process's argv revealed the --db flag
+
+AND THE INVERSE, WHICH IS WORSE BECAUSE IT REASSURES: a FAST, EMPTY, rc=0
+answer. Two agents independently declared a data-plane fix successful on
+latency alone; reads were returning zero rows. A hang announces itself. A
+fast empty answer looks like the truth.
+  RULE: verify a data-plane change on CONTENT - a known id resolving, a known
+  row count - NEVER on latency or exit code.
+
+## ONE SAMPLE CANNOT TELL A STOPPED PROCESS FROM A RUNNING ONE
+
+A single reading gives you a value, never a TREND. "Last written 23:45:29"
+and "still being written, most recently at 23:45:29" are the same
+observation, and only the second is true. Take a second sample before
+describing anything as stopped, flat, stable, or finished.
+
+Cost it three times on 2026-08-31:
+  - Called wisp growth ~24/hour from one 7-minute sample. It was ~100/hour;
+    the sample sat in a trough between ticker bursts.
+  - Called the open-wisp count "flat" from three close samples. It was
+    growing slowly, and the real growth was in a population I was not
+    counting at all.
+  - Called an embedded store "last written 23:45:29", implying writes had
+    STOPPED, during a live incident. It was being written continuously.
+    gastown/witness took three ascending samples and saw it immediately -
+    and that observation is what led to the workaround that unblocked
+    the town.
+
+The stale-tmux-frame error in the section above is the same shape: a frozen
+final frame looks identical to a live one until you look twice.
+
+## VERIFY THE SURVIVOR IS OPEN WHEN CLOSING A DUPLICATE
+
+Credit: gastown/witness, 2026-09-01, after we did this to each other.
+
+Two agents each filed a bead on the same incident. Each read the other's,
+judged it better, and closed their own as the duplicate - IN OPPOSITE
+DIRECTIONS, minutes apart. Net result: both closed, and the night's only P0
+had no open record. Neither close was wrong in isolation. THE DEFERRING IS
+WHAT DELETED THE RECORD.
+
+RULE: after closing one of a duplicate pair, re-read the SURVIVOR and confirm
+it is OPEN. It costs one command.
+
+Why it needs to be a rule rather than common sense: THE FAILURE IS INVISIBLE
+FROM BOTH SIDES. Each agent saw a successful close and had a good reason for
+it. Nothing in either view showed the count going to zero. It was caught only
+because one of us mentioned it in passing.
+
+Related sharp edge: `bd update --append-notes` writes the NOTES field, which
+is NOT comments. Verifying a fold by checking comments will report absence
+for anything written with --append-notes. Check the field you actually wrote.
+
+## A RETRACTION CAN BE AS WRONG AS AN ASSERTION
+
+When someone pushes back, ask what you are conceding: the REASONING or the
+FACT. They are separable. You can have reached a true claim by an unsound
+route - the fix is to repair the route, NOT to abandon the claim. And you can
+be talked out of a correct position by someone more confident than their
+evidence warrants.
+
+On 2026-08-31 the Deacon and the Witness swapped a true claim back and forth
+FOUR times, each retraction sounding more rigorous than the last, before
+primary evidence settled it. Time cost was real and Marc's summary was edited
+in both directions.
+
+## MEASURING THE WRONG THING IS NOT VERIFYING
+
+The worst instance that day was committed BY THE AUTHOR OF THIS STEP, while
+promoting it, hours after writing it.
+
+To settle whether a session died in a restart, I parsed its transcript:
+847 records, 0 malformed, last timestamp 23:40:07.241Z = 17:40:07 MDT, which
+is 14 seconds before the first session_death. I called that verified and said
+so to two agents.
+
+The number was exactly right. The Mayor reproduced it. THE EQUIVALENCE WAS THE
+INFERENCE: I read "last TIMESTAMPED record" as "end of life". The final two
+records of that file are type last-prompt and type cost-state and carry NO
+timestamp field at all. The file kept being written for four more minutes, in
+records a timestamp scan cannot see.
+
+    bfb329ee.jsonl   mtime 17:44:36   <- four minutes AFTER the death window
+    4ab64ba9.jsonl   mtime 17:40:16   <- a sibling the restart DID take
+
+One `ls` would have settled it. The positive control was sitting in the same
+directory the entire time. The actual cause was a MANUAL tmux kill-session by
+the restart operator, which emits no session_death event - which is why the
+absence of a death event, correctly observed, explained nothing.
+
+THE COMPOUNDING HARM, and this is why it earns the space: the Witness had the
+correct mtime in their own output, said the discrepancy out loud, and then
+DISCOUNTED IT because my number sounded more confident. False confidence does
+not just mislead the speaker. It overrides other people's correct data.
+
+Rules for this specific failure:
+- Parsing a file is not verifying a claim unless the field you parsed actually
+  answers the question. Ask: could this measurement be blind to the very thing
+  I am testing?
+- Prefer a check that does not share the failure mode. mtime is filesystem
+  truth and does not care whether records carry timestamps.
+- Look for a POSITIVE CONTROL. A sibling with a known outcome converts an
+  absolute reading into a comparison, and comparisons survive blind spots.
+- Absence of an expected event is not evidence of absence of the act. Manual
+  operations leave no trace in a system's own event log.
+- Before offering an absence as evidence, ask WHERE the signal would have gone
+  if the thing were true. On the same day, the Deacon argued two symptoms had
+  different causes partly because one showed NO error - not realising the
+  error in that case would have printed on the SENDER's stderr, never reaching
+  the observer at all. The absence was fully consistent with both theories, so
+  it supported neither. An absence is only evidence if you would actually have
+  been in a position to see the presence.
+
+## It cannot gate what you already sent
+
+This step runs late, but the patrol NUDGES ALL CYCLE - inbox-check, health-scan
+and zombie-scan all send before this point. So it cannot gate those, and the
+errors that escaped on 2026-08-31 escaped exactly that way: mid-cycle, into
+another agent's context, hours before any digest.
+
+So this step is also a RETRACTION SWEEP. Re-read every nudge you have already
+sent this cycle. For each, ask whether any claim was a conclusion presented as
+an observation. If so, correct it NOW, before the report - do not let the
+digest be the first place the correction appears, and do not wait to be caught.
+
+Correcting yourself unprompted is cheaper than being corrected, and much
+cheaper than having a true claim retracted because nobody could tell which
+kind it was.
+
+(Credit: this section is the Witness's addition, from applying the rule to
+mol-witness-patrol. Their chain has the same hole and they hit it the same day.)
+
+**Exit criteria:** Digest and outbound nudges distinguish observations from
+conclusions. Nudges already sent this cycle have been re-read and any
+inference-as-fact corrected. No causal claim ships without either direct
+evidence or an explicit hedge."""
+
+[[steps]]
 id = "patrol-digest"
 title = "Aggregate daily patrol digests"
-needs = ["costs-digest"]
+needs = ["costs-digest", "observed-vs-concluded"]
 description = """
 **DAILY DIGEST** - Aggregate yesterday's patrol cycle digests.
 
@@ -1180,9 +1528,68 @@ If context is high (>80%), prepare for handoff:
 This enables the Deacon to burn and respawn cleanly."""
 
 [[steps]]
+id = "dispatch-ready-work"
+title = "Dispatch ready work that nobody has claimed"
+needs = ["context-check"]
+description = """
+**You have dispatch authority. Use it.** (Granted by Marc 2026-09-02.)
+
+Diagnosis was never this town's bottleneck — reaching someone with it was. You
+already find stuck work every cycle and report it. Now dispatch it.
+
+## Why this step exists
+
+On the night of 2026-09-01 the Mayor picked up implementation work and stopped
+dispatching for hours. Two Tier-1 bugs sat "Scheduled and unclaimed", all four
+polecats went idle, and nobody noticed until a patrol surfaced it. The Mayor
+should be preparing and dispatching, not the only one who can.
+
+## What to dispatch
+
+```bash
+bd ready --json                 # ready, unblocked, unassigned
+gt polecat list <rig>           # is there capacity?
+```
+
+Sling P0/P1 work beads whose rig has capacity:
+```bash
+gt sling <bead-id> <rig>
+```
+
+## Guardrails — read these before slinging anything
+
+1. **ELIGIBILITY IS PART OF "READY".** A bead can be correctly unclaimed because
+   its executor does not exist yet. `Eligible: ['agent:research']` names a
+   LiveOp-side agent — Gas Town polecats must NEVER take those. Marc was explicit:
+   town agents maintain the town, they are not the execution substrate for LiveOp
+   users' research. If a town polecat ever claims one, that is the incident.
+
+2. **DO NOT RE-SLING WHAT IS ALREADY SCHEDULED.** `gt sling` reports
+   "already scheduled ... no-op" and costs ~2 minutes. Check first.
+
+3. **CAP IT.** At most 3 new dispatches per cycle. You are unblocking flow, not
+   draining the backlog. A flood you cannot review is worse than a queue.
+
+4. **VERIFY THE BEAD IS STILL REAL.** Beads filed by a gap review days ago may
+   already be fixed by other work — check the claim against origin/main before
+   spending a polecat on it. Two DAILY beads were closed this way on 2026-09-02
+   after being verified already-shipped.
+
+5. **NEVER NUKE OR RECOVER A POLECAT TO MAKE ROOM.** If the pool is jammed with
+   `idle-recovery-needed`, report it and stop. That is Marc's call — it destroys
+   session, worktree, branch and agent bead, and `check-recovery`/`git-state` both
+   report squash-merged work as unsafe when it is not (gt-3up).
+
+## Report what you dispatched
+
+Name each bead and rig in your patrol report, and nudge the Mayor. Dispatching
+silently is how two people end up slinging the same bead.
+"""
+
+[[steps]]
 id = "loop-or-exit"
 title = "Loop or exit for respawn"
-needs = ["context-check"]
+needs = ["context-check", "dispatch-ready-work"]
 description = """
 End of patrol cycle decision.
 
