@@ -47,32 +47,9 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build config based on role
-	var cfg PatrolConfig
-	switch Role(roleName) {
-	case RoleDeacon:
-		cfg = PatrolConfig{
-			RoleName:      "deacon",
-			PatrolMolName: constants.MolDeaconPatrol,
-			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      "deacon",
-		}
-	case RoleWitness:
-		cfg = PatrolConfig{
-			RoleName:      "witness",
-			PatrolMolName: constants.MolWitnessPatrol,
-			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      roleInfo.Rig + "/witness",
-		}
-	case RoleRefinery:
-		cfg = PatrolConfig{
-			RoleName:      "refinery",
-			PatrolMolName: constants.MolRefineryPatrol,
-			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      roleInfo.Rig + "/refinery",
-			ExtraVars:     buildRefineryPatrolVars(roleInfo),
-		}
-	default:
-		return fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", roleName)
+	cfg, err := patrolConfigForRole(roleName, roleInfo)
+	if err != nil {
+		return err
 	}
 
 	// Create and hook the wisp
@@ -89,4 +66,61 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 
 	fmt.Println(patrolID)
 	return nil
+}
+
+// patrolConfigForRole builds the PatrolConfig for a patrol-capable role.
+//
+// Assignee MUST come from buildAgentIdentity, which is the same function
+// gt hook (gt mol status) uses to construct the address it queries. Writing
+// the assignee as a separate literal here is what caused gt-7rne: this
+// function wrote the Deacon's assignee as "deacon" while buildAgentIdentity
+// queried "deacon/", and listAssignedActiveWork matches the assignee exactly,
+// with no normalization anywhere on the path. The result was a patrol wisp
+// created in HOOKED state that gt hook could never see, so the Deacon read
+// its own hook as empty and stood down.
+//
+// Deriving the written address from the read address makes that drift
+// impossible rather than merely corrected. Do not reintroduce a literal here.
+func patrolConfigForRole(roleName string, roleInfo RoleInfo) (PatrolConfig, error) {
+	role := Role(roleName)
+
+	switch role {
+	case RoleDeacon, RoleWitness, RoleRefinery:
+	default:
+		return PatrolConfig{}, fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", roleName)
+	}
+
+	// The address gt hook will query for this agent. Deriving it here rather
+	// than restating it as a literal is the point of this function.
+	identity := buildAgentIdentity(RoleInfo{Role: role, Rig: roleInfo.Rig})
+	if identity == "" {
+		return PatrolConfig{}, fmt.Errorf("cannot determine agent identity for patrol role %q", roleName)
+	}
+
+	switch role {
+	case RoleDeacon:
+		return PatrolConfig{
+			RoleName:      "deacon",
+			PatrolMolName: constants.MolDeaconPatrol,
+			BeadsDir:      roleInfo.TownRoot,
+			Assignee:      identity,
+		}, nil
+	case RoleWitness:
+		return PatrolConfig{
+			RoleName:      "witness",
+			PatrolMolName: constants.MolWitnessPatrol,
+			BeadsDir:      roleInfo.TownRoot,
+			Assignee:      identity,
+		}, nil
+	case RoleRefinery:
+		return PatrolConfig{
+			RoleName:      "refinery",
+			PatrolMolName: constants.MolRefineryPatrol,
+			BeadsDir:      roleInfo.TownRoot,
+			Assignee:      identity,
+			ExtraVars:     buildRefineryPatrolVars(roleInfo),
+		}, nil
+	default:
+		return PatrolConfig{}, fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", roleName)
+	}
 }

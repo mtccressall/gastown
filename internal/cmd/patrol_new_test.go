@@ -48,3 +48,66 @@ func TestPatrolNewCmd_HasRoleFlag(t *testing.T) {
 		t.Error("patrol new command missing --role flag")
 	}
 }
+
+// TestPatrolConfigAssigneeMatchesHookLookup is the regression test for gt-7rne.
+//
+// gt patrol new writes a wisp with cfg.Assignee; gt hook (gt mol status) looks
+// that wisp up using buildAgentIdentity(). listAssignedActiveWork matches the
+// assignee EXACTLY -- nothing on that path trims or normalizes a trailing
+// slash. So if the two disagree by even one character, gt patrol new produces
+// a HOOKED wisp that gt hook reports as "Nothing on hook", and the agent reads
+// its own hook as empty.
+//
+// The original defect was exactly one character: patrol_new wrote "deacon"
+// while buildAgentIdentity queried "deacon/". This asserts the INVARIANT for
+// every patrol-capable role, not just the instance that broke, so drift in
+// any of them fails here instead of silently blanking an agent's hook.
+func TestPatrolConfigAssigneeMatchesHookLookup(t *testing.T) {
+	const rig = "testrig"
+
+	for _, role := range []Role{RoleDeacon, RoleWitness, RoleRefinery} {
+		t.Run(string(role), func(t *testing.T) {
+			cfg, err := patrolConfigForRole(string(role), RoleInfo{Rig: rig, TownRoot: t.TempDir()})
+			if err != nil {
+				t.Fatalf("patrolConfigForRole(%q): %v", role, err)
+			}
+
+			// The address gt hook will actually query for this agent.
+			want := buildAgentIdentity(RoleInfo{Role: role, Rig: rig})
+			if want == "" {
+				t.Fatalf("buildAgentIdentity returned empty for role %q", role)
+			}
+
+			if cfg.Assignee != want {
+				t.Errorf("assignee written by gt patrol new does not match the address gt hook queries\n"+
+					"  role:            %s\n"+
+					"  patrol new wrote: %q\n"+
+					"  gt hook queries:  %q\n"+
+					"a wisp written this way is HOOKED but invisible to gt hook (gt-7rne)",
+					role, cfg.Assignee, want)
+			}
+		})
+	}
+}
+
+// TestPatrolConfigDeaconAssigneeIsCanonical pins the specific value that broke.
+// Town-level agents (mayor, deacon) carry a trailing slash; see
+// canonicalAssigneeAddress in sling_target.go, which documents this as the
+// canonical assignee form and names the bare form as the read/write mismatch.
+func TestPatrolConfigDeaconAssigneeIsCanonical(t *testing.T) {
+	cfg, err := patrolConfigForRole("deacon", RoleInfo{TownRoot: t.TempDir()})
+	if err != nil {
+		t.Fatalf("patrolConfigForRole(deacon): %v", err)
+	}
+	if cfg.Assignee != "deacon/" {
+		t.Errorf("deacon patrol assignee = %q, want %q (town-level roles take a trailing slash)", cfg.Assignee, "deacon/")
+	}
+}
+
+func TestPatrolConfigForRole_UnsupportedRole(t *testing.T) {
+	for _, role := range []string{"mayor", "polecat", "crew", "unknown", ""} {
+		if _, err := patrolConfigForRole(role, RoleInfo{Rig: "testrig"}); err == nil {
+			t.Errorf("patrolConfigForRole(%q) = nil error, want error", role)
+		}
+	}
+}
