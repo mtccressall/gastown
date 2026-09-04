@@ -161,10 +161,19 @@ func runPolecatRelease(cmd *cobra.Command, args []string) error {
 	// Read back. A write that reports success without persisting is the defect
 	// this whole command exists to clean up after; it must not be the defect the
 	// command itself ships.
-	if _, after, vErr := bd.GetAgentBead(agentBeadID); vErr == nil && after != nil {
-		if strings.TrimSpace(after.HookBead) != "" {
-			return fmt.Errorf("wrote the clear but %s still reads hook_bead=%s; NOT released", agentBeadID, after.HookBead)
-		}
+	// A readback that CANNOT RUN is not a readback that passed. The original
+	// version skipped verification on error or nil fields and printed "Released"
+	// anyway — reporting success for a write whose persistence is unknown, which
+	// is the exact defect this command exists to clean up after. (codex review)
+	_, after, vErr := bd.GetAgentBead(agentBeadID)
+	if vErr != nil {
+		return fmt.Errorf("wrote the clear to %s but could not read it back to verify (%v); treat as NOT released and re-check before relying on it", agentBeadID, vErr)
+	}
+	if after == nil {
+		return fmt.Errorf("wrote the clear to %s but the readback returned no agent bead; treat as NOT released", agentBeadID)
+	}
+	if strings.TrimSpace(after.HookBead) != "" {
+		return fmt.Errorf("wrote the clear but %s still reads hook_bead=%s; NOT released", agentBeadID, after.HookBead)
 	}
 
 	fmt.Printf("✓ Released %s/%s\n", rigName, polecatName)
