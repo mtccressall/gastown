@@ -2,11 +2,14 @@ package cmd
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 func TestGetTTL(t *testing.T) {
@@ -301,4 +304,139 @@ func compactSourceBetween(t *testing.T, source, startMarker, endMarker string) s
 		t.Fatalf("could not find %q after %q", endMarker, startMarker)
 	}
 	return source[start : start+end]
+}
+
+// writeTestTown creates a town root with a rigs.json listing the given rigs,
+// plus a .beads directory per rig so redirect resolution has something to land
+// on. Returns the town root.
+func writeTestTown(t *testing.T, rigNames ...string) string {
+	t.Helper()
+
+	townRoot := t.TempDir()
+	rigs := make(map[string]config.RigEntry, len(rigNames))
+	for _, name := range rigNames {
+		rigs[name] = config.RigEntry{GitURL: "https://example.invalid/" + name + ".git"}
+		if err := os.MkdirAll(filepath.Join(townRoot, name, ".beads"), 0o755); err != nil {
+			t.Fatalf("creating rig %s: %v", name, err)
+		}
+	}
+	if err := config.SaveRigsConfig(constants.MayorRigsPath(townRoot), &config.RigsConfig{Version: 1, Rigs: rigs}); err != nil {
+		t.Fatalf("saving rigs config: %v", err)
+	}
+	return townRoot
+}
+
+// An unknown --rig used to be accepted silently and report "0 wisps scanned",
+// making a wrong scope indistinguishable from an empty store (gt-kei9).
+func TestResolveCompactScopeRejectsUnknownRig(t *testing.T) {
+	t.Setenv("GT_RIG", "")
+	townRoot := writeTestTown(t, "gastown", "liveop")
+
+	for _, name := range []string{"nonsense", "gt", "town"} {
+		t.Run(name, func(t *testing.T) {
+			scope, err := resolveCompactScope(townRoot, townRoot, name)
+			if err == nil {
+				t.Fatalf("resolveCompactScope(%q) = %+v, want error", name, scope)
+			}
+			// The error must name the rejected value and the rigs that do exist,
+			// so the caller can act on it without a second command.
+			for _, want := range []string{name, "gastown", "liveop"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveCompactScopeAcceptsKnownRig(t *testing.T) {
+	t.Setenv("GT_RIG", "")
+	townRoot := writeTestTown(t, "gastown", "liveop")
+
+	scope, err := resolveCompactScope(townRoot, townRoot, "liveop")
+	if err != nil {
+		t.Fatalf("resolveCompactScope(liveop): %v", err)
+	}
+	if scope.Name != "liveop" {
+		t.Errorf("scope.Name = %q, want liveop", scope.Name)
+	}
+	if scope.Source != "--rig" {
+		t.Errorf("scope.Source = %q, want --rig", scope.Source)
+	}
+	// The scan must be scoped to the named rig's store, not to the working
+	// directory. Before this, --rig only selected TTLs.
+	wantBeads := filepath.Join(townRoot, "liveop", ".beads")
+	if scope.BeadsDir != wantBeads {
+		t.Errorf("scope.BeadsDir = %q, want %q", scope.BeadsDir, wantBeads)
+	}
+	if scope.WorkDir != filepath.Join(townRoot, "liveop") {
+		t.Errorf("scope.WorkDir = %q, want the rig path", scope.WorkDir)
+	}
+}
+
+// GT_RIG reaches the same code path as --rig, so it gets the same validation
+// and the error has to say which one supplied the bad name.
+func TestResolveCompactScopeValidatesGTRig(t *testing.T) {
+	townRoot := writeTestTown(t, "gastown")
+	t.Setenv("GT_RIG", "nonsense")
+
+	_, err := resolveCompactScope(townRoot, townRoot, "")
+	if err == nil {
+		t.Fatal("resolveCompactScope with GT_RIG=nonsense returned nil error")
+	}
+	if !strings.Contains(err.Error(), "GT_RIG") {
+		t.Errorf("error %q does not name GT_RIG as the source", err)
+	}
+}
+
+func TestResolveCompactScopeFallsBackToCwd(t *testing.T) {
+	t.Setenv("GT_RIG", "")
+	townRoot := writeTestTown(t, "gastown")
+	workDir := filepath.Join(townRoot, "gastown")
+
+	scope, err := resolveCompactScope(workDir, townRoot, "")
+	if err != nil {
+		t.Fatalf("resolveCompactScope with no rig: %v", err)
+	}
+	if scope.Name != "cwd" || scope.Source != "cwd" {
+		t.Errorf("scope = {Name:%q Source:%q}, want both \"cwd\"", scope.Name, scope.Source)
+	}
+	if scope.WorkDir != workDir {
+		t.Errorf("scope.WorkDir = %q, want %q", scope.WorkDir, workDir)
+	}
+}
+
+// Outside a workspace there is no rigs.json to validate against, so a rig name
+// must fail rather than be accepted unchecked.
+func TestResolveCompactScopeRequiresTownRootForRig(t *testing.T) {
+	t.Setenv("GT_RIG", "")
+
+	_, err := resolveCompactScope(t.TempDir(), "", "gastown")
+	if err == nil {
+		t.Fatal("resolveCompactScope with no town root returned nil error")
+	}
+}
+
+// The scan query omits --include-infra, so it cannot see wisps. The shortfall
+// probe must use the flag, or it measures the same blind spot twice and
+// reports a reassuring zero.
+func TestCountHiddenWispsQueryIncludesInfra(t *testing.T) {
+	data, err := os.ReadFile("compact.go")
+	if err != nil {
+		t.Fatalf("read compact.go: %v", err)
+	}
+	src := string(data)
+
+	idx := strings.Index(src, "func countHiddenWisps(")
+	if idx < 0 {
+		t.Fatal("countHiddenWisps not found in compact.go")
+	}
+	end := strings.Index(src[idx:], "\n}\n")
+	if end < 0 {
+		t.Fatal("could not delimit countHiddenWisps body")
+	}
+	body := src[idx : idx+end]
+	if !strings.Contains(body, `"--include-infra"`) {
+		t.Error("countHiddenWisps does not pass --include-infra; it would report the same zero the scan does")
+	}
 }
