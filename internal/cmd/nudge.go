@@ -151,6 +151,33 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
+// startNudgePoller is nudge.StartPoller, indirected through a var so tests can
+// observe the recovery attempt without spawning a real background process.
+var startNudgePoller = nudge.StartPoller
+
+// enqueueAndEnsurePoller writes a nudge to the target's queue and then makes
+// sure a poller exists to drain it. Every wait-idle enqueue goes through here,
+// so a queue write and its drain guarantee cannot drift apart.
+//
+// The poller is normally started at session start, but if it later dies —
+// crashed, or the session was started by hand — nothing else ever starts
+// another, and queued nudges sit until they expire. Claude Code's
+// UserPromptSubmit hook is not a fallback: every hook in this town drains mail,
+// not the nudge queue, so the poller is the only drain path.
+//
+// StartPoller is idempotent (it early-returns while a poller is alive), so this
+// costs nothing on the healthy path. It is called only after a successful
+// Enqueue: with nothing in the queue there is nothing to drain. (gastown-ku3)
+func enqueueAndEnsurePoller(townRoot, sessionName string, n nudge.QueuedNudge) error {
+	if err := nudge.Enqueue(townRoot, sessionName, n); err != nil {
+		return err
+	}
+	if _, pollerErr := startNudgePoller(townRoot, sessionName); pollerErr != nil {
+		fmt.Fprintf(os.Stderr, "wait-idle: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
+	}
+	return nil
+}
+
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -211,7 +238,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			preset := config.GetAgentPresetByName(agentName)
 			if preset != nil && preset.ReadyPromptPrefix == "" {
 				fmt.Fprintf(os.Stderr, "wait-idle: %s agent %q has no prompt detection, using queue mode\n", sessionName, agentName)
-				if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+				if qErr := enqueueAndEnsurePoller(townRoot, sessionName, nudge.QueuedNudge{
 					Sender:   sender,
 					Message:  message,
 					Priority: nudgePriorityFlag,
@@ -222,14 +249,6 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 						Priority: nudgePriorityFlag,
 					}})
 					return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
-				}
-				// Ensure a nudge-poller is running so the queue actually drains.
-				// The poller is normally started by gt crew start, but if the
-				// session was started manually (or the poller crashed), queued
-				// nudges sit undelivered forever. StartPoller is idempotent —
-				// it no-ops if a poller is already alive for this session.
-				if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
-					fmt.Fprintf(os.Stderr, "wait-idle: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
 				}
 				return nil
 			}
@@ -250,7 +269,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				return deliverErr
 			}
 			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
-			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+			if qErr := enqueueAndEnsurePoller(townRoot, sessionName, nudge.QueuedNudge{
 				Sender:   sender,
 				Message:  message,
 				Priority: nudgePriorityFlag,
@@ -265,7 +284,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			return fmt.Errorf("wait-idle: %w", err)
 		}
 		// Timeout (agent busy) — queue instead
-		if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		if qErr := enqueueAndEnsurePoller(townRoot, sessionName, nudge.QueuedNudge{
 			Sender:   sender,
 			Message:  message,
 			Priority: nudgePriorityFlag,

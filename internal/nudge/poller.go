@@ -1,7 +1,12 @@
-// poller.go provides a background nudge-queue poller for agents that lack
-// turn-boundary drain hooks (e.g., Gemini, Codex). Claude Code drains its
-// queue via the UserPromptSubmit hook on every turn. Other runtimes have no
-// equivalent hook, so queued nudges would sit undelivered forever.
+// poller.go provides a background nudge-queue poller.
+//
+// The poller is the ONLY drain path for the nudge queue, for every runtime
+// including Claude Code. An earlier version of this comment claimed Claude
+// agents drain via the UserPromptSubmit hook on every turn and therefore did
+// not need a poller. That is wrong: the UserPromptSubmit hooks deployed in a
+// Gas Town workspace drain MAIL, not the nudge queue. A session whose poller
+// dies has no fallback, and its queued nudges sit until they expire — measured
+// as 24 expired, undelivered nudges town-wide (gastown-ku3, gt-gpwt).
 //
 // The poller runs as a background goroutine launched by crew/manager.Start().
 // It polls the queue every PollInterval, waits for the agent to be idle, then
