@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/nudge"
 )
 
 func TestShouldSkipDrainUntilIdle(t *testing.T) {
@@ -38,7 +40,10 @@ func TestTrackPollerPidFileRoundTrip(t *testing.T) {
 	const session = "gastown-refinery"
 	path := filepath.Join(townRoot, ".runtime", "nudge_poller", session+".pid")
 
-	untrack := trackPollerPidFile(townRoot, session, 1221266)
+	untrack, err := trackPollerPidFile(townRoot, session, 1221266)
+	if err != nil {
+		t.Fatalf("trackPollerPidFile: %v", err)
+	}
 
 	// A directly invoked `gt nudge-poller` used to leave nothing here, so the
 	// "already running" guard could not fire and any pid-file census reported a
@@ -58,14 +63,37 @@ func TestTrackPollerPidFileRoundTrip(t *testing.T) {
 	}
 }
 
-func TestTrackPollerPidFileCleanupSparesASuccessor(t *testing.T) {
+func TestTrackPollerPidFileRefusesASecondPoller(t *testing.T) {
 	t.Parallel()
 
 	townRoot := t.TempDir()
 	const session = "hq-deacon"
+
+	// Our own pid is the one process we can be certain is alive.
+	untrack, err := trackPollerPidFile(townRoot, session, os.Getpid())
+	if err != nil {
+		t.Fatalf("first trackPollerPidFile: %v", err)
+	}
+	defer untrack()
+
+	// Starting anyway would put a second consumer on one queue, and this
+	// invocation's exit would then erase the record of both.
+	if _, err := trackPollerPidFile(townRoot, session, 4242); !errors.Is(err, nudge.ErrPollerAlreadyRunning) {
+		t.Fatalf("second trackPollerPidFile err = %v, want ErrPollerAlreadyRunning", err)
+	}
+}
+
+func TestTrackPollerPidFileCleanupSparesASuccessor(t *testing.T) {
+	t.Parallel()
+
+	townRoot := t.TempDir()
+	const session = "hq-boot"
 	path := filepath.Join(townRoot, ".runtime", "nudge_poller", session+".pid")
 
-	untrack := trackPollerPidFile(townRoot, session, 4242)
+	untrack, err := trackPollerPidFile(townRoot, session, 4242)
+	if err != nil {
+		t.Fatalf("trackPollerPidFile: %v", err)
+	}
 
 	// StopPoller removes the file straight after SIGTERM, so a replacement can
 	// claim the slot before the dying poller's deferred cleanup runs.
