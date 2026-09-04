@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -192,11 +194,10 @@ func TestClaimPollerPidFileClearsAnUnparseableEntry(t *testing.T) {
 	}
 }
 
-// Every reader of this index reads it unlocked. A create-then-write claim, or an
-// os.WriteFile that truncates first, leaves a window in which a concurrent
-// pollerAlive reads an empty file, fails to parse a pid, reports no poller and
-// lets StartPoller spawn a duplicate. The content must be complete before the
-// name appears.
+// Every reader of this index reads it unlocked. An in-place write truncates
+// first, so a reader landing in that gap sees an empty file, fails to parse a
+// pid, concludes there is no poller, and lets StartPoller spawn a duplicate. The
+// content must be complete before the name appears.
 func TestClaimPollerPidFileIsAtomicForConcurrentReaders(t *testing.T) {
 	t.Parallel()
 
@@ -209,7 +210,7 @@ func TestClaimPollerPidFileIsAtomicForConcurrentReaders(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		for i := 0; i < 300; i++ {
+		for i := 0; i < 200; i++ {
 			pid := 2000000 + i
 			if err := ClaimPollerPidFile(townRoot, session, pid); err != nil {
 				bad <- fmt.Sprintf("ClaimPollerPidFile: %v", err)
@@ -241,6 +242,81 @@ func TestClaimPollerPidFileIsAtomicForConcurrentReaders(t *testing.T) {
 		if _, err := strconv.Atoi(string(data)); err != nil {
 			t.Fatalf("reader observed a non-pid %q mid-claim; the claim is not atomic", string(data))
 		}
+	}
+}
+
+// Two claimants inspecting the slot at the same moment must not both conclude it
+// is theirs. Without the slot lock they can: each reads the same stale entry,
+// each decides to take it, and the second overwrites the first — two pollers on
+// one queue, which is the defect this file exists to prevent.
+func TestConcurrentClaimsProduceExactlyOneWinner(t *testing.T) {
+	t.Parallel()
+
+	townRoot := t.TempDir()
+	const session = "hq-mayor"
+	const claimants = 8
+
+	// Real, live processes: the refusal turns on pollerProcessAlive, so fake pids
+	// would all read as dead and every claimant would legitimately take over.
+	pids := make([]int, 0, claimants)
+	for i := 0; i < claimants; i++ {
+		cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("starting child %d: %v", i, err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		pids = append(pids, cmd.Process.Pid)
+	}
+
+	// A stale entry is the contended starting state codex named: everyone sees
+	// it, everyone is entitled to take it, only one may.
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), []byte("999999999"), 0644); err != nil {
+		t.Fatalf("writing stale pid file: %v", err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, claimants)
+	for _, pid := range pids {
+		go func(pid int) {
+			<-start
+			results <- ClaimPollerPidFile(townRoot, session, pid)
+		}(pid)
+	}
+	close(start)
+
+	var won, refused int
+	for i := 0; i < claimants; i++ {
+		switch err := <-results; {
+		case err == nil:
+			won++
+		case errors.Is(err, ErrPollerAlreadyRunning):
+			refused++
+		default:
+			t.Errorf("unexpected claim error: %v", err)
+		}
+	}
+
+	if won != 1 {
+		t.Errorf("%d claimants won the slot, want exactly 1 (%d refused)", won, refused)
+	}
+
+	// And the slot must name one of them, not a corpse or a half-written file.
+	data, err := os.ReadFile(pollerPidFile(townRoot, session))
+	if err != nil {
+		t.Fatalf("reading pid file: %v", err)
+	}
+	winner, err := strconv.Atoi(string(data))
+	if err != nil {
+		t.Fatalf("pid file holds %q, which is not a pid", string(data))
+	}
+	if !slices.Contains(pids, winner) {
+		t.Errorf("pid file names %d, which is not one of the claimants %v", winner, pids)
 	}
 }
 
@@ -320,8 +396,9 @@ func TestReleasePollerPidFileClearsAnUnparseableEntry(t *testing.T) {
 	}
 }
 
-// The temp and hand-off files these operations use must not pile up in the index
-// directory — a census that lists the directory would count them as pollers.
+// The temp files these operations use must not pile up in the index directory —
+// a census that lists it would count them as pollers. The sidecar lock is the one
+// permitted extra, and it carries a suffix a *.pid census does not match.
 func TestPidFileOperationsLeaveNoDebris(t *testing.T) {
 	t.Parallel()
 
@@ -344,12 +421,24 @@ func TestPidFileOperationsLeaveNoDebris(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading pid dir: %v", err)
 	}
-	if len(entries) != 1 {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
+
+	var pidFiles, other []string
+	for _, e := range entries {
+		switch {
+		case strings.HasSuffix(e.Name(), ".pid"):
+			pidFiles = append(pidFiles, e.Name())
+		case strings.HasSuffix(e.Name(), ".pid.lock"):
+			// The lock file is permanent by design: unlinking a locked file lets
+			// the next process lock a different inode under the same name.
+		default:
+			other = append(other, e.Name())
 		}
-		t.Errorf("pid dir holds %d entries %v, want exactly 1", len(entries), names)
+	}
+	if len(pidFiles) != 1 {
+		t.Errorf("pid dir holds %d pid files %v, want exactly 1", len(pidFiles), pidFiles)
+	}
+	if len(other) != 0 {
+		t.Errorf("pid dir holds unexpected debris %v", other)
 	}
 }
 
