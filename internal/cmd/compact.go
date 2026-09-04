@@ -5,13 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/suggest"
 	"github.com/steveyegge/gastown/internal/wisp"
 )
 
@@ -36,11 +41,22 @@ var defaultTTLs = map[string]time.Duration{
 
 // compactResult tracks what happened to each wisp during compaction.
 type compactResult struct {
+	// Scope and Store name the store this run actually scanned. Without them a
+	// "0 wisps scanned" line is unattributable: a wrong scope and a genuinely
+	// empty store print the same report (gt-kei9 / gastown-c62).
+	Scope            string          `json:"scope"`
+	Store            string          `json:"store"`
 	Promoted         []compactAction `json:"promoted"`
 	Deleted          []compactAction `json:"deleted"`
 	Skipped          int             `json:"skipped"`            // wisps still within TTL
 	OrphanedWispDeps int             `json:"orphaned_wisp_deps"` // stale wisp_dependencies removed
-	Errors           []string        `json:"errors,omitempty"`
+	// HiddenWisps counts ephemeral rows that exist in the scanned store but are
+	// invisible to the scan query, which omits --include-infra. Only measured
+	// when the scan itself came back empty. Reported, never acted on: this run
+	// deletes and promotes exactly what it can see, and nothing else.
+	HiddenWisps      int      `json:"hidden_wisps"`
+	HiddenWispsError string   `json:"hidden_wisps_error,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
 }
 
 type compactAction struct {
@@ -70,7 +86,12 @@ Examples:
   gt compact              # Run compaction
   gt compact --dry-run    # Preview what would happen
   gt compact --verbose    # Show each wisp decision
-  gt compact --json       # Machine-readable output`,
+  gt compact --json       # Machine-readable output
+  gt compact --rig liveop # Compact the liveop rig's store
+
+Scope: --rig names the rig whose store is scanned; without it, $GT_RIG is used,
+and without that the store the working directory routes to. An unknown rig name
+is an error, never a silent no-op. Every run names the store it scanned.`,
 	RunE: runCompact,
 }
 
@@ -78,7 +99,7 @@ func init() {
 	compactCmd.Flags().BoolVar(&compactDryRun, "dry-run", false, "Preview compaction without making changes")
 	compactCmd.Flags().BoolVarP(&compactVerbose, "verbose", "v", false, "Show each wisp decision")
 	compactCmd.Flags().BoolVar(&compactJSON, "json", false, "Output results as JSON")
-	compactCmd.Flags().StringVar(&compactRig, "rig", "", "Compact a specific rig (default: current rig)")
+	compactCmd.Flags().StringVar(&compactRig, "rig", "", "Compact a specific rig's store (default: $GT_RIG, else the store the working directory routes to)")
 
 	rootCmd.AddCommand(compactCmd)
 }
@@ -173,6 +194,76 @@ type compactIssue struct {
 	WispType     string `json:"wisp_type,omitempty"`
 }
 
+// compactScope names the store a compaction run operates on, and how that
+// store was chosen.
+type compactScope struct {
+	// Name is the rig name, or "cwd" when no rig was named and the run falls
+	// back to whatever the working directory routes to.
+	Name string
+	// Source describes where Name came from, for error messages: "--rig",
+	// "GT_RIG" or "cwd".
+	Source string
+	// WorkDir is the directory bd runs in.
+	WorkDir string
+	// BeadsDir is the resolved .beads directory that will be scanned.
+	BeadsDir string
+}
+
+// resolveCompactScope decides which store this run scans, and refuses to run
+// against a rig name that does not exist.
+//
+// An unknown --rig used to be accepted silently: the name was consulted only
+// for TTL configuration, the scan still ran against the working directory, and
+// the run reported "0 wisps scanned". A wrong scope and an empty store were
+// indistinguishable, which is why an inert compactor went unnoticed for days
+// (gt-kei9). A name that does not resolve to a store is now an error, and a
+// name that does resolve scopes the scan to that rig's store rather than only
+// its TTLs.
+func resolveCompactScope(workDir, townRoot, flagRig string) (*compactScope, error) {
+	rigName, source := flagRig, "--rig"
+	if rigName == "" {
+		rigName, source = os.Getenv("GT_RIG"), "GT_RIG"
+	}
+
+	if rigName == "" {
+		return &compactScope{
+			Name:     "cwd",
+			Source:   "cwd",
+			WorkDir:  workDir,
+			BeadsDir: beads.ResolveBeadsDir(workDir),
+		}, nil
+	}
+
+	if townRoot == "" {
+		return nil, fmt.Errorf("%s=%s given, but %s is not inside a Gas Town workspace so the rig cannot be resolved",
+			source, rigName, workDir)
+	}
+
+	rigsConfig, err := config.LoadRigsConfig(constants.MayorRigsPath(townRoot))
+	if err != nil {
+		return nil, fmt.Errorf("loading rigs config to validate %s=%s: %w", source, rigName, err)
+	}
+
+	if _, ok := rigsConfig.Rigs[rigName]; !ok {
+		known := make([]string, 0, len(rigsConfig.Rigs))
+		for name := range rigsConfig.Rigs {
+			known = append(known, name)
+		}
+		sort.Strings(known)
+		msg := suggest.FormatSuggestion("rig", rigName, suggest.FindSimilar(rigName, known, 3), "")
+		return nil, fmt.Errorf("%s=%s: %s\n\n  Known rigs: %s",
+			source, rigName, msg, strings.Join(known, ", "))
+	}
+
+	rigPath := filepath.Join(townRoot, rigName)
+	return &compactScope{
+		Name:     rigName,
+		Source:   source,
+		WorkDir:  rigPath,
+		BeadsDir: beads.ResolveBeadsDir(rigPath),
+	}, nil
+}
+
 func runCompact(cmd *cobra.Command, args []string) error {
 	now := time.Now().UTC()
 
@@ -183,26 +274,42 @@ func runCompact(cmd *cobra.Command, args []string) error {
 	}
 
 	townRoot := beads.FindTownRoot(workDir)
-	rigName := compactRig
-	if rigName == "" {
-		rigName = os.Getenv("GT_RIG")
+
+	scope, err := resolveCompactScope(workDir, townRoot, compactRig)
+	if err != nil {
+		return err
+	}
+
+	rigName := scope.Name
+	if scope.Source == "cwd" {
+		rigName = ""
 	}
 
 	// Load TTL config
 	ttls := loadTTLConfig(townRoot, rigName)
 
-	// Query all ephemeral (wisp) issues via bd list
-	bd := beads.New(workDir)
+	// Query all ephemeral (wisp) issues via bd list, against the scoped store.
+	bd := beads.NewWithBeadsDir(scope.WorkDir, scope.BeadsDir)
 	allWisps, err := listWisps(bd)
 	if err != nil {
-		return fmt.Errorf("listing wisps: %w", err)
+		return fmt.Errorf("listing wisps in %s: %w", scope.BeadsDir, err)
 	}
 
 	if !compactJSON && !compactDryRun {
-		fmt.Printf("Compacting %d wisps...\n", len(allWisps))
+		fmt.Printf("Compacting %d wisps in %s (%s)...\n", len(allWisps), scope.BeadsDir, scope.Name)
 	}
 
-	result := &compactResult{}
+	result := &compactResult{Scope: scope.Name, Store: scope.BeadsDir}
+
+	// An empty scan is the exact shape this bug family keeps producing, so it
+	// gets a positive control rather than a clean report. See countHiddenWisps.
+	if len(allWisps) == 0 {
+		if hidden, herr := countHiddenWisps(bd); herr != nil {
+			result.HiddenWispsError = herr.Error()
+		} else {
+			result.HiddenWisps = hidden
+		}
+	}
 
 	for _, w := range allWisps {
 		age, err := wispAge(w, now)
@@ -333,6 +440,37 @@ func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
 	return wisps, nil
 }
 
+// countHiddenWisps reports how many ephemeral rows the scan query cannot see.
+//
+// listWisps runs "bd list --all", which omits --include-infra. Wisps are infra
+// and hidden by that filter, so the scan can return zero rows from a store
+// holding thousands of them, and the run prints a clean "0 wisps scanned". The
+// shortfall leaves no trace in the output, which is how an inert compactor sat
+// unnoticed next to a wisp count that kept climbing (gt-kei9).
+//
+// This measures the shortfall and does nothing about it. Widening the scan
+// query would silently arm deletion and promotion over every wisp in the store,
+// which is not a change to make as a side effect of a reporting fix.
+func countHiddenWisps(bd *beads.Beads) (int, error) {
+	out, err := bd.Run("list", "--json", "--all", "--include-infra", "-n", "0")
+	if err != nil {
+		return 0, err
+	}
+
+	var allIssues []*compactIssue
+	if err := json.Unmarshal(extractJSONArray(out), &allIssues); err != nil {
+		return 0, fmt.Errorf("parsing issue list: %w", err)
+	}
+
+	hidden := 0
+	for _, issue := range allIssues {
+		if issue.Ephemeral {
+			hidden++
+		}
+	}
+	return hidden, nil
+}
+
 // extractJSONArray finds the first '[' byte in data and returns from that
 // point onward. This strips any non-JSON prefix (warning messages, notices)
 // that a subprocess may emit to stdout before the actual JSON payload.
@@ -416,11 +554,25 @@ func printCompactSummary(result *compactResult) {
 		fmt.Printf("\n%s Compaction complete\n", style.Success.Render("✓"))
 	}
 
+	fmt.Printf("  Scope:    %s\n", result.Scope)
+	fmt.Printf("  Store:    %s\n", result.Store)
 	fmt.Printf("  Promoted: %d\n", promoted)
 	fmt.Printf("  Deleted:  %d\n", deleted)
 	fmt.Printf("  Skipped:  %d (within TTL)\n", result.Skipped)
 	if result.OrphanedWispDeps > 0 {
 		fmt.Printf("  Cleaned:  %d orphaned wisp dependency ref(s)\n", result.OrphanedWispDeps)
+	}
+
+	if result.HiddenWispsError != "" {
+		fmt.Printf("\n%s Scanned 0 wisps and could not check whether that is real: %s\n",
+			style.Warning.Render("⚠"), result.HiddenWispsError)
+	} else if result.HiddenWisps > 0 {
+		fmt.Printf("\n%s Scanned 0 wisps, but this store holds %d ephemeral row(s).\n",
+			style.Warning.Render("⚠"), result.HiddenWisps)
+		fmt.Printf("  They are invisible to the scan query, which omits --include-infra,\n")
+		fmt.Printf("  so this run compacted nothing and the report above is not evidence\n")
+		fmt.Printf("  that there was nothing to compact. See gt-kei9.\n")
+		fmt.Printf("  Reproduce: bd list --json --all --include-infra -n 0\n")
 	}
 
 	if len(result.Errors) > 0 {

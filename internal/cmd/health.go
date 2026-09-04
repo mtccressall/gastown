@@ -8,11 +8,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/health"
 	"github.com/steveyegge/gastown/internal/style"
@@ -23,15 +28,53 @@ var (
 	healthJSON bool
 )
 
+// beadsStoreCountTimeout bounds how long gt health waits for one store's issue
+// count. Shorter than bd's own 60s subprocess timeout on purpose: an unanswered
+// count is reported, and the rest of the report still prints.
+const beadsStoreCountTimeout = 15 * time.Second
+
 // HealthReport is the machine-readable output of gt health --json.
 type HealthReport struct {
-	Timestamp string              `json:"timestamp"`
-	Server    *ServerHealth       `json:"server"`
-	Databases []DatabaseHealth    `json:"databases"`
-	Pollution []PollutionRecord   `json:"pollution,omitempty"`
-	Backups   *BackupHealth       `json:"backups"`
-	Processes *ProcessHealth      `json:"processes"`
-	Orphans   []OrphanDB          `json:"orphans,omitempty"`
+	Timestamp string           `json:"timestamp"`
+	Server    *ServerHealth    `json:"server"`
+	Databases []DatabaseHealth `json:"databases"`
+	// BeadsStores reports the stores bd actually reads, which are not
+	// necessarily the databases served by Server. See checkBeadsStores.
+	BeadsStores []BeadsStoreHealth `json:"beads_stores"`
+	Pollution   []PollutionRecord  `json:"pollution,omitempty"`
+	Backups     *BackupHealth      `json:"backups"`
+	Processes   *ProcessHealth     `json:"processes"`
+	Orphans     []OrphanDB         `json:"orphans,omitempty"`
+}
+
+// BeadsStoreHealth describes one beads store as bd resolves it: where it is,
+// what mode it is opened in, and how many issues it actually holds.
+//
+// The Databases section above reports on the Dolt server. bd does not
+// necessarily use that server — when metadata.json says dolt_mode "embedded",
+// bd opens a local store instead, and every count the server reports is a true
+// statement about a database the town does not run on (gt-kei9). This section
+// exists so the two can be told apart without reading source.
+type BeadsStoreHealth struct {
+	// Scope is "town" or a rig name.
+	Scope string `json:"scope"`
+	// Path is the resolved .beads directory, after following any redirect.
+	Path string `json:"path"`
+	// Mode is dolt_mode from the store's metadata.json: "embedded", "server",
+	// or "" when metadata.json is absent or unreadable.
+	Mode string `json:"mode,omitempty"`
+	// Database is dolt_database from metadata.json.
+	Database string `json:"database,omitempty"`
+	// UsesServer reports whether this store is served by the Dolt server in the
+	// Server section. When false, the Databases counts say nothing about it.
+	UsesServer bool `json:"uses_server"`
+	// Counted is false when the counts below could not be measured. Without it,
+	// an unreachable store and an empty one both report zero.
+	Counted      bool   `json:"counted"`
+	TotalIssues  int    `json:"total_issues"`
+	OpenIssues   int    `json:"open_issues"`
+	ClosedIssues int    `json:"closed_issues"`
+	Error        string `json:"error,omitempty"`
 }
 
 type ServerHealth struct {
@@ -89,11 +132,16 @@ var healthCmd = &cobra.Command{
 
 Sections:
   1. Dolt Server: status, PID, port, latency
-  2. Databases: per-DB counts of issues, wisps, commits
-  3. Pollution: scan for known test/garbage patterns
-  4. Backups: Dolt filesystem and JSONL git freshness
-  5. Processes: zombie dolt servers
-  6. Orphan DBs: databases not referenced by any rig
+  2. Databases: per-DB counts of issues, wisps, commits, ON THE DOLT SERVER
+  3. Beads stores: the stores bd actually reads, and their issue counts
+  4. Pollution: scan for known test/garbage patterns
+  5. Backups: Dolt filesystem and JSONL git freshness
+  6. Processes: zombie dolt servers
+  7. Orphan DBs: databases not referenced by any rig
+
+Sections 2 and 3 are different targets and can disagree. A store whose
+metadata.json says dolt_mode "embedded" is not served by the Dolt server, so
+the server's counts for it say nothing about what bd reads.
 
 Use --json for machine-readable output.`,
 	RunE: runHealth,
@@ -122,18 +170,22 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		report.Databases = checkDatabaseHealth(report.Server.Port)
 	}
 
-	// 3. Pollution scan
+	// 3. Beads stores — the stores bd actually reads, which the Databases
+	// section above does not necessarily cover.
+	report.BeadsStores = checkBeadsStores(townRoot)
+
+	// 4. Pollution scan
 	if report.Server.Running {
 		report.Pollution = checkPollution(report.Server.Port)
 	}
 
-	// 4. Backups
+	// 5. Backups
 	report.Backups = checkBackupHealth(townRoot)
 
-	// 5. Processes
+	// 6. Processes
 	report.Processes = checkProcessHealth(report.Server.Port)
 
-	// 6. Orphans
+	// 7. Orphans
 	report.Orphans = checkOrphanDBs(townRoot)
 
 	if healthJSON {
@@ -175,6 +227,131 @@ func checkServerHealth(townRoot string) *ServerHealth {
 	}
 
 	return sh
+}
+
+// checkBeadsStores reports on the stores bd actually reads: the town store and
+// each registered rig's store.
+//
+// gt health's Databases section reports on the Dolt server. Whether bd uses
+// that server is a per-store property recorded in each store's metadata.json,
+// and when it says "embedded" bd opens a local store instead. On a town in that
+// state every server-side count is a true statement about a database nothing
+// reads, which is how "gt: 0 issues" sat next to a store holding hundreds of
+// open ones for days (gt-kei9). Counting the stores directly is the only way
+// the report can be checked against what bd returns.
+//
+// A store that cannot be counted is marked Counted=false with the error, never
+// reported as zero.
+func checkBeadsStores(townRoot string) []BeadsStoreHealth {
+	type target struct {
+		scope    string
+		workDir  string
+		beadsDir string
+	}
+
+	targets := []target{{
+		scope:    "town",
+		workDir:  townRoot,
+		beadsDir: beads.ResolveBeadsDir(townRoot),
+	}}
+
+	if rigsConfig, err := config.LoadRigsConfig(constants.MayorRigsPath(townRoot)); err == nil {
+		names := make([]string, 0, len(rigsConfig.Rigs))
+		for name := range rigsConfig.Rigs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			rigPath := filepath.Join(townRoot, name)
+			targets = append(targets, target{
+				scope:    name,
+				workDir:  rigPath,
+				beadsDir: beads.ResolveBeadsDir(rigPath),
+			})
+		}
+	}
+
+	results := make([]BeadsStoreHealth, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t target) {
+			defer wg.Done()
+			bsh := BeadsStoreHealth{Scope: t.scope, Path: t.beadsDir}
+			bsh.Mode, bsh.Database = readBeadsStoreMode(t.beadsDir)
+			bsh.UsesServer = bsh.Mode == "server"
+
+			// A hung store must not hang the diagnostic. bd's own subprocess
+			// timeout is 60s, which is longer than anyone will wait during the
+			// incident this section exists to diagnose, so the count is given a
+			// shorter deadline of its own and a miss is reported as one.
+			type countResult struct {
+				out []byte
+				err error
+			}
+			done := make(chan countResult, 1)
+			go func() {
+				out, err := beads.NewWithBeadsDir(t.workDir, t.beadsDir).Run("stats", "--json")
+				done <- countResult{out: out, err: err}
+			}()
+
+			var res countResult
+			select {
+			case res = <-done:
+			case <-time.After(beadsStoreCountTimeout):
+				bsh.Error = fmt.Sprintf("bd stats did not answer within %s", beadsStoreCountTimeout)
+				results[i] = bsh
+				return
+			}
+
+			if res.err != nil {
+				bsh.Error = res.err.Error()
+				results[i] = bsh
+				return
+			}
+
+			var stats struct {
+				Summary struct {
+					TotalIssues  int `json:"total_issues"`
+					OpenIssues   int `json:"open_issues"`
+					ClosedIssues int `json:"closed_issues"`
+				} `json:"summary"`
+			}
+			if err := json.Unmarshal(res.out, &stats); err != nil {
+				bsh.Error = fmt.Sprintf("parsing bd stats: %v", err)
+				results[i] = bsh
+				return
+			}
+
+			bsh.Counted = true
+			bsh.TotalIssues = stats.Summary.TotalIssues
+			bsh.OpenIssues = stats.Summary.OpenIssues
+			bsh.ClosedIssues = stats.Summary.ClosedIssues
+			results[i] = bsh
+		}(i, t)
+	}
+	wg.Wait()
+
+	return results
+}
+
+// readBeadsStoreMode reads dolt_mode and dolt_database from a store's
+// metadata.json. Returns empty strings when the file is absent or unreadable,
+// which is itself reportable: without metadata.json bd cannot identify the
+// database, and the caller shows "unknown" rather than assuming a mode.
+func readBeadsStoreMode(beadsDir string) (mode, database string) {
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json")) //nolint:gosec // G304: path is constructed internally
+	if err != nil {
+		return "", ""
+	}
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return "", ""
+	}
+	return metadata.DoltMode, metadata.DoltDatabase
 }
 
 func checkDatabaseHealth(port int) []DatabaseHealth {
@@ -362,7 +539,11 @@ func printHealthReport(r *HealthReport) {
 
 	// 2. Databases
 	if len(r.Databases) > 0 {
-		fmt.Printf("\n%s Databases\n", style.Bold.Render("●"))
+		header := "Databases"
+		if r.Server != nil && r.Server.Port > 0 {
+			header = fmt.Sprintf("Databases (Dolt server on port %d)", r.Server.Port)
+		}
+		fmt.Printf("\n%s %s\n", style.Bold.Render("●"), header)
 		for _, db := range r.Databases {
 			fmt.Printf("  %s: %d issues (%d open), %d wisps (%d open), %d commits\n",
 				style.Bold.Render(db.Name), db.Issues, db.OpenIssues,
@@ -370,7 +551,10 @@ func printHealthReport(r *HealthReport) {
 		}
 	}
 
-	// 3. Pollution
+	// 3. Beads stores
+	printBeadsStores(r)
+
+	// 4. Pollution
 	fmt.Printf("\n%s Pollution\n", style.Bold.Render("●"))
 	if len(r.Pollution) == 0 {
 		fmt.Printf("  %s No pollution detected\n", style.Bold.Render("✓"))
@@ -381,7 +565,7 @@ func printHealthReport(r *HealthReport) {
 		}
 	}
 
-	// 4. Backups
+	// 5. Backups
 	fmt.Printf("\n%s Backups\n", style.Bold.Render("●"))
 	if r.Backups.DoltFreshness != "" {
 		icon := style.Bold.Render("✓")
@@ -402,7 +586,7 @@ func printHealthReport(r *HealthReport) {
 		fmt.Printf("  %s JSONL git: not found\n", style.Dim.Render("○"))
 	}
 
-	// 5. Processes
+	// 6. Processes
 	fmt.Printf("\n%s Processes\n", style.Bold.Render("●"))
 	if r.Processes.ZombieCount == 0 {
 		fmt.Printf("  %s No zombie processes\n", style.Bold.Render("✓"))
@@ -411,7 +595,7 @@ func printHealthReport(r *HealthReport) {
 			r.Processes.ZombieCount, r.Processes.ZombiePIDs)
 	}
 
-	// 6. Orphans
+	// 7. Orphans
 	fmt.Printf("\n%s Orphan DBs\n", style.Bold.Render("●"))
 	if len(r.Orphans) == 0 {
 		fmt.Printf("  %s None\n", style.Bold.Render("✓"))
@@ -422,4 +606,43 @@ func printHealthReport(r *HealthReport) {
 	}
 
 	fmt.Println()
+}
+
+// printBeadsStores renders the stores bd reads, and says plainly when a store
+// is not served by the Dolt server the Databases section reports on.
+func printBeadsStores(r *HealthReport) {
+	fmt.Printf("\n%s Beads stores (what bd actually reads)\n", style.Bold.Render("●"))
+	if len(r.BeadsStores) == 0 {
+		fmt.Printf("  %s No beads stores resolved\n", style.Warning.Render("!"))
+		return
+	}
+
+	offServer := 0
+	for _, b := range r.BeadsStores {
+		mode := b.Mode
+		if mode == "" {
+			mode = "unknown"
+		}
+		fmt.Printf("  %s: %s\n", style.Bold.Render(b.Scope), b.Path)
+		if b.Database != "" {
+			fmt.Printf("    mode: %s, database: %s\n", mode, b.Database)
+		} else {
+			fmt.Printf("    mode: %s\n", mode)
+		}
+		if b.Counted {
+			fmt.Printf("    %d issues (%d open, %d closed)\n", b.TotalIssues, b.OpenIssues, b.ClosedIssues)
+		} else {
+			fmt.Printf("    %s counts UNAVAILABLE: %s\n", style.Warning.Render("!"), b.Error)
+		}
+		if !b.UsesServer {
+			offServer++
+		}
+	}
+
+	if offServer > 0 && r.Server != nil && r.Server.Running {
+		fmt.Printf("\n  %s %d of %d store(s) are NOT served by the Dolt server on port %d.\n",
+			style.Warning.Render("!"), offServer, len(r.BeadsStores), r.Server.Port)
+		fmt.Printf("  The Databases section above reports on that server, so its counts\n")
+		fmt.Printf("  are not a measurement of those stores. See gt-kei9.\n")
+	}
 }
