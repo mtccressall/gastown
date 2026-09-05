@@ -189,13 +189,26 @@ func isRoleCommand(cmd *cobra.Command) bool {
 	return false
 }
 
+// isDoneCommand reports whether this invocation is the POLECAT `gt done`, whose
+// pre-run proves worktree ownership before any shared write.
+//
+// Matched by IDENTITY, not by name. The previous version walked the parent chain
+// looking for a command called "done", and FOUR commands carry that name:
+//
+//	gt done            the polecat one, which this guard is for
+//	gt dog done        a dog returning to idle
+//	gt wl done         completing a wanted-list item
+//	gt mol step done   completing a molecule step
+//
+// So three unrelated commands inherited a guard that rejects every actor except a
+// polecat, and each failed with "gt done is for polecats only" — an error naming a
+// command the caller had not run. No dog could complete on this build; deacon's
+// dog charlie found it, and gt wl done and gt mol step done were equally unusable.
+//
+// A name is not an identity. The parent walk also meant any FUTURE subcommand
+// named "done", anywhere in the tree, would silently acquire this guard.
 func isDoneCommand(cmd *cobra.Command) bool {
-	for c := cmd; c != nil; c = c.Parent() {
-		if c.Name() == "done" {
-			return true
-		}
-	}
-	return false
+	return cmd == doneCmd
 }
 
 // initCLITheme initializes the CLI color theme based on settings and environment.

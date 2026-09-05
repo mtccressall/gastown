@@ -287,14 +287,49 @@ func TestRunDoneRejectsMayorRigBeforeAutosave(t *testing.T) {
 }
 
 func TestIsDoneCommand(t *testing.T) {
-	done := &cobra.Command{Use: "done"}
-	root := &cobra.Command{Use: "gt"}
-	root.AddCommand(done)
-	if !isDoneCommand(done) {
-		t.Fatal("done command should be detected")
+	// Identity, not name. This test previously built its own
+	// &cobra.Command{Use: "done"} and asserted it matched — which tested the
+	// NAME MECHANISM rather than the behaviour, and passed while three unrelated
+	// commands were being rejected in production.
+	if !isDoneCommand(doneCmd) {
+		t.Fatal("the real polecat done command must be guarded")
 	}
-	if isDoneCommand(root) {
-		t.Fatal("root command should not be detected as done")
+	if isDoneCommand(rootCmd) {
+		t.Fatal("root must not be guarded")
+	}
+
+	// A command that merely SHARES THE NAME must not inherit the guard. Four
+	// commands are called "done": gt done, gt dog done, gt wl done and
+	// gt mol step done. Only the first is a polecat command. Under the old
+	// name-walk all four were rejected with "gt done is for polecats only",
+	// naming a command the caller had not run, and no dog could ever complete.
+	impostor := &cobra.Command{Use: "done"}
+	root := &cobra.Command{Use: "gt"}
+	root.AddCommand(impostor)
+	if isDoneCommand(impostor) {
+		t.Fatal("a different command named 'done' must NOT be guarded")
+	}
+}
+
+// The three real commands that were wrongly guarded. Named individually so a
+// regression says WHICH one broke rather than that something did.
+func TestOnlyPolecatDoneIsGuarded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  *cobra.Command
+	}{
+		{"gt dog done", dogDoneCmd},
+		{"gt wl done", wlDoneCmd},
+		{"gt mol step done", moleculeStepDoneCmd},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.cmd == nil {
+				t.Skip("command not present in this build")
+			}
+			if isDoneCommand(tc.cmd) {
+				t.Fatalf("%s must not inherit the polecat worktree guard", tc.name)
+			}
+		})
 	}
 }
 
@@ -315,8 +350,10 @@ func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
-	done := &cobra.Command{Use: "done"}
-	err = persistentPreRun(done, nil)
+	// The REAL doneCmd, not a synthetic one. The guard now matches by identity,
+	// so a stand-in named "done" no longer triggers it — which is the point of
+	// the fix, and would make this test pass vacuously if it kept the stand-in.
+	err = persistentPreRun(doneCmd, nil)
 	if err == nil || !strings.Contains(err.Error(), "assigned polecat worktree") {
 		t.Fatalf("persistentPreRun error = %v, want assigned worktree rejection", err)
 	}
