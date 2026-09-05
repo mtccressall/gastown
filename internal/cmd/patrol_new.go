@@ -53,7 +53,7 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create and hook the wisp
-	patrolID, err := autoSpawnPatrol(cfg)
+	patrolID, err := autoSpawnPatrol(cfg, "")
 	if err != nil {
 		if patrolID != "" {
 			// Created but failed to hook
