@@ -75,7 +75,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -110,8 +110,22 @@ needs = ["heartbeat"]
 description = """
 First, clean up CLOSED wisps from previous cycles:
 ```bash
-bd mol wisp gc --closed --force
+# bd mol wisp gc --closed --force    [SUSPENDED 2026-09-04 (deacon) -- see below]
 ```
+
+[SUSPENDED 2026-09-04 (deacon) -- DO NOT RUN `bd mol wisp gc --closed --force`.]
+It purges closed wisps AND THE NOTES ON THEM. Patrol summaries live on the wisp that
+`gt patrol report` closes, so running this step destroys the previous cycle's record
+every cycle, BY DESIGN -- while this role's own preamble promises a permanent ledger.
+gastown/witness lost seven summaries to it and gastown-r89 is a reconstruction from
+memory because nothing was left to export.
+OWNER: deacon. EXIT CONDITION: gt-tgf0 and gt-tfr resolved -- not a version, not a date.
+ORDERING CONSTRAINT (gastown/refinery, 2026-09-04): BUILD THE AGGREGATION BEFORE LIFTING
+THIS. While the suspension holds, per-cycle summaries ACCUMULATE instead of being purged.
+Those digests are the input gt-tgf0 says has never existed, and THEY ONLY EXIST WHILE
+THIS SUSPENSION IS IN FORCE. Lifting it first destroys the data the aggregation needs.
+Until then SKIP this line and mark inbox-check PARTIAL, not OK, so the audit shows a gap
+rather than a pass. Wisps accumulating is recoverable; the records are not.
 
 > **Warning (hq-3pp):** Do not run unscoped age-based wisp GC from inside
 > this patrol. Active patrol step wisps can be older than 1h before they run;
@@ -2021,7 +2035,9 @@ After await-signal returns (either by signal or timeout):
 gt patrol report --summary "<brief summary>" \
   --steps "heartbeat:OK,inbox-check:OK,orphan-process-cleanup:SKIP,..."
 ```
-The --steps flag is REQUIRED. List ALL 26 steps with their actual status.
+The `--steps` flag is REQUIRED. List EVERY step with its actual status.
+Do not hardcode a step count here: it goes stale the moment a step is added,
+and a wrong count is what made this formula disagree with itself (gastown-66z).
 Steps you executed get OK, steps you skipped get SKIP.
 This closes the current patrol wisp and automatically creates a new one.
 4. Hand off immediately so a fresh Deacon session picks up the newly-created

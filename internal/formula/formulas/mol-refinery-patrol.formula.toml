@@ -108,7 +108,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 16
+version = 18
 
 [vars]
 [vars.wisp_type]
@@ -189,9 +189,29 @@ title = "Check refinery mail"
 description = """
 First, clean up wisps from previous cycles (closed wisps + abandoned wisps):
 ```bash
-bd mol wisp gc --closed --force
-bd mol wisp gc --age 1h --force
+# bd mol wisp gc --closed --force    [SUSPENDED 2026-09-04 (deacon) -- see below]
+# bd mol wisp gc --age 1h --force    [DISABLED 2026-08-31 (mayor, gt-tfr P0) -- see below]
 ```
+
+[SUSPENDED 2026-09-04 (deacon) -- DO NOT RUN `bd mol wisp gc --closed --force`.]
+It purges closed wisps AND THE NOTES ON THEM. Patrol summaries live on the wisp that
+`gt patrol report` closes, so running this step destroys the previous cycle's record
+every cycle, BY DESIGN -- while this role's own preamble promises a permanent ledger.
+gastown/witness lost seven summaries to it and gastown-r89 is a reconstruction from
+memory because nothing was left to export.
+OWNER: deacon. EXIT CONDITION: gt-tgf0 and gt-tfr resolved -- not a version, not a date.
+ORDERING CONSTRAINT (gastown/refinery, 2026-09-04): BUILD THE AGGREGATION BEFORE LIFTING
+THIS. While the suspension holds, per-cycle summaries ACCUMULATE instead of being purged.
+Those digests are the input gt-tgf0 says has never existed, and THEY ONLY EXIST WHILE
+THIS SUSPENSION IS IN FORCE. Lifting it first destroys the data the aggregation needs.
+Until then SKIP this line and mark inbox-check PARTIAL, not OK, so the audit shows a gap
+rather than a pass. Wisps accumulating is recoverable; the records are not.
+
+[DISABLED by Mayor 2026-08-31 (gt-tfr, P0) -- DO NOT RUN `bd mol wisp gc --age 1h --force`.]
+It deletes UNREAD MAIL and HOOKED (assigned, in-flight) work. The predicate is
+'not updated in --age AND not closed' -- hooked is not closed, so live assignments are in
+scope. Confirmed loss: 6 of 8 town mail messages and 3 hooked molecules destroyed.
+Do NOT re-enable until gt-tfr is fixed (must exclude by STATE and by LABEL). See also gt-ppo.
 
 Then check mail for MERGE_READY submissions, escalations, and messages.
 
@@ -1079,9 +1099,15 @@ Before leaving this step on a failure path, ALL of the following MUST be true:
 If any box is unchecked, GO BACK and complete it. The Scotty Test applies."""
 
 [[steps]]
+id = "observed-vs-concluded"
+title = "Separate observed from concluded"
+needs = ["check-integration-branches"]
+description = "Separate what you OBSERVED from what you CONCLUDED, before anything leaves this patrol.\n\nAdded 2026-09-04 by the deacon. Adapted from mol-witness-patrol, which adapted it from\nmol-deacon-patrol. **The refinery was the only agent patrol formula without this step.**\n\n## Why it was added, and the evidence is about THIS ROLE\n\ngastown/witness reported that it and gastown/refinery made at least eight errors that\nreached publication in one night, and that NEITHER caught its own -- every one was caught\nby the other agent. Two of the refinery's, in its own account: disputing a store claim\nwith an instrument that cannot discriminate between stores, and writing a confident\nnegative onto a shared bead when the answer sat 115 lines below where it stopped reading.\n\nIt concluded the town's error-catching is an accident of staffing -- two agents happening\nto work the same defect at the same hour. That is half right. The measurable half is that\nthe witness and deacon formulas both carry this step and the refinery formula did not.\nA structural gap is fixable; luck is not.\n\n## The rule\n\nOBSERVED is a command you ran and its actual output, quoted. CONCLUDED is anything\ninferred from it. `make test` exited 2 is observed. 'The branch breaks the build' is\nconcluded, and on a repo whose tests are already red it is usually wrong.\n\n**Trigger heuristic**: when you catch yourself writing a CAUSE word -- broke, caused by,\nintroduced, because of, regressed -- that is almost always a conclusion wearing an\nobservation's clothes.\n\n## The refinery-specific traps\n\n- **A red gate is not a red branch.** Compare failure SETS against a control at the\n  CURRENT base, never counts, and re-confirm the base has not moved before reusing an\n  earlier control. A matching count hides a swap.\n- **A passing package is not an executed test.** Run new tests BY NAME. Tests that\n  t.Skip behind an env var return rc=0 and say nothing.\n- **--pre-verified on the MR is a claim by the polecat, not a measurement by you.**\n  Check the bead's attached_vars: if the gate commands are empty the flag asserts\n  nothing (gt-7p1y).\n- **A store answer is scoped to your cwd.** Before reporting that a bead or MR does not\n  exist, say where you ran the query, and use a named-ID positive control.\n- **Read to the end of the bead before writing a negative onto it.**\n\n## Getting the right answer is not evidence that you checked\n\nA correct conclusion reached by an unsound method gets CONFIRMED, and the confirmation\nteaches you the method works. This step is about METHOD, not outcome.\n\n## A retraction can be as wrong as an assertion\n\nWhen you retract under push-back, check WHICH you are conceding: the REASONING or the\nFACT. They are separable, and conceding the first does not concede the second.\n\n## What to do\n\nOne pass over everything this cycle is about to publish -- PR bodies, bead comments,\nmail, the MR verdict. For each claim, name the command whose output supports it.\nAnything left over is a conclusion: label it, or go get the evidence.\n\n**NEVER SKIP, including on an abbreviated cycle.** An abbreviated cycle reports on less\nevidence, so its claims lean harder on inference."
+
+[[steps]]
 id = "context-check"
 title = "Assess session health"
-needs = ["check-integration-branches"]
+needs = ["observed-vs-concluded"]
 description = """
 Assess whether this session should continue or hand off to a fresh one.
 
@@ -1184,7 +1210,7 @@ Then use await-event to subscribe to the refinery event channel with exponential
 
 ```bash
 gt mol step await-event --channel refinery --agent-bead "$YOUR_AGENT_BEAD" \
-  --backoff-base 30s --backoff-mult 2 --backoff-max 15m --cleanup \
+  --backoff-base 30s --backoff-mult 2 --backoff-max 15m \
   --context-check-interval 5m
 ```
 
@@ -1198,8 +1224,29 @@ This command:
    - ...capped at 15 minutes max
 4. Tracks `idle:N` label on refinery agent bead for backoff state
 5. Returns `reason: context-yield` after 5m if no event arrived (see below)
-6. `--cleanup` auto-deletes processed event files
+6. `--cleanup` would auto-delete processed event files -- deliberately NOT passed, see below
 7. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
+
+**NO `--cleanup` HERE, deliberately (gt-a3qs).** The channel is ROLE-scoped, not
+rig-scoped: `~/gt/events/refinery/` is shared by gastown/refinery AND liveop/refinery.
+`await-event --help` states it plainly -- *"Channels are single-consumer... if multiple
+consumers watch the same channel with --cleanup, events may be deleted before all
+consumers read them."* This formula used to prescribe exactly that unsafe configuration
+to every refinery.
+
+Observed live 2026-09-02 11:37Z: gastown/refinery woke on 6 MQ_SUBMIT events with its own
+queue empty and `--cleanup` deleted them. They were liveop's, whose MQ had a ready MR aged
+20s. Two costs per occurrence -- the victim never wakes, and the thief burns a full
+EFFORT:full cycle on an empty queue. Candidate cause of the recurring "refinery idle while
+MRs wait" reports (gt-rhb, gt-zy1): the wake-up WAS delivered, to the wrong rig.
+
+Dropping `--cleanup` stops the theft immediately. Events accumulate in the shared directory
+instead of being consumed by whoever wakes first, so both refineries see every event. The
+real fix is namespacing the channel per rig, which needs the Go emitters changed in lockstep
+(`internal/witness/handlers.go`, `internal/cmd/sling_helpers.go` both hardcode `"refinery"`)
+-- namespacing the listener alone would stop refineries waking at all. Tracked on gt-a3qs.
+
+Until then, prune the directory periodically rather than racing for it.
 
 **Supported events:**
 - `MERGE_READY` — from witness when polecat branch is pushed and ready to merge
@@ -1233,7 +1280,8 @@ If context is ACCEPTABLE (< 70% consumed, RSS < 1 GB, session < 8h):
 If context is HIGH (≥ 70% consumed, or RSS ≥ 1 GB, or session ≥ 8h):
 - Hand off immediately:
   ```bash
-  gt patrol report --summary "context-yield handoff: <RSS>MB, <age>h"
+  gt patrol report --summary "context-yield handoff: <RSS>MB, <age>h" \
+    --steps "inbox-check:OK,queue-scan:OK,...,burn-or-loop:OK"   # EVERY step, see below
   gt handoff -s "Refinery context-yield handoff" -m "Yield after <age>h. Queue: <state>."
   ```
 
@@ -1260,8 +1308,21 @@ After await-event returns (either by event, timeout, or context-yield):
 2. If reason is `context-yield` and context is acceptable: re-enter await-event (skip steps 3-4)
 3. Close current patrol and start next cycle:
 ```bash
-gt patrol report --summary "<brief summary: branches merged, test results, queue state>"
+gt patrol report --summary "<brief summary: branches merged, test results, queue state>" \
+  --steps "inbox-check:OK,queue-scan:OK,...,burn-or-loop:OK"   # EVERY step, see below
 ```
+
+**The `--steps` flag is REQUIRED.** List EVERY step with its actual status. The report
+reconciles your list against the formula's real step IDs and fills anything you omit as
+SKIP, so a step cannot be hidden by leaving it out -- but a step you never READ about is
+one you cannot run, and it reads as SKIP forever. Without `--steps` the audit silently
+records `Steps: NOT REPORTED`. The step IDs for this formula are:
+
+    inbox-check, queue-scan, merged-pr-sweep, process-branch, run-tests,
+    quality-review, handle-failures, merge-push, loop-check, generate-summary,
+    check-integration-branches, observed-vs-concluded, context-check,
+    patrol-cleanup, burn-or-loop
+
 This closes the current patrol wisp and automatically creates a new one.
 4. Continue executing from the first step of the new patrol cycle
 
