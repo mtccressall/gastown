@@ -9,7 +9,9 @@ import (
 )
 
 func TestEmitToTown(t *testing.T) {
-	t.Parallel()
+	// This test exercises the writer itself, so it opts out of the test-binary
+	// suppression the package applies by default (gastown-rv6).
+	t.Setenv(EnvSuppress, "0")
 	townRoot := t.TempDir()
 
 	path, err := EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
@@ -54,6 +56,8 @@ func TestEmitToTown(t *testing.T) {
 }
 
 func TestEmitToTown_InvalidChannel(t *testing.T) {
+	// No opt-in: name validation is rejected ahead of the suppression gate,
+	// so this path is the same in a test binary and in production.
 	t.Parallel()
 	_, err := EmitToTown(t.TempDir(), "../escape", "TEST", nil)
 	if err == nil {
@@ -62,7 +66,9 @@ func TestEmitToTown_InvalidChannel(t *testing.T) {
 }
 
 func TestEmitToTown_UniqueFilenames(t *testing.T) {
-	t.Parallel()
+	// This test exercises the writer itself, so it opts out of the test-binary
+	// suppression the package applies by default (gastown-rv6).
+	t.Setenv(EnvSuppress, "0")
 	townRoot := t.TempDir()
 	seen := make(map[string]bool)
 
@@ -96,7 +102,9 @@ func TestValidChannelName(t *testing.T) {
 }
 
 func TestEmitToTown_CreatesDirectory(t *testing.T) {
-	t.Parallel()
+	// This test exercises the writer itself, so it opts out of the test-binary
+	// suppression the package applies by default (gastown-rv6).
+	t.Setenv(EnvSuppress, "0")
 	townRoot := t.TempDir()
 	channelDir := filepath.Join(townRoot, "events", "newchannel")
 
@@ -111,5 +119,62 @@ func TestEmitToTown_CreatesDirectory(t *testing.T) {
 
 	if _, err := os.Stat(channelDir); err != nil {
 		t.Errorf("channel dir should exist after emit: %v", err)
+	}
+}
+
+// TestEmitSuppressedInsideTestBinary asserts the gate is ENGAGED by default in
+// a test binary (gastown-rv6). Without it, `go test` from a worktree under the
+// town appended MQ_SUBMIT events to the production events/refinery directory,
+// where a refinery consumes them as real wake-ups.
+//
+// This is the negative half of a pair: TestEmitToTown above opts back in and
+// asserts the writer still works, so a gate stuck ON cannot pass both.
+func TestEmitSuppressedInsideTestBinary(t *testing.T) {
+	townRoot := t.TempDir()
+
+	path, err := EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{"message=test message"})
+	if err != nil {
+		t.Fatalf("a suppressed emit must not error, got %v", err)
+	}
+	if path != "" {
+		t.Errorf("a suppressed emit must return an empty path, got %q", path)
+	}
+
+	// Nothing on disk: not the event, and not the directory either. The mkdir
+	// used to happen ahead of the write, which left production channel dirs
+	// behind even when no event was written.
+	if _, err := os.Stat(filepath.Join(townRoot, "events")); !os.IsNotExist(err) {
+		t.Errorf("a suppressed emit created %s/events (stat err: %v)", townRoot, err)
+	}
+}
+
+// TestEmitSuppressionIsOptOut pins the escape hatch itself: the same call that
+// writes nothing above must write when a test opts back in. Tests in other
+// packages depend on this contract, so it is asserted rather than assumed.
+func TestEmitSuppressionIsOptOut(t *testing.T) {
+	townRoot := t.TempDir()
+
+	if _, err := EmitToTown(townRoot, "refinery", "MQ_SUBMIT", nil); err != nil {
+		t.Fatalf("suppressed emit: %v", err)
+	}
+	suppressed, err := filepath.Glob(filepath.Join(townRoot, "events", "refinery", "*.event"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(EnvSuppress, "0")
+	if _, err := EmitToTown(townRoot, "refinery", "MQ_SUBMIT", nil); err != nil {
+		t.Fatalf("opted-in emit: %v", err)
+	}
+	allowed, err := filepath.Glob(filepath.Join(townRoot, "events", "refinery", "*.event"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(suppressed) != 0 {
+		t.Errorf("suppressed emit wrote %d event(s), want 0", len(suppressed))
+	}
+	if len(allowed) != 1 {
+		t.Errorf("opted-in emit left %d event(s), want 1", len(allowed))
 	}
 }

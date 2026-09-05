@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/session"
 )
 
@@ -111,8 +113,107 @@ func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 	// Ensure test log is NOT set so we exercise the real tmux path
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
 
+	// Run inside a throwaway town. Unsetting the log hook above is what reaches
+	// the tmux call, and the channel emit sits on that same ungated path — with
+	// the process cwd inside the real town this fixture appended a "test
+	// message" MQ_SUBMIT to events/refinery on every run (gastown-rv6). The
+	// package-level gate stops that now; this keeps the fixture out of reach of
+	// the production town regardless.
+	t.Chdir(newThrowawayTown(t))
+
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")
+}
+
+// newThrowawayTown creates a temp directory carrying the workspace marker, so
+// workspace.FindFromCwd resolves to it rather than to the real town. The path is
+// symlink-resolved because Find compares against os.Getwd(), which is not.
+func newThrowawayTown(t *testing.T) string {
+	t.Helper()
+	townRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return townRoot
+}
+
+// townEvents lists every channel event file anywhere under a town root.
+func townEvents(t *testing.T, townRoot string) []string {
+	t.Helper()
+	var found []string
+	err := filepath.WalkDir(filepath.Join(townRoot, "events"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".event") {
+			found = append(found, path)
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return found
+}
+
+// TestNudgeRefineryWritesNoChannelEventUnderTest is gastown-rv6's acceptance
+// criterion, run on the exact path the pollution came from: the nudge test hook
+// unset, so the emit beside the gated tmux transport is reached.
+//
+// A channel event is not a log line — a pending MQ_SUBMIT wakes a refinery,
+// which then burns a patrol cycle on an empty queue. 43 of the 70 files in the
+// live events/refinery carried the payload "test message".
+//
+// The opted-in half is a positive control, not decoration: without it, any early
+// return added above the emit would satisfy the first assertion, and the test
+// would go quietly vacuous.
+func TestNudgeRefineryWritesNoChannelEventUnderTest(t *testing.T) {
+	t.Setenv("GT_TEST_NUDGE_LOG", "")
+	townRoot := newThrowawayTown(t)
+	t.Chdir(townRoot)
+
+	nudgeRefinery("nonexistent-rig", "test message")
+	if got := townEvents(t, townRoot); len(got) != 0 {
+		t.Errorf("nudgeRefinery wrote %d channel event(s) from a test binary: %v", len(got), got)
+	}
+
+	t.Setenv(channelevents.EnvSuppress, "0")
+	nudgeRefinery("nonexistent-rig", "test message")
+	if got := townEvents(t, townRoot); len(got) != 1 {
+		t.Fatalf("control: with suppression off nudgeRefinery wrote %d event(s), want 1 — "+
+			"if this is 0 the assertion above proves nothing", len(got))
+	}
+}
+
+// TestNudgeWitnessWritesNoChannelEventUnderTest covers the sibling emitter.
+// nudgeWitness carries the same ungated emit behind the same gated transport,
+// and the two are fixed together because a per-call-site fix is the shape that
+// gets half applied.
+func TestNudgeWitnessWritesNoChannelEventUnderTest(t *testing.T) {
+	t.Setenv("GT_TEST_NUDGE_LOG", "")
+	townRoot := newThrowawayTown(t)
+	t.Chdir(townRoot)
+
+	nudgeWitness("nonexistent-rig", "test message")
+	if got := townEvents(t, townRoot); len(got) != 0 {
+		t.Errorf("nudgeWitness wrote %d channel event(s) from a test binary: %v", len(got), got)
+	}
+
+	t.Setenv(channelevents.EnvSuppress, "0")
+	nudgeWitness("nonexistent-rig", "test message")
+	if got := townEvents(t, townRoot); len(got) != 1 {
+		t.Fatalf("control: with suppression off nudgeWitness wrote %d event(s), want 1 — "+
+			"if this is 0 the assertion above proves nothing", len(got))
+	}
 }
 
 func TestIsDeferredBead(t *testing.T) {
