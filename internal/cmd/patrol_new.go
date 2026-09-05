@@ -70,6 +70,12 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 
 // patrolConfigForRole builds the PatrolConfig for a patrol-capable role.
 //
+// EVERY patrol minting path must come through here: gt patrol new (recovery),
+// gt patrol report (routine, once per cycle per role) and gt prime (session
+// start auto-bond). All three write cfg.Assignee onto a hooked wisp AND read
+// it back through findActivePatrol, so a literal in any one of them both
+// blinds gt hook and desynchronises that path from the others.
+//
 // Assignee MUST come from buildAgentIdentity, which is the same function
 // gt hook (gt mol status) uses to construct the address it queries. Writing
 // the assignee as a separate literal here is what caused gt-7rne: this
@@ -88,6 +94,15 @@ func patrolConfigForRole(roleName string, roleInfo RoleInfo) (PatrolConfig, erro
 	case RoleDeacon, RoleWitness, RoleRefinery:
 	default:
 		return PatrolConfig{}, fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", roleName)
+	}
+
+	// gt-s4pw: buildAgentIdentity concatenates Rig for the rig-scoped roles, so
+	// an empty Rig yields "/witness" or "/refinery" -- non-empty, well-formed to
+	// every check below, and an address no agent can ever hold. On 2026-09-02
+	// this minted gt-wisp-8etdh and gt-wisp-ejd8r two seconds apart; both are
+	// still HOOKED and unworkable. Refuse to mint rather than orphan a wisp.
+	if (role == RoleWitness || role == RoleRefinery) && roleInfo.Rig == "" {
+		return PatrolConfig{}, fmt.Errorf("cannot create %s patrol: rig is empty, which would assign the wisp to %q -- an address no agent holds (gt-s4pw)", roleName, "/"+roleName)
 	}
 
 	// The address gt hook will query for this agent. Deriving it here rather
