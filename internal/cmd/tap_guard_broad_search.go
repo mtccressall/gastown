@@ -36,7 +36,9 @@ WHEN IT BLOCKS. All of these must hold, so ordinary searches are unaffected:
   1. the command is a recursive grep/find-exec-grep, or an rg that has been
      told to ignore .gitignore or to include hidden files
   2. its search root is the repository root ("." or omitted), not a subtree
-  3. a .env file actually exists at that root -- no .env, no block
+  3. the repo declares a Read deny rule for .env or secrets. The rule, NOT the
+     file: the permission check is predictive, so brahmin froze on a .env that
+     does not exist anywhere in its worktree
   4. the command does not already exclude .env
 
 Exit codes:
@@ -73,22 +75,50 @@ func hookInputCwd(input []byte) string {
 	return wd
 }
 
-// rootHasEnvFile reports whether a dotenv file the deny rules cover exists at
-// dir. The guard blocks ONLY when the prompt it prevents could actually fire,
-// so a repository with no .env is never slowed down by this rule.
-func rootHasEnvFile(dir string) bool {
+// denyRuleCoversSecrets reports whether the repository at dir declares a Read
+// deny rule for a dotenv or secrets path.
+//
+// THIS REPLACED AN EXISTENCE CHECK, AND THE DIFFERENCE IS THE WHOLE GUARD.
+// The first version of this file asked whether a .env FILE existed at the
+// root, on the assumption that no file means no prompt. That is wrong, and it
+// made the guard miss the exact incident it was written for: brahmin's
+// worktree contains NO .env at any depth, and brahmin still froze for hours on
+// the prompt.
+//
+// Claude Code's permission check is PREDICTIVE, not a stat. It reasons that a
+// recursive grep on "." COULD read ./.env, matches that against the deny
+// patterns, and asks. The modal's own words, as captured during the incident:
+// "grep on '.' would read .../brahmin/liveop/.env, which the deny rule
+// Read(./.env) covers". WOULD read. The file need never exist.
+//
+// So the condition that actually predicts the prompt is the presence of the
+// RULE, not the presence of the file.
+//
+// Fails open (returns false) when settings cannot be read. A guard that blocks
+// on uncertainty would be worse than the problem, and an unreadable settings
+// file is also a repo where we cannot show the prompt would fire.
+func denyRuleCoversSecrets(dir string) bool {
 	if dir == "" {
 		return false
 	}
-	entries, err := os.ReadDir(dir)
+	raw, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
 	if err != nil {
 		return false
 	}
-	for _, e := range entries {
-		if e.IsDir() {
+	var cfg struct {
+		Permissions struct {
+			Deny []string `json:"deny"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return false
+	}
+	for _, rule := range cfg.Permissions.Deny {
+		if !strings.HasPrefix(rule, "Read(") {
 			continue
 		}
-		if e.Name() == ".env" || strings.HasPrefix(e.Name(), ".env.") {
+		lower := strings.ToLower(rule)
+		if strings.Contains(lower, ".env") || strings.Contains(lower, "secret") {
 			return true
 		}
 	}
@@ -241,7 +271,7 @@ func runTapGuardBroadSearch(cmd *cobra.Command, args []string) error {
 	if !searchRootIsRepoRoot(fields, cwd) {
 		return nil
 	}
-	if !rootHasEnvFile(cwd) {
+	if !denyRuleCoversSecrets(cwd) {
 		return nil
 	}
 
