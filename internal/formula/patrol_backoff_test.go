@@ -122,8 +122,15 @@ func TestPatrolFormulasHaveReportCycle(t *testing.T) {
 	}
 }
 
-// TestPatrolFormulasHaveWispGC verifies that all three patrol formulas
-// include `bd mol wisp gc` in their inbox-check step for safe cleanup.
+// TestPatrolFormulasHaveWispGC verifies that all three patrol formulas still
+// carry `bd mol wisp gc` in their inbox-check step.
+//
+// PRESENCE NO LONGER IMPLIES EXECUTION. The command is SUSPENDED in every patrol
+// formula (gt-tfr, gt-tgf0): `--closed --force` purges closed wisps and the patrol
+// summaries stored on them, and `--age` additionally reaps unread mail and hooked
+// work. It is kept, commented out, alongside the reason -- so this test guards the
+// instruction and its history against deletion, and
+// TestPatrolFormulasDoNotShipLiveWispGC guards against it being uncommented.
 //
 // Closed-wisp cleanup is safe inside active patrols. Stale open-wisp cleanup
 // belongs to reaper paths that are not running inside the active patrol molecule.
@@ -197,6 +204,8 @@ func TestDeaconPatrolDoesNotRunAgeBasedWispGC(t *testing.T) {
 		t.Fatal("deacon patrol formula: inbox-check step not found or has empty description")
 	}
 
+	// Presence, not execution: the command is suspended (see
+	// TestPatrolFormulasHaveWispGC). This asserts the instruction survives.
 	if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
 		t.Fatal("deacon inbox-check must keep closed-wisp cleanup")
 	}
