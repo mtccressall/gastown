@@ -3991,7 +3991,35 @@ type HealthMetrics struct {
 
 // GetHealthMetrics collects resource monitoring metrics from the Dolt server.
 // Returns partial metrics if some checks fail — always returns what it can.
+// GetHealthMetrics collects the full picture INCLUDING the beads read probe,
+// which costs up to beadsProbeSamples x beadsProbeTimeout. Use it from operator
+// commands. Do NOT use it from anything on a recovery or heartbeat path.
 func GetHealthMetrics(townRoot string) *HealthMetrics {
+	return getHealthMetrics(townRoot, true)
+}
+
+// GetHealthMetricsFast omits the beads read probe.
+//
+// The probe issues five sequential bd reads, each bounded at 30s, so it can block
+// its caller for up to 150 SECONDS. That is fine for `gt health`, where an
+// operator asked and is waiting. It is not fine on the daemon's recovery
+// heartbeat, which called GetHealthMetrics synchronously: a degraded store would
+// stall every subsequent agent recovery check for minutes, and a degraded store is
+// the only condition under which the probe reports anything interesting.
+//
+// So the diagnostic became the outage it was built to observe. Worse under
+// contention: concurrent bd reads SERIALIZE against the embedded store, so five
+// sequential samples during a pile-up is the pathological case rather than the
+// unlucky one.
+//
+// Caught by codex review on the merged code, not before merge — the PR that added
+// the probe was gated on build, tests and a failure-set diff, all of which it
+// passed, because none of them can see a call-path cost.
+func GetHealthMetricsFast(townRoot string) *HealthMetrics {
+	return getHealthMetrics(townRoot, false)
+}
+
+func getHealthMetrics(townRoot string, includeBeadsProbe bool) *HealthMetrics {
 	config := DefaultConfig(townRoot)
 	metrics := &HealthMetrics{
 		Healthy:        true,
@@ -4020,7 +4048,9 @@ func GetHealthMetrics(townRoot string) *HealthMetrics {
 	// moves while the town is suffering, so a median-based threshold is blind
 	// to the tail BY CONSTRUCTION -- which is the same shape of mistake as
 	// probing the wrong server, arriving by a different route.
-	metrics.BeadsRead = MeasureBeadsReadLatency(townRoot)
+	if includeBeadsProbe {
+		metrics.BeadsRead = MeasureBeadsReadLatency(townRoot)
+	}
 	if w := BeadsLatencyWarning(metrics.BeadsRead, 1*time.Second); w != "" {
 		metrics.Warnings = append(metrics.Warnings, w)
 	}

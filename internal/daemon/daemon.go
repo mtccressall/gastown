@@ -1049,7 +1049,10 @@ func (d *Daemon) ensureDoltServerRunning() {
 
 	// Update OTel gauges with the latest Dolt health snapshot.
 	if d.metrics != nil {
-		h := doltserver.GetHealthMetrics(d.config.TownRoot)
+		// FAST variant deliberately: the full one runs a five-sample bd probe
+		// bounded at 30s each, and this is the recovery heartbeat. A degraded
+		// store would stall every subsequent agent recovery check for minutes.
+		h := doltserver.GetHealthMetricsFast(d.config.TownRoot)
 		d.metrics.updateDoltHealth(
 			int64(h.Connections),
 			int64(h.MaxConnections),
