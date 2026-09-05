@@ -197,17 +197,46 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	messages = appendBeadsMessages(messages, seen, cc.messages, false)
 	if wisps.err == nil {
 		messages = appendWispMessages(messages, seen, wisps.messages)
+	} else if !isUnsupportedSQLBackend(wisps.err) {
+		// Surface anything we did not expect. This branch used to discard EVERY
+		// wisp-query error, which is how gt-mff stayed undiagnosed for five days:
+		// the only path dedicated to wisp-backed mail failed on every call and
+		// said nothing, so an inbox with 73 messages in it rendered as empty at
+		// rc=0. An unexpected failure here means messages may be missing, and a
+		// warning is strictly better than a silent short read.
+		fmt.Fprintf(os.Stderr, "gt mail: wisp message query failed for %s (messages may be missing): %v\n", m.identity, wisps.err)
 	}
 
 	return messages, nil
 }
 
+// isUnsupportedSQLBackend reports whether err is bd declining to run `bd sql`
+// because the store is an embedded database rather than a server-backed one.
+//
+// This is an EXPECTED condition, not a fault: the town store is embedded
+// (.beads/embeddeddolt), so queryWispMessages cannot run there at all. It is
+// tolerated silently because the issue queries now pass --include-infra and
+// therefore already return wisp-backed messages -- the SQL path is a redundant
+// second route, not the only one. Kept separate from the generic error case so
+// that a REAL wisp-query failure is still reported (gt-mff).
+func isUnsupportedSQLBackend(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "not yet supported in embedded mode")
+}
+
 func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []string) ([]BeadsMessage, error) {
 	var messages []BeadsMessage
 	for _, id := range identities {
+		// --include-infra is REQUIRED, not optional: gt mail send writes wisp-backed
+		// messages (gt-wisp-*), wisps are infra beads, and bd list hides infra by
+		// default. Without this flag every wisp-backed message is invisible here --
+		// measured 0 rows against 73 for one recipient on one store (gt-mff).
 		args := []string{"list",
 			"--label", "gt:message",
 			"--assignee", id,
+			"--include-infra",
 			"--json",
 			"--limit", "0",
 		}
@@ -230,9 +259,12 @@ func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []str
 func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) []BeadsMessage {
 	var messages []BeadsMessage
 	for _, id := range identities {
+		// --include-infra: see queryIssueMessagesByAssignee. A CC'd wisp message is
+		// hidden by the same default filter (gt-mff).
 		args := []string{"list",
 			"--label", "gt:message",
 			"--label", "cc:" + id,
+			"--include-infra",
 			"--json",
 			"--limit", "0",
 		}
