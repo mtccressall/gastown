@@ -115,6 +115,28 @@ func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
 	return t.CheckSessionHealth(m.SessionName(), maxInactivity)
 }
 
+// WorkDir returns the working directory the refinery agent runs in.
+//
+// Read-only counterpart to the directory resolution in start(): it reports
+// where the agent's transcripts live and never attempts worktree repair, so it
+// is safe to call from status commands. It mirrors start()'s fallback to
+// MayorWorkDir when the refinery worktree is absent.
+func (m *Manager) WorkDir() string {
+	refineryRigDir := filepath.Join(m.rig.Path, "refinery", "rig")
+	if _, err := os.Stat(refineryRigDir); err == nil {
+		return refineryRigDir
+	}
+	return m.MayorWorkDir()
+}
+
+// MayorWorkDir is the directory start() falls back to when the refinery
+// worktree is missing and cannot be repaired. The mayor runs there too, so
+// anything derived from that directory's contents belongs to both agents and
+// to neither.
+func (m *Manager) MayorWorkDir() string {
+	return filepath.Join(m.rig.Path, "mayor", "rig")
+}
+
 // Status returns information about the refinery session.
 // ZFC-compliant: tmux session is the source of truth.
 func (m *Manager) Status() (*tmux.SessionInfo, error) {

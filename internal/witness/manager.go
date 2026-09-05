@@ -85,9 +85,9 @@ func (m *Manager) Status() (*tmux.SessionInfo, error) {
 	return t.GetSessionInfo(sessionID)
 }
 
-// witnessDir returns the working directory for the witness.
+// WorkDir returns the working directory the witness agent runs in.
 // Prefers witness/rig/ for existing legacy clones, otherwise uses witness/.
-func (m *Manager) witnessDir() string {
+func (m *Manager) WorkDir() string {
 	witnessRigDir := filepath.Join(m.rig.Path, "witness", "rig")
 	if _, err := os.Stat(witnessRigDir); err == nil {
 		return witnessRigDir
@@ -97,7 +97,7 @@ func (m *Manager) witnessDir() string {
 }
 
 func (m *Manager) prepareWitnessDir(townRoot string) (string, error) {
-	witnessDir := m.witnessDir()
+	witnessDir := m.WorkDir()
 	if err := os.MkdirAll(witnessDir, 0755); err != nil {
 		return "", fmt.Errorf("creating witness dir: %w", err)
 	}

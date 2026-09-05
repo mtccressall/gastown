@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/session"
@@ -221,10 +222,15 @@ func runWitnessStop(cmd *cobra.Command, args []string) error {
 }
 
 // WitnessStatusOutput is the JSON output format for witness status.
+//
+// Running is derived from tmux session existence and so reads true for a frozen
+// witness (gt-fy6). The embedded AgentActivity is the only liveness-bearing part
+// of this output: it is derived from what the agent WROTE. Read them together.
 type WitnessStatusOutput struct {
 	Running           bool     `json:"running"`
 	RigName           string   `json:"rig_name"`
 	Session           string   `json:"session,omitempty"`
+	AgentActivity              // inlined: last_activity, age, source
 	MonitoredPolecats []string `json:"monitored_polecats,omitempty"`
 }
 
@@ -232,7 +238,7 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
 	// Get rig for polecat info
-	_, r, err := getRig(rigName)
+	townRoot, r, err := getRig(rigName)
 	if err != nil {
 		return err
 	}
@@ -243,6 +249,14 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 	running, _ := mgr.IsRunning()
 	sessionInfo, _ := mgr.Status() // may be nil if not running
 
+	// Write-derived activity: the only field here that a frozen witness cannot fake.
+	act := resolveAgentActivity(activityQuery{
+		TownRoot:    townRoot,
+		SessionName: mgr.SessionName(),
+		WorkDir:     mgr.WorkDir(),
+		Provider:    agentProvider("witness", townRoot, r.Path, mgr.SessionName()),
+	}, time.Now())
+
 	// Polecats come from rig config, not state file
 	polecats := r.Polecats
 
@@ -251,6 +265,7 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 		output := WitnessStatusOutput{
 			Running:           running,
 			RigName:           rigName,
+			AgentActivity:     act,
 			MonitoredPolecats: polecats,
 		}
 		if sessionInfo != nil {
@@ -272,6 +287,7 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("  State: %s\n", style.Dim.Render("○ stopped"))
 	}
+	printAgentActivity(act)
 
 	// Show monitored polecats
 	fmt.Printf("\n  %s\n", style.Bold.Render("Monitored Polecats:"))
