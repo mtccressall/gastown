@@ -8,9 +8,13 @@ import (
 	"testing"
 
 	gtevents "github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/testmode"
 )
 
 func TestRunLogCrashEmitsFeedSessionDeath(t *testing.T) {
+	// This test asserts on the records themselves, so opt back into writing.
+	t.Setenv(testmode.EnvSuppress, "0")
+
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
 		t.Fatal(err)

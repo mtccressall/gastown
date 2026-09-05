@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/testmode"
 )
 
 func TestFormatLogLine(t *testing.T) {
@@ -141,6 +143,9 @@ func TestLoggerLogEvent(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// This test exercises the writer itself, so opt back into writing.
+	t.Setenv(testmode.EnvSuppress, "0")
+
 	logger := NewLogger(tmpDir)
 
 	// Log an event
@@ -263,6 +268,9 @@ func TestEventHandoffNoPersist_NoContext(t *testing.T) {
 }
 
 func TestEventHandoffNoPersist_ParseRoundTrip(t *testing.T) {
+	// This test exercises the writer itself, so opt back into writing.
+	t.Setenv(testmode.EnvSuppress, "0")
+
 	tmpDir := t.TempDir()
 	logPath := filepath.Join(tmpDir, "town.log")
 	logger := &Logger{logPath: logPath}
