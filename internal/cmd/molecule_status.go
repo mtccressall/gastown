@@ -518,6 +518,14 @@ func extractRoleFromIdentity(target string) string {
 // buildAgentIdentity constructs the agent identity string from role context.
 // Town-level agents (mayor, deacon) use trailing slash to match the format
 // used when setting assignee on hooked beads (see resolveSelfTarget in sling.go).
+//
+// A rig-scoped role with an empty Rig, or a per-agent role with an empty
+// Polecat, returns "" rather than a concatenation (gt-s4pw). Concatenating an
+// empty component yields "/witness", "/refinery", "/polecats/nux" -- non-empty
+// and well formed to every caller's `== ""` check, and an address no agent can
+// ever hold. Ten of the twelve call sites already guard on "" and produce a
+// sensible error; returning "" here is what makes those guards correct. Do not
+// re-add the concatenation without also fixing every one of them.
 func buildAgentIdentity(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
@@ -527,12 +535,24 @@ func buildAgentIdentity(ctx RoleContext) string {
 	case RoleBoot:
 		return "deacon/boot"
 	case RoleWitness:
+		if ctx.Rig == "" {
+			return ""
+		}
 		return ctx.Rig + "/witness"
 	case RoleRefinery:
+		if ctx.Rig == "" {
+			return ""
+		}
 		return ctx.Rig + "/refinery"
 	case RolePolecat:
+		if ctx.Rig == "" || ctx.Polecat == "" {
+			return ""
+		}
 		return ctx.Rig + "/polecats/" + ctx.Polecat
 	case RoleCrew:
+		if ctx.Rig == "" || ctx.Polecat == "" {
+			return ""
+		}
 		return ctx.Rig + "/crew/" + ctx.Polecat
 	case RoleDog:
 		if ctx.Polecat == "" {

@@ -443,6 +443,12 @@ func handleMoleculeComplete(cwd, townRoot, moleculeID string, dryRun bool) error
 		WorkDir:  cwd,
 	}
 	agentID := buildAgentIdentity(roleCtx)
+	if agentID == "" {
+		// gt-s4pw: agentID is used below as beads.ListOptions{Assignee: ...} to
+		// find THIS agent's pinned work. An empty assignee would not scope the
+		// query to anybody, so unpinning could reach another agent's beads.
+		return fmt.Errorf("cannot determine agent identity (role: %s)", roleCtx.Role)
+	}
 
 	// Get git root for hook files
 	gitRoot, err := getGitRoot()
