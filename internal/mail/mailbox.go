@@ -195,35 +195,33 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	messages := make([]*Message, 0, len(assignee.messages)+len(cc.messages)+len(wisps.messages))
 	messages = appendBeadsMessages(messages, seen, assignee.messages, true)
 	messages = appendBeadsMessages(messages, seen, cc.messages, false)
+	// A wisp-query failure is tolerated, and it is worth saying why that is safe
+	// NOW when it was not before (gt-mff).
+	//
+	// This path runs `bd sql`, which legitimately fails in at least three
+	// supported configurations: an embedded store (the town store is embedded,
+	// and bd answers "not yet supported in embedded mode"), a bd old enough to
+	// lack `bd sql` at all (see scheduler_epic.go, which carries its own
+	// fallback for exactly that), and a store whose wisps table does not exist
+	// yet (runWispSQL says so at its own error return).
+	//
+	// What made the old silence harmful was not the silence. It was that this
+	// was the ONLY route to a wisp-backed message, so when it failed the inbox
+	// went blind and said nothing -- 227 messages invisible town-wide. Now that
+	// both issue queries pass --include-infra they return wisp-backed messages
+	// themselves, so this SQL query is a redundant second source and its failure
+	// cannot mean a message was dropped. Warning here would fire on every single
+	// inbox read in the configurations above, including the UserPromptSubmit
+	// hook's `gt mail check --inject` on every agent turn.
+	//
+	// The invariant that actually protects the inbox is therefore "--include-infra
+	// is present on the issue queries", and that is pinned structurally by
+	// TestMessageQueriesIncludeInfra rather than left to a runtime warning.
 	if wisps.err == nil {
 		messages = appendWispMessages(messages, seen, wisps.messages)
-	} else if !isUnsupportedSQLBackend(wisps.err) {
-		// Surface anything we did not expect. This branch used to discard EVERY
-		// wisp-query error, which is how gt-mff stayed undiagnosed for five days:
-		// the only path dedicated to wisp-backed mail failed on every call and
-		// said nothing, so an inbox with 73 messages in it rendered as empty at
-		// rc=0. An unexpected failure here means messages may be missing, and a
-		// warning is strictly better than a silent short read.
-		fmt.Fprintf(os.Stderr, "gt mail: wisp message query failed for %s (messages may be missing): %v\n", m.identity, wisps.err)
 	}
 
 	return messages, nil
-}
-
-// isUnsupportedSQLBackend reports whether err is bd declining to run `bd sql`
-// because the store is an embedded database rather than a server-backed one.
-//
-// This is an EXPECTED condition, not a fault: the town store is embedded
-// (.beads/embeddeddolt), so queryWispMessages cannot run there at all. It is
-// tolerated silently because the issue queries now pass --include-infra and
-// therefore already return wisp-backed messages -- the SQL path is a redundant
-// second route, not the only one. Kept separate from the generic error case so
-// that a REAL wisp-query failure is still reported (gt-mff).
-func isUnsupportedSQLBackend(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "not yet supported in embedded mode")
 }
 
 func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []string) ([]BeadsMessage, error) {
