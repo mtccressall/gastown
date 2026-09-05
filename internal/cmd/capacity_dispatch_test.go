@@ -13,42 +13,73 @@ import (
 )
 
 func TestShouldFireCrossRigEscalation_Debounces(t *testing.T) {
-	resetCrossRigEscalationStateForTest()
-	t.Cleanup(resetCrossRigEscalationStateForTest)
+	townRoot := t.TempDir()
 
 	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
-	if !shouldFireCrossRigEscalation("walletui", "hq", now) {
+	if !shouldFireCrossRigEscalation(townRoot, "walletui", "hq", now) {
 		t.Fatalf("first call must fire")
 	}
 	// Second call inside the debounce window must NOT fire.
-	if shouldFireCrossRigEscalation("walletui", "hq", now.Add(30*time.Minute)) {
+	if shouldFireCrossRigEscalation(townRoot, "walletui", "hq", now.Add(30*time.Minute)) {
 		t.Fatalf("second call inside debounce window must not fire")
 	}
 	// After the debounce window elapses, fire again.
-	if !shouldFireCrossRigEscalation("walletui", "hq", now.Add(crossRigEscalationDebounce+time.Minute)) {
+	if !shouldFireCrossRigEscalation(townRoot, "walletui", "hq", now.Add(crossRigEscalationDebounce+time.Minute)) {
 		t.Fatalf("call past debounce window must fire")
 	}
 }
 
+// TestShouldFireCrossRigEscalation_SurvivesProcessRestart is the whole point of
+// gt-83kc's second half, and the case the previous in-memory implementation
+// could not represent.
+//
+// The daemon does not call this in-process. It runs `gt scheduler run` as a
+// fresh process on every dispatch pass, so the debounce has to survive a
+// process boundary or it suppresses nothing. An in-memory map passed the two
+// tests above and still let every pass send Marc a new MEDIUM escalation.
+//
+// Dropping all in-process state between the two calls is what a new process
+// looks like to this function; only the state file can carry the answer across.
+func TestShouldFireCrossRigEscalation_SurvivesProcessRestart(t *testing.T) {
+	townRoot := t.TempDir()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if !shouldFireCrossRigEscalation(townRoot, "liveop", "live", now) {
+		t.Fatalf("first call must fire")
+	}
+
+	// Positive control: the state must actually be on disk. Without this the
+	// test would also pass against an implementation that never persisted and
+	// happened to be called twice in one process.
+	if _, err := os.Stat(crossRigEscalationStatePath(townRoot)); err != nil {
+		t.Fatalf("debounce state was not persisted: %v", err)
+	}
+
+	// A second process, five minutes later, carrying no memory of the first.
+	if shouldFireCrossRigEscalation(townRoot, "liveop", "live", now.Add(5*time.Minute)) {
+		t.Error("a fresh process re-fired inside the debounce window; the daemon " +
+			"spawns one per dispatch pass, so this is an escalation per pass")
+	}
+}
+
 func TestShouldFireCrossRigEscalation_KeyedByRigAndPrefix(t *testing.T) {
-	resetCrossRigEscalationStateForTest()
-	t.Cleanup(resetCrossRigEscalationStateForTest)
+	townRoot := t.TempDir()
 
 	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
 
-	if !shouldFireCrossRigEscalation("walletui", "hq", now) {
+	if !shouldFireCrossRigEscalation(townRoot, "walletui", "hq", now) {
 		t.Fatalf("walletui/hq first call must fire")
 	}
 	// Different rig — should fire independently.
-	if !shouldFireCrossRigEscalation("furiosa", "hq", now) {
+	if !shouldFireCrossRigEscalation(townRoot, "furiosa", "hq", now) {
 		t.Fatalf("furiosa/hq must fire (different rig)")
 	}
 	// Different prefix on same rig — should fire independently.
-	if !shouldFireCrossRigEscalation("walletui", "wisp", now) {
+	if !shouldFireCrossRigEscalation(townRoot, "walletui", "wisp", now) {
 		t.Fatalf("walletui/wisp must fire (different prefix)")
 	}
 	// Same (rig, prefix) repeats — debounced.
-	if shouldFireCrossRigEscalation("walletui", "hq", now.Add(time.Minute)) {
+	if shouldFireCrossRigEscalation(townRoot, "walletui", "hq", now.Add(time.Minute)) {
 		t.Fatalf("walletui/hq repeat must not fire")
 	}
 }

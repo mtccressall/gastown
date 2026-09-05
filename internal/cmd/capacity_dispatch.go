@@ -14,6 +14,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
@@ -25,38 +26,79 @@ import (
 // stuck context keeps re-appearing on every dispatch tick.
 const crossRigEscalationDebounce = time.Hour
 
-// crossRigEscalationState tracks last-escalation timestamps per (rig, prefix).
-// Process-local — debounce resets on daemon restart, which is fine: a new
-// process should be allowed to surface the issue once.
-var (
-	crossRigEscalationMu   sync.Mutex
-	crossRigEscalationLast = map[string]time.Time{}
-)
+// crossRigEscalationMu serialises this process's own access to the state file.
+// Cross-PROCESS exclusion is the flock inside withCrossRigEscalationState.
+var crossRigEscalationMu sync.Mutex
 
 // crossRigEscalationKey returns the debounce key for a (rig, prefix) pair.
 func crossRigEscalationKey(rig, prefix string) string {
 	return rig + "/" + prefix
 }
 
-// shouldFireCrossRigEscalation reports whether enough time has elapsed since
-// the last escalation for this (rig, prefix) pair to fire a new one. Updates
-// the timestamp on a positive answer.
-func shouldFireCrossRigEscalation(rig, prefix string, now time.Time) bool {
-	crossRigEscalationMu.Lock()
-	defer crossRigEscalationMu.Unlock()
-	key := crossRigEscalationKey(rig, prefix)
-	if last, ok := crossRigEscalationLast[key]; ok && now.Sub(last) < crossRigEscalationDebounce {
-		return false
-	}
-	crossRigEscalationLast[key] = now
-	return true
+// crossRigEscalationStatePath is where the debounce timestamps live.
+//
+// THIS MUST BE ON DISK. It used to be a process-local map whose comment read
+// "debounce resets on daemon restart, which is fine". That premise was false:
+// the daemon does not hold this state, it runs `gt scheduler run` as a FRESH
+// PROCESS every pass (internal/daemon/daemon.go, dispatchQueuedWork). The map
+// was therefore empty on every pass, each pass touches a given bead once, and
+// the debounce suppressed nothing, ever -- the hour was never once observed.
+//
+// It is the kind of guard that reads correctly, tests green against an
+// in-process caller, and is structurally incapable of firing in production.
+func crossRigEscalationStatePath(townRoot string) string {
+	return filepath.Join(constants.TownRuntimePath(townRoot), "cross-rig-escalation.json")
 }
 
-// resetCrossRigEscalationStateForTest clears the debounce map. Test-only.
-func resetCrossRigEscalationStateForTest() {
+// shouldFireCrossRigEscalation reports whether enough time has elapsed since
+// the last escalation for this (rig, prefix) pair to fire a new one, recording
+// the new timestamp when it answers true.
+//
+// Fails OPEN -- an unreadable or unwritable state file lets the escalation
+// through. A missed alert is worse than a duplicate one, and the duplicate is
+// the failure mode this function merely reduces rather than guarantees against.
+func shouldFireCrossRigEscalation(townRoot, rig, prefix string, now time.Time) bool {
+	if townRoot == "" {
+		return true
+	}
 	crossRigEscalationMu.Lock()
 	defer crossRigEscalationMu.Unlock()
-	crossRigEscalationLast = map[string]time.Time{}
+
+	path := crossRigEscalationStatePath(townRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return true
+	}
+	lock := flock.New(path + ".lock")
+	if err := lock.Lock(); err != nil {
+		return true
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	state := map[string]time.Time{}
+	if raw, err := os.ReadFile(path); err == nil {
+		// A corrupt file must not wedge the debounce shut forever; start over.
+		if err := json.Unmarshal(raw, &state); err != nil {
+			state = map[string]time.Time{}
+		}
+	}
+
+	key := crossRigEscalationKey(rig, prefix)
+	if last, ok := state[key]; ok && now.Sub(last) < crossRigEscalationDebounce {
+		return false
+	}
+	state[key] = now
+
+	// Drop entries older than twice the debounce so a long-lived town does not
+	// accumulate a key per prefix it has ever refused.
+	for k, ts := range state {
+		if now.Sub(ts) > 2*crossRigEscalationDebounce {
+			delete(state, k)
+		}
+	}
+	if raw, err := json.Marshal(state); err == nil {
+		_ = os.WriteFile(path, raw, 0o644)
+	}
+	return true
 }
 
 // fireCrossRigEscalation invokes `gt escalate` with a MEDIUM severity. Best
@@ -775,14 +817,110 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
 		return nil
 	}
+	// AcceptsPrefix compares the substring before the FIRST hyphen against the
+	// rig's single registered prefix, by equality. That is only ever a summary
+	// of the real question this guard asks -- "can the target rig's store
+	// resolve this bead" -- and it is wrong whenever a store carries more than
+	// one prefix. liveop holds legacy "live-op-" beads alongside "liveop-"
+	// ones, so BeadIDPrefix("live-op-agy") is "live", which never equals
+	// "liveop" and refused 11 open P0/P1 beads permanently (gt-83kc).
+	//
+	// routes.jsonl is the authority on which store resolves an ID, and
+	// ResolveBeadsDirForID is the function that reads it -- the same one bd
+	// uses. Ask it, rather than adding a second prefix rule that can drift
+	// from the first.
+	if routedIntoRig(townRoot, b.TargetRig, b.WorkBeadID) {
+		return nil
+	}
 	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
 	fmt.Fprintf(os.Stderr,
 		"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
 		style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
-	if escalate && shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
+	if escalate && shouldFireCrossRigEscalation(townRoot, b.TargetRig, gotPrefix, time.Now()) {
 		fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
 	}
 	return capacity.ErrCrossRigPrefix
+}
+
+// routedIntoRig reports whether routes.jsonl resolves beadID into rigName's
+// beads store.
+//
+// This is deliberately a question about the STORE, not about prefix spelling.
+// A rig can serve several ID prefixes -- liveop serves both "liveop-" and the
+// legacy "live-op-" -- and only the route table knows that. Comparing resolved
+// directories also means a redirect (liveop/.beads -> mayor/rig/.beads) is
+// followed on both sides rather than compared as text.
+//
+// Fails CLOSED: any error, or no route for this ID, yields false and leaves the
+// existing refusal in place. Absent routing information is not permission.
+func routedIntoRig(townRoot, rigName, beadID string) bool {
+	if townRoot == "" || rigName == "" || beadID == "" {
+		return false
+	}
+	townBeads := beads.GetTownBeadsPath(townRoot)
+
+	// Find the route for this ID EXPLICITLY. Do not infer it from what
+	// ResolveBeadsDirForID returns: that function falls back to the directory it
+	// was handed when no route matches, so an unroutable bead comes back as the
+	// TOWN store. A rig whose own store resolves to the town store would then
+	// compare equal and this guard would accept every unroutable bead for it
+	// (caught by codex review on this change).
+	//
+	// ExtractPrefix is the same splitter ResolveBeadsDirForID uses internally,
+	// so route matching here agrees with bead resolution by construction rather
+	// than by a second rule that can drift.
+	prefix := beads.ExtractPrefix(beadID)
+	if prefix == "" {
+		return false
+	}
+	routes, err := beads.LoadRoutes(townBeads)
+	if err != nil || len(routes) == 0 {
+		return false // absent routing information is not permission
+	}
+	routePath := ""
+	for _, r := range routes {
+		if r.Prefix == prefix {
+			routePath = r.Path
+			break
+		}
+	}
+	if routePath == "" {
+		return false // no route claims this ID
+	}
+	// A town-level route ("." ) is never a rig acceptance, whatever the rig's
+	// store happens to resolve to.
+	if filepath.Clean(routePath) == "." {
+		return false
+	}
+
+	routeBeads := beads.ResolveBeadsDir(filepath.Join(townRoot, routePath))
+	rigBeads := beads.ResolveBeadsDir(filepath.Join(townRoot, rigName))
+	if routeBeads == "" || rigBeads == "" {
+		return false
+	}
+	// Belt and braces: never accept on the town store, even if a rig resolves
+	// there. That is a degenerate configuration and refusing preserves the
+	// existing behaviour rather than opening the guard in it.
+	if sameDir(routeBeads, townBeads) {
+		return false
+	}
+	return sameDir(routeBeads, rigBeads)
+}
+
+// sameDir compares two directory paths, resolving symlinks where it can. It
+// falls back to a lexical comparison rather than reporting a match it could not
+// establish.
+func sameDir(a, b string) bool {
+	ca, cb := filepath.Clean(a), filepath.Clean(b)
+	if ca == cb {
+		return true
+	}
+	ra, errA := filepath.EvalSymlinks(ca)
+	rb, errB := filepath.EvalSymlinks(cb)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return ra == rb
 }
 
 // isDaemonDispatch returns true when dispatch is triggered by the daemon heartbeat.
