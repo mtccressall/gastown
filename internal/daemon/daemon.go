@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gofrs/flock"
 	beadsdk "github.com/steveyegge/beads"
@@ -3122,10 +3123,44 @@ func (d *Daemon) dispatchQueuedWork() {
 	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		d.logger.Printf("Scheduler dispatch timed out after 5m")
+		// CombinedOutput still returns whatever the child printed before the
+		// deadline killed it. Log it. Until gt-vkv9 this was the ONE branch that
+		// captured its evidence and threw it away, so a 5m hang was
+		// unattributable: the pass writes no feed event either, which makes a
+		// failing dispatcher indistinguishable from an idle one.
+		d.logger.Printf("Scheduler dispatch timed out after 5m (partial output: %s)", schedulerOutputTail(out))
 	} else if err != nil {
-		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, string(out))
+		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, schedulerOutputTail(out))
 	} else if len(out) > 0 {
 		d.logger.Printf("Scheduler dispatch: %s", string(out))
 	}
+}
+
+// schedulerOutputTail renders a child pass's captured output for daemon.log.
+//
+// It is bounded, because a runaway pass would otherwise flood the log with the
+// output nobody could read anyway, and it keeps the TAIL rather than the head:
+// the last thing the pass printed is where it stopped, which is the whole
+// question a timeout leaves open.
+//
+// It renders the empty case explicitly. "printed nothing before it was killed"
+// and "we dropped the output" are different facts, and a bare empty string
+// renders them identically -- which is the failure this function exists to end.
+func schedulerOutputTail(out []byte) string {
+	if len(out) == 0 {
+		return "<no output>"
+	}
+	const maxBytes = 4096
+	if len(out) > maxBytes {
+		tail := out[len(out)-maxBytes:]
+		// The cut lands at an arbitrary byte offset and scheduler output carries
+		// multibyte runes -- its dispatch lines are rendered "Dispatching X -> Y"
+		// with U+2192. Slicing mid-rune would put invalid UTF-8 into daemon.log,
+		// so walk forward to the next rune boundary before rendering.
+		for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+			tail = tail[1:]
+		}
+		return fmt.Sprintf("<last %d of %d bytes> %s", len(tail), len(out), tail)
+	}
+	return string(out)
 }
