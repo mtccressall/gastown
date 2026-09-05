@@ -167,16 +167,53 @@ func rotatePatrolCycle(b *beads.Beads, cfg PatrolConfig, patrolID, summary strin
 	// If descendants can't be closed, abort so patrol retries next cycle (gt-7lx3).
 	closed, closeDescErr := forceCloseDescendants(b, patrolID)
 	if closeDescErr != nil {
+		rollbackSuccessorPatrol(b, cfg, newPatrolID, patrolID)
 		return false, fmt.Errorf("closing descendants of patrol %s (closed %d): %w", patrolID, closed, closeDescErr)
 	}
 
 	// Close the patrol root
 	if err := b.ForceCloseWithReason("patrol cycle complete: "+summary, patrolID); err != nil {
+		rollbackSuccessorPatrol(b, cfg, newPatrolID, patrolID)
 		return false, fmt.Errorf("closing patrol %s: %w", patrolID, err)
 	}
 
 	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
 	return true, nil
+}
+
+// rollbackSuccessorPatrol closes a successor that was minted for a cycle whose
+// outgoing root then failed to close.
+//
+// Without it a failed close ends the call with TWO hooked roots, and the retry
+// picks the WRONG one: findActivePatrol takes the first active bead from a list
+// mergeBeadLists sorts newest-first, which is the successor. The next cycle then
+// reports against the successor and burns the outgoing root as superseded, so
+// its close_reason reads "burned: replaced by new patrol cycle" instead of the
+// summary that cycle actually produced — and close_reason cannot be amended once
+// written. The step audit survives in the outgoing root's description, which is
+// written before any of this, so what is lost is the close record rather than
+// the whole report; it is still a transient failure turning into a permanent
+// wrong answer.
+//
+// Rolling the successor back restores the invariant the retry depends on —
+// exactly one hooked patrol root — and it cannot strand the role, because the
+// outgoing root is still hooked at this point (its close is what just failed).
+// That keeps gt-7lx3's intent intact: abort, and let the next cycle retry the
+// same patrol.
+func rollbackSuccessorPatrol(b *beads.Beads, cfg PatrolConfig, newPatrolID, patrolID string) {
+	if newPatrolID == "" {
+		return
+	}
+	reason := fmt.Sprintf("rolled back: patrol %s could not be closed, so its cycle must be retried", patrolID)
+	closeDescendants(b, newPatrolID)
+	if err := b.ForceCloseWithReason(reason, newPatrolID); err != nil {
+		// Both roots stay hooked. The role is not stranded, but the next cycle
+		// will report against the successor, so say so rather than leaving the
+		// operator to infer it from a close_reason months later.
+		style.PrintWarning("could not roll back successor patrol %s after %s failed to close: %v; "+
+			"two patrols are now hooked for %s and the next cycle will report against %s",
+			newPatrolID, patrolID, err, cfg.Assignee, newPatrolID)
+	}
 }
 
 func stampDeaconHeartbeatOnReport(townRoot, summary string) {

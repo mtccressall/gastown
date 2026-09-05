@@ -222,6 +222,60 @@ func TestBurnPreviousPatrolWisps_KeepsExcludedRoot(t *testing.T) {
 	}
 }
 
+// TestRotatePatrolCycle_RollsBackSuccessorWhenCloseFails covers the failure path
+// the reorder introduces: the successor is hooked, and then the outgoing root
+// fails to close.
+//
+// Leaving both hooked is not a neutral outcome. findActivePatrol takes the first
+// active bead from a list mergeBeadLists sorts NEWEST-FIRST, so the retry picks
+// the successor, reports against it, and burns the outgoing root as superseded —
+// writing "burned: replaced by new patrol cycle" over the close_reason that
+// cycle earned, which cannot be amended afterwards. A transient close failure
+// would become a permanent wrong record.
+//
+// The close is made to fail for real, by rotating a patrol id that does not
+// exist, rather than by indirecting the close behind another test hook.
+func TestRotatePatrolCycle_RollsBackSuccessorWhenCloseFails(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+
+	// A real, hooked successor for the rollback to act on.
+	successor := createHookedPatrol(t, b, molName, assignee, false)
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	}
+
+	stubPatrolSpawn(t, func(PatrolConfig, string) (string, error) {
+		return successor, nil
+	})
+
+	rotated, err := rotatePatrolCycle(b, cfg, "testrig-wisp-does-not-exist", "all clear")
+	if err == nil {
+		t.Fatal("rotatePatrolCycle returned nil error when the outgoing patrol could not be closed")
+	}
+	if rotated {
+		t.Error("rotatePatrolCycle reported a completed rotation despite a failed close")
+	}
+
+	issue, showErr := b.Show(successor)
+	if showErr != nil {
+		t.Fatalf("show successor: %v", showErr)
+	}
+	if issue.Status != "closed" {
+		t.Fatalf("successor %s status = %q, want %q: the close failed, so leaving the successor "+
+			"hooked alongside the outgoing root makes the retry report against the SUCCESSOR "+
+			"(findActivePatrol takes the newest) and burn the outgoing root, overwriting the "+
+			"close_reason its cycle earned", successor, issue.Status, "closed")
+	}
+}
+
 func stubPatrolSpawn(t *testing.T, fn func(PatrolConfig, string) (string, error)) {
 	t.Helper()
 	old := patrolSpawnSuccessor
