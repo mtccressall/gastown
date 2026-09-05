@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/activity"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
@@ -689,12 +690,7 @@ func getClaudeProjectDir(workDir string) (string, error) {
 		return "", err
 	}
 
-	// Convert path to Claude's directory naming: replace / and _ with -
-	// Claude Code encodes both path separators and underscores as hyphens.
-	// Keep leading slash - it becomes a leading dash in Claude's encoding.
-	projectName := strings.ReplaceAll(workDir, "/", "-")
-	projectName = strings.ReplaceAll(projectName, "_", "-")
-	return filepath.Join(configDir, "projects", projectName), nil
+	return activity.ProjectDir(configDir, workDir), nil
 }
 
 // findLatestTranscript finds the most recently modified .jsonl file in a directory.

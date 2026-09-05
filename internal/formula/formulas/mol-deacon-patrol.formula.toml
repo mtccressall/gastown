@@ -51,7 +51,10 @@ Abbreviated patrol rules:
 - **resolve-external-deps**: SKIP.
 - **fire-notifications**: SKIP.
 - **heartbeat-mid**: SKIP (short cycle doesn't need mid-cycle refresh).
-- **health-scan**: Quick `gt witness status` / `gt refinery status` only. Skip nudges.
+- **health-scan**: Quick `gt witness status <rig>` / `gt refinery status <rig>` only, per rig. Skip nudges.
+  The `<rig>` argument is REQUIRED. Both commands exit 1 with a usage block when it is omitted from the
+  Deacon's cwd, so an abbreviated health scan without it measures nothing. Read the `Last activity` line,
+  not just `State`: `running` is session existence and reads true for a frozen agent (gt-fy6).
 - **dolt-health**: SKIP.
 - **zombie-scan**: SKIP.
 - **plugin-run**: SKIP.

@@ -359,11 +359,17 @@ func runRefineryStop(cmd *cobra.Command, args []string) error {
 }
 
 // RefineryStatusOutput is the JSON output format for refinery status.
+//
+// Running is derived from tmux session existence and so reads true for a frozen
+// refinery (gt-fy6). The embedded AgentActivity is the only liveness-bearing part
+// of this output: it is derived from what the agent WROTE. Read them together —
+// a non-empty queue with a stale last_activity is a stuck refinery, not a busy one.
 type RefineryStatusOutput struct {
-	Running     bool   `json:"running"`
-	RigName     string `json:"rig_name"`
-	Session     string `json:"session,omitempty"`
-	QueueLength int    `json:"queue_length"`
+	Running       bool   `json:"running"`
+	RigName       string `json:"rig_name"`
+	Session       string `json:"session,omitempty"`
+	AgentActivity        // inlined: last_activity, age, source
+	QueueLength   int    `json:"queue_length"`
 }
 
 func runRefineryStatus(cmd *cobra.Command, args []string) error {
@@ -372,7 +378,7 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 		rigName = args[0]
 	}
 
-	mgr, _, rigName, err := getRefineryManager(rigName)
+	mgr, r, rigName, err := getRefineryManager(rigName)
 	if err != nil {
 		return err
 	}
@@ -381,6 +387,16 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 	running, _ := mgr.IsRunning()
 	sessionInfo, _ := mgr.Status() // may be nil if not running
 
+	// Write-derived activity: the only field here that a frozen refinery cannot fake.
+	townRoot := townRootForRig(r.Path)
+	act := resolveAgentActivity(activityQuery{
+		TownRoot:    townRoot,
+		SessionName: mgr.SessionName(),
+		WorkDir:     mgr.WorkDir(),
+		Provider:    agentProvider("refinery", townRoot, r.Path, mgr.SessionName()),
+		SharedDirs:  []string{mgr.MayorWorkDir()},
+	}, time.Now())
+
 	// Get queue from beads
 	queue, _ := mgr.Queue()
 	queueLen := len(queue)
@@ -388,9 +404,10 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 	// JSON output
 	if refineryStatusJSON {
 		output := RefineryStatusOutput{
-			Running:     running,
-			RigName:     rigName,
-			QueueLength: queueLen,
+			Running:       running,
+			RigName:       rigName,
+			AgentActivity: act,
+			QueueLength:   queueLen,
 		}
 		if sessionInfo != nil {
 			output.Session = sessionInfo.Name
@@ -411,6 +428,7 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("  State: %s\n", style.Dim.Render("○ stopped"))
 	}
+	printAgentActivity(act)
 
 	fmt.Printf("\n  Queue: %d pending\n", queueLen)
 
