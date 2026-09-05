@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -438,5 +439,138 @@ func TestCountHiddenWispsQueryIncludesInfra(t *testing.T) {
 	body := src[idx : idx+end]
 	if !strings.Contains(body, `"--include-infra"`) {
 		t.Error("countHiddenWisps does not pass --include-infra; it would report the same zero the scan does")
+	}
+}
+
+func TestHasPatrolReport(t *testing.T) {
+	// `gt patrol report` writes "Patrol report: <summary>\n\n<step audit>" into
+	// the wisp description and then closes the wisp. Nothing else keeps the
+	// step audit, so this arm of the proven-value predicate is the only thing
+	// standing between that record and deleteWisp.
+	tests := []struct {
+		name string
+		desc string
+		want bool
+	}{
+		{"empty", "", false},
+		{"patrol report", "Patrol report: routine cycle\n\nheartbeat: OK", true},
+		{"leading whitespace", "\n  Patrol report: cycle 12", true},
+		{"rendered formula text", "# mol-deacon-patrol\n\nStep 1: heartbeat", false},
+		{"mentions the phrase later", "Cycle notes\n\nPatrol report: not at the head", false},
+		{"different prefix", "Patrol summary: routine cycle", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &compactIssue{Issue: beads.Issue{Description: tc.desc}}
+			if got := hasPatrolReport(w); got != tc.want {
+				t.Errorf("hasPatrolReport(%q) = %v, want %v", tc.desc, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPatrolReportPrefixMatchesWriter pins the reader against the writer. If
+// patrol_report.go's format string changes, the guard stops matching and the
+// records it protects become deletable again, silently — the shape gastown-mq9
+// exists to prevent.
+func TestPatrolReportPrefixMatchesWriter(t *testing.T) {
+	written := fmt.Sprintf("Patrol report: %s\n\n%s", "summary text", "step audit")
+	w := &compactIssue{Issue: beads.Issue{Description: written}}
+	if !hasPatrolReport(w) {
+		t.Fatalf("hasPatrolReport rejected the exact description patrol_report.go writes: %q", written)
+	}
+}
+
+// TestCompactVerdict exercises the decision path itself, including the case
+// gastown-mq9 is about: a closed patrol wisp, long past TTL, carrying no
+// comments, no keep label and no dependencies — whose description is the only
+// surviving copy of that patrol cycle's summary and step audit.
+func TestCompactVerdict(t *testing.T) {
+	const ttl = 24 * time.Hour
+	patrolDesc := "Patrol report: routine cycle\n\nheartbeat: OK | inbox-check: OK"
+
+	tests := []struct {
+		name       string
+		w          *compactIssue
+		age        time.Duration
+		want       compactVerdictKind
+		wantReason string
+	}{
+		{
+			name:       "closed patrol wisp past TTL is never deleted",
+			w:          &compactIssue{Issue: beads.Issue{Status: "closed", Description: patrolDesc}},
+			age:        30 * 24 * time.Hour,
+			want:       verdictPromote,
+			wantReason: "proven value",
+		},
+		{
+			name: "closed patrol wisp past TTL survives even with zero metadata",
+			w: &compactIssue{
+				Issue:        beads.Issue{Status: "closed", Description: patrolDesc},
+				CommentCount: 0,
+			},
+			age:        365 * 24 * time.Hour,
+			want:       verdictPromote,
+			wantReason: "proven value",
+		},
+		{
+			name:       "closed wisp past TTL with no record is deleted",
+			w:          &compactIssue{Issue: beads.Issue{Status: "closed", Description: "heartbeat"}},
+			age:        30 * 24 * time.Hour,
+			want:       verdictDelete,
+			wantReason: "TTL expired",
+		},
+		{
+			name:       "closed wisp within TTL is skipped",
+			w:          &compactIssue{Issue: beads.Issue{Status: "closed"}},
+			age:        time.Hour,
+			want:       verdictSkip,
+			wantReason: "within TTL",
+		},
+		{
+			name:       "commented wisp is promoted regardless of age",
+			w:          &compactIssue{Issue: beads.Issue{Status: "closed"}, CommentCount: 2},
+			age:        time.Hour,
+			want:       verdictPromote,
+			wantReason: "proven value",
+		},
+		{
+			name:       "keep label is promoted",
+			w:          &compactIssue{Issue: beads.Issue{Status: "closed", Labels: []string{"gt:keep"}}},
+			age:        30 * 24 * time.Hour,
+			want:       verdictPromote,
+			wantReason: "proven value",
+		},
+		{
+			name:       "molecule step past TTL is deleted, not promoted",
+			w:          &compactIssue{Issue: beads.Issue{Status: "open", Parent: "gt-wisp-root"}, CommentCount: 5},
+			age:        30 * 24 * time.Hour,
+			want:       verdictDelete,
+			wantReason: "molecule step past TTL",
+		},
+		{
+			name:       "stuck in_progress past TTL is promoted",
+			w:          &compactIssue{Issue: beads.Issue{Status: "in_progress"}},
+			age:        30 * 24 * time.Hour,
+			want:       verdictPromote,
+			wantReason: "stuck in_progress past TTL",
+		},
+		{
+			name:       "open past TTL is promoted",
+			w:          &compactIssue{Issue: beads.Issue{Status: "open"}},
+			age:        30 * 24 * time.Hour,
+			want:       verdictPromote,
+			wantReason: "open past TTL",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := compactVerdict(tc.w, tc.age, ttl)
+			if got != tc.want || reason != tc.wantReason {
+				t.Errorf("compactVerdict = (%v, %q), want (%v, %q)", got, reason, tc.want, tc.wantReason)
+			}
+		})
 	}
 }

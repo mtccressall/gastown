@@ -74,7 +74,9 @@ var compactCmd = &cobra.Command{
 
 For non-closed wisps past TTL: promotes to permanent beads (something is stuck).
 For closed wisps past TTL: deletes them (Dolt AS OF preserves history).
-Wisps with comments or keep labels are always promoted.
+Wisps with comments, keep labels, or a "Patrol report:" description are always
+promoted: a patrol wisp's description is the only copy of that cycle's summary
+and step audit.
 
 TTLs by wisp type:
   heartbeat, ping:              6h
@@ -319,47 +321,17 @@ func runCompact(cmd *cobra.Command, args []string) error {
 		}
 
 		ttl := getTTL(ttls, w.WispType)
-		shouldPromote := hasComments(w) || hasKeepLabel(w)
 
-		// Molecule step wisps (those with a Parent) should never be promoted.
-		// They are subordinate steps of a molecule and should be deleted when
-		// past TTL, not elevated to permanent beads. This prevents patrol
-		// molecule steps from polluting the issues table.
-		isMoleculeStep := w.Parent != ""
-
-		if w.Status != "closed" {
-			// Non-closed wisps
-			if shouldPromote && !isMoleculeStep {
-				promoteWisp(bd, w, "proven value", result)
-			} else if age > ttl {
-				if isMoleculeStep {
-					deleteWisp(bd, w, "molecule step past TTL", result)
-				} else {
-					reason := "open past TTL"
-					if w.Status == "in_progress" {
-						reason = "stuck in_progress past TTL"
-					}
-					promoteWisp(bd, w, reason, result)
-				}
-			} else {
-				result.Skipped++
-				if compactVerbose && !compactJSON {
-					fmt.Printf("  skip  %s %s (age: %s, ttl: %s)\n",
-						w.ID, compactTruncate(w.Title, 40), age.Round(time.Minute), ttl)
-				}
-			}
-		} else {
-			// Closed wisps
-			if shouldPromote && !isMoleculeStep {
-				promoteWisp(bd, w, "proven value", result)
-			} else if age > ttl {
-				deleteWisp(bd, w, "TTL expired", result)
-			} else {
-				result.Skipped++
-				if compactVerbose && !compactJSON {
-					fmt.Printf("  skip  %s %s (age: %s, ttl: %s)\n",
-						w.ID, compactTruncate(w.Title, 40), age.Round(time.Minute), ttl)
-				}
+		switch verdict, reason := compactVerdict(w, age, ttl); verdict {
+		case verdictPromote:
+			promoteWisp(bd, w, reason, result)
+		case verdictDelete:
+			deleteWisp(bd, w, reason, result)
+		default:
+			result.Skipped++
+			if compactVerbose && !compactJSON {
+				fmt.Printf("  skip  %s %s (age: %s, ttl: %s)\n",
+					w.ID, compactTruncate(w.Title, 40), age.Round(time.Minute), ttl)
 			}
 		}
 	}
@@ -381,6 +353,53 @@ func runCompact(cmd *cobra.Command, args []string) error {
 
 	printCompactSummary(result)
 	return nil
+}
+
+// compactVerdictKind is what a compaction run decides to do with one wisp.
+type compactVerdictKind int
+
+const (
+	verdictSkip compactVerdictKind = iota
+	verdictPromote
+	verdictDelete
+)
+
+// compactVerdict is the whole promote/delete/skip decision for one wisp.
+//
+// It is a pure function on purpose. The decision used to be inline in
+// runCompact, so the only testable pieces were the individual predicates —
+// and a predicate test passes whether or not the decision path calls it. That
+// is the shape that let gt-7rne ship next to a green suite pinning a function
+// the broken path never invoked. Test the verdict, not the predicate.
+func compactVerdict(w *compactIssue, age, ttl time.Duration) (compactVerdictKind, string) {
+	// Molecule step wisps (those with a Parent) should never be promoted.
+	// They are subordinate steps of a molecule and should be deleted when
+	// past TTL, not elevated to permanent beads. This prevents patrol
+	// molecule steps from polluting the issues table.
+	isMoleculeStep := w.Parent != ""
+
+	if (hasComments(w) || hasKeepLabel(w) || hasPatrolReport(w)) && !isMoleculeStep {
+		return verdictPromote, "proven value"
+	}
+
+	if age <= ttl {
+		return verdictSkip, "within TTL"
+	}
+
+	if w.Status == "closed" {
+		return verdictDelete, "TTL expired"
+	}
+
+	// Non-closed and past TTL: something is stuck, so the wisp becomes a
+	// permanent bead rather than disappearing — except molecule steps, which
+	// are deleted so they do not pollute the issues table.
+	if isMoleculeStep {
+		return verdictDelete, "molecule step past TTL"
+	}
+	if w.Status == "in_progress" {
+		return verdictPromote, "stuck in_progress past TTL"
+	}
+	return verdictPromote, "open past TTL"
 }
 
 // cleanOrphanedWispDeps removes wisp_dependencies rows where either side no
@@ -411,6 +430,28 @@ func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 
 // listWisps queries all ephemeral issues from the database.
 // Returns extended issue structs with comment_count and wisp_type.
+//
+// The query deliberately omits --include-infra, so it sees no wisps at all and
+// this compactor is inert. Do NOT add the flag as a one-line fix (gastown-mq9).
+// Adding it arms deleteWisp and promoteWisp over every wisp in the store on the
+// very next run — a mass delete, which CLAUDE.md reserves — and it makes the
+// compactor a second path to a deletion that the standing `bd mol wisp gc
+// --closed --force` suspension in the town patrol formulas currently blocks.
+// The compactor is not covered by that suspension only because it cannot see
+// wisps; widening the scan silently lifts a protection left in place on purpose.
+//
+// Enabling it needs, in this order:
+//  1. Somewhere durable for per-cycle patrol summaries to live (gt-tgf0's
+//     aggregation), or at minimum the proven-value guard for them that
+//     hasPatrolReport now provides — landed, so this step is satisfied.
+//  2. A decision on whether the first enabled run is forced to --dry-run,
+//     gated behind an explicit --confirm, or bounded by a max-deletions cap.
+//     Ages in every store are far past every TTL in defaultTTLs, so the first
+//     armed run deletes essentially everything closed at once.
+//  3. Confirmation that the TTL policy is still what we want before it takes
+//     effect on thousands of accumulated wisps.
+//
+// Steps 2 and 3 are Marc's or the Deacon's call, not a code change.
 func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
 	// Use bd list --json --all to get wisps in all statuses, unlimited
 	out, err := bd.Run("list", "--json", "--all", "-n", "0")
@@ -607,6 +648,33 @@ func compactTruncate(s string, maxLen int) string {
 // hasComments checks the comment_count on the compactIssue.
 func hasComments(w *compactIssue) bool {
 	return w.CommentCount > 0
+}
+
+// patrolReportPrefix is what patrol_report.go writes at the head of a patrol
+// wisp's description when a cycle closes with a summary. Keep it in step with
+// the format string there.
+const patrolReportPrefix = "Patrol report:"
+
+// hasPatrolReport reports whether this wisp's description carries a patrol
+// cycle summary, which makes it the only copy of that record.
+//
+// `gt patrol report` writes the cycle summary and step audit into the wisp's
+// DESCRIPTION and then closes the wisp (patrol_report.go). Nothing else keeps
+// that text: the close reason holds the summary but not the step audit, and no
+// aggregation reads it yet (gt-tgf0). So a closed patrol wisp past TTL is a
+// deletion candidate whose description is the record.
+//
+// The rest of the proven-value predicate cannot see this. Comments, keep
+// labels and dependency counts are all metadata; a patrol wisp typically
+// carries none of them. Measured against the town store 2026-09-05 with
+// `bd -C ~/gt list --json --all --include-infra -n 0`: of 8344 rows, 7829
+// ephemeral, 237 carry a "Patrol report:" description and 232 of those are
+// closed with comment_count 0 — unprotected by every other arm of the
+// predicate, and the exact record class the standing `bd mol wisp gc --closed`
+// suspension exists to preserve. All 237 are molecule ROOTS (parent empty), so
+// the !isMoleculeStep arm of the promote branch does not exclude them.
+func hasPatrolReport(w *compactIssue) bool {
+	return strings.HasPrefix(strings.TrimSpace(w.Description), patrolReportPrefix)
 }
 
 // isReferenced checks dependency counts.
