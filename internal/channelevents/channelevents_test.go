@@ -12,7 +12,7 @@ func TestEmitToTown(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()
 
-	path, err := EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
+	path, err := EmitToTown(townRoot, TownScope, "refinery", "MERGE_READY", []string{
 		"source=witness",
 		"rig=dashboard",
 	})
@@ -55,7 +55,7 @@ func TestEmitToTown(t *testing.T) {
 
 func TestEmitToTown_InvalidChannel(t *testing.T) {
 	t.Parallel()
-	_, err := EmitToTown(t.TempDir(), "../escape", "TEST", nil)
+	_, err := EmitToTown(t.TempDir(), TownScope, "../escape", "TEST", nil)
 	if err == nil {
 		t.Error("expected error for invalid channel name")
 	}
@@ -67,7 +67,7 @@ func TestEmitToTown_UniqueFilenames(t *testing.T) {
 	seen := make(map[string]bool)
 
 	for i := 0; i < 10; i++ {
-		path, err := EmitToTown(townRoot, "test", "EVENT", nil)
+		path, err := EmitToTown(townRoot, TownScope, "test", "EVENT", nil)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
@@ -104,7 +104,7 @@ func TestEmitToTown_CreatesDirectory(t *testing.T) {
 		t.Fatal("channel dir should not exist yet")
 	}
 
-	_, err := EmitToTown(townRoot, "newchannel", "TEST", nil)
+	_, err := EmitToTown(townRoot, TownScope, "newchannel", "TEST", nil)
 	if err != nil {
 		t.Fatalf("EmitToTown failed: %v", err)
 	}

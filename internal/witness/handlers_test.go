@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2714,8 +2715,14 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	// notifyRefineryMergeReady takes workDir and calls workspace.Find(workDir) internally
 	notifyRefineryMergeReady(townRoot, "dashboard", result)
 
-	// Verify that a MERGE_READY event file was created in the refinery channel
-	eventDir := filepath.Join(townRoot, "events", "refinery")
+	// Verify that a MERGE_READY event file was created in THIS RIG's refinery
+	// channel. The channel is rig-scoped (gt-a3qs): before scoping, every rig's
+	// refinery watched one shared directory and could consume — and with
+	// --cleanup delete — another rig's events.
+	eventDir, err := channelevents.ChannelDir(townRoot, "dashboard", "refinery")
+	if err != nil {
+		t.Fatalf("resolving channel dir: %v", err)
+	}
 	entries, err := os.ReadDir(eventDir)
 	if err != nil {
 		t.Fatalf("reading event dir: %v", err)
@@ -2729,7 +2736,17 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	}
 
 	if len(eventFiles) == 0 {
-		t.Fatal("expected at least one .event file in ~/gt/events/refinery/, got none")
+		t.Fatalf("expected at least one .event file in %s, got none", eventDir)
+	}
+
+	// The shared, unscoped directory must not receive it — otherwise the fix
+	// would have added a second copy rather than moved the event.
+	if shared, err := os.ReadDir(filepath.Join(townRoot, "events", "refinery")); err == nil {
+		for _, e := range shared {
+			if strings.HasSuffix(e.Name(), ".event") {
+				t.Errorf("event also written to the shared events/refinery/: %s", e.Name())
+			}
+		}
 	}
 
 	// Read and verify the event content
@@ -2759,6 +2776,9 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	}
 	if payload["rig"] != "dashboard" {
 		t.Errorf("payload.rig = %v, want dashboard", payload["rig"])
+	}
+	if event["rig"] != "dashboard" {
+		t.Errorf("event rig = %v, want dashboard", event["rig"])
 	}
 }
 

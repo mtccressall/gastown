@@ -23,6 +23,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
@@ -81,6 +82,11 @@ type Daemon struct {
 	// Used to escalate logging from WARN to ERROR after repeated failures.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	syncFailures map[string]int
+
+	// warnLegacyEventsOnce keeps the pre-scoping-events advisory to one line per
+	// daemon lifetime. The heartbeat runs constantly, and a warning repeated
+	// every tick is a warning nobody reads.
+	warnLegacyEventsOnce sync.Once
 
 	// PATCH-006: Resolved binary paths to avoid PATH issues in subprocesses.
 	gtPath string
@@ -1731,12 +1737,43 @@ func (d *Daemon) ensureWitnessesRunning() {
 	})
 }
 
-// hasPendingEvents checks if there are pending .event files in the given channel directory.
+// hasPendingEvents checks if there are pending .event files in the given rig's
+// channel directory.
 // Used to gate agent spawning: don't burn API credits starting a Claude session when
 // there's nothing to process. The agent's await-event handles the actual consumption.
-func (d *Daemon) hasPendingEvents(channel string) bool {
-	eventDir := filepath.Join(d.config.TownRoot, "events", channel)
-	entries, err := os.ReadDir(eventDir)
+//
+// This is the third consumer of a channel directory, alongside emit and
+// await-event, and it must resolve the path the same way they do. While it read
+// the unscoped events/<channel>, one rig's pending events spawned every other
+// rig's agent — the same cross-rig bleed as gt-a3qs, on the spawn path rather
+// than the consume path. Pass channelevents.TownScope for a town-level channel.
+func (d *Daemon) hasPendingEvents(rigName, channel string) bool {
+	eventDir, err := channelevents.ChannelDir(d.config.TownRoot, rigName, channel)
+	if err != nil {
+		return false // Unusable channel/rig name = no pending events
+	}
+	if dirHasEventFiles(eventDir) {
+		return true
+	}
+	// Transition: an event written before scoping still sits in the unscoped
+	// directory. One that names this rig on its own contents is ours, so MOVE
+	// it into the directory this rig's await-event actually watches and then
+	// open the gate.
+	//
+	// Detecting it without moving it would be worse than ignoring it: the gate
+	// would open, spawn a refinery that watches only the scoped directory, find
+	// nothing, exit — and the legacy event would still be there to do it again
+	// on the next heartbeat. A spawn loop burning a Claude session per tick.
+	//
+	// Events that name no rig are NOT claimed here — claiming another rig's work
+	// is the bug this change exists to fix — and legacyEventsNeedMigration
+	// reports them instead.
+	return d.deliverLegacyEventsNamingRig(rigName, channel) > 0
+}
+
+// dirHasEventFiles reports whether dir holds at least one .event file.
+func dirHasEventFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false // Directory doesn't exist or unreadable = no pending events
 	}
@@ -1746,6 +1783,75 @@ func (d *Daemon) hasPendingEvents(channel string) bool {
 		}
 	}
 	return false
+}
+
+// deliverLegacyEventsNamingRig moves pre-scoping events that explicitly name
+// rigName out of the shared directory and into that rig's channel directory,
+// returning how many arrived.
+//
+// Attribution comes from each event's own contents, so this cannot claim
+// another rig's event however the directory is shared, and an event naming no
+// rig is left exactly where it is for `gt events migrate` to archive.
+func (d *Daemon) deliverLegacyEventsNamingRig(rigName, channel string) int {
+	if rigName == channelevents.TownScope {
+		return 0
+	}
+	legacyDir, err := channelevents.ChannelDir(d.config.TownRoot, channelevents.TownScope, channel)
+	if err != nil {
+		return 0
+	}
+	scopedDir, err := channelevents.ChannelDir(d.config.TownRoot, rigName, channel)
+	if err != nil {
+		return 0
+	}
+	entries, err := os.ReadDir(legacyDir)
+	if err != nil {
+		return 0
+	}
+	delivered := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".event") {
+			continue
+		}
+		src := filepath.Join(legacyDir, entry.Name())
+		if channelevents.EventRig(src) != rigName {
+			continue
+		}
+		if err := channelevents.MoveEvent(src, filepath.Join(scopedDir, entry.Name())); err != nil {
+			d.logger.Printf("Could not deliver pre-scoping event %s to rig %s: %v", entry.Name(), rigName, err)
+			continue
+		}
+		delivered++
+	}
+	if delivered > 0 {
+		d.logger.Printf("Delivered %d pre-scoping %s event(s) naming rig %s into %s",
+			delivered, channel, rigName, scopedDir)
+	}
+	return delivered
+}
+
+// legacyEventsNeedMigration counts pre-scoping events that name no rig, so the
+// daemon can say so instead of skipping a spawn in silence. Pre-scoping
+// MQ_SUBMIT events carry no rig at all, so they cannot be delivered to anyone
+// and `gt events migrate` is the only thing that will clear them. Left
+// unsaid, "no pending events" reads identically to a genuinely quiet channel —
+// the false empty this town keeps paying for.
+func (d *Daemon) legacyEventsNeedMigration(channel string) int {
+	legacyDir, err := channelevents.ChannelDir(d.config.TownRoot, channelevents.TownScope, channel)
+	if err != nil {
+		return 0
+	}
+	entries, err := os.ReadDir(legacyDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".event") {
+			count++
+		}
+	}
+	return count
 }
 
 // ensureWitnessRunning ensures the witness for a specific rig is running.
@@ -1858,7 +1964,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
 	// But spawning a NEW session with an empty queue burns API credits for nothing.
 	// The refinery formula uses await-event internally, so it will wake when events appear.
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents(rigName, "refinery") {
 		// Check if session already exists before skipping — let running sessions continue
 		r := &rig.Rig{
 			Name: rigName,
@@ -1866,6 +1972,14 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 		}
 		mgr := refinery.NewManager(r)
 		if running, _ := mgr.IsRunning(); !running {
+			if stranded := d.legacyEventsNeedMigration("refinery"); stranded > 0 {
+				d.warnLegacyEventsOnce.Do(func() {
+					d.logger.Printf("No pending refinery events for %s, but %d pre-scoping event(s) "+
+						"sit in the unscoped events/refinery directory and name no rig, so they cannot "+
+						"be attributed to any refinery. Run 'gt events migrate' to drain them "+
+						"(it archives rather than deletes).", rigName, stranded)
+				})
+			}
 			d.logger.Printf("No pending refinery events and no session running for %s, skipping spawn", rigName)
 			return
 		}

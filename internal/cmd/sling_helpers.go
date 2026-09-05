@@ -944,8 +944,9 @@ func nudgeWitness(rigName, message string) {
 	// Emit a file event so the witness's await-event unblocks instantly.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", []string{
+		_, _ = channelevents.EmitToTown(townRoot, rigName, "witness", "POLECAT_DONE", []string{
 			"source=polecat",
+			"rig=" + rigName,
 			"message=" + message,
 		})
 	}
@@ -979,8 +980,9 @@ func nudgeRefinery(rigName, message string) {
 	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+		_, _ = channelevents.EmitToTown(townRoot, rigName, "refinery", "MQ_SUBMIT", []string{
 			"source=sling",
+			"rig=" + rigName,
 			"message=" + message,
 		})
 	}

@@ -1183,13 +1183,21 @@ This must resolve exactly one bead ID. If it fails, STOP and report the error. I
 Then use await-event to subscribe to the refinery event channel with exponential backoff:
 
 ```bash
-gt mol step await-event --channel refinery --agent-bead "$YOUR_AGENT_BEAD" \
+gt mol step await-event --channel refinery --rig {{rig}} --agent-bead "$YOUR_AGENT_BEAD" \
   --backoff-base 30s --backoff-mult 2 --backoff-max 15m --cleanup \
   --context-check-interval 5m
 ```
 
+**`--rig` is required here.** The refinery channel is per-rig: every rig runs its
+own refinery, and until the channel was scoped they all watched one directory.
+One rig then consumed — and with `--cleanup`, deleted — another rig's events
+(gt-a3qs: six of liveop's MQ_SUBMIT events, gone). With `--rig` you watch only
+your own rig's channel, which is what makes `--cleanup` safe again, and draining
+your own directory is what lets the backoff actually engage. Without `--rig` the
+command falls back to `GT_RIG` or your cwd and warns if it still cannot tell.
+
 This command:
-1. Watches `~/gt/events/refinery/` for event files (polling-based)
+1. Watches `~/gt/events/rigs/{{rig}}/refinery/` for event files (polling-based)
 2. Returns IMMEDIATELY when an event is emitted (MERGE_READY, PATROL_WAKE, MQ_SUBMIT)
 3. If no events, times out with exponential backoff:
    - First timeout: 30s
