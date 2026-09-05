@@ -36,6 +36,13 @@ Examples:
   gt patrol report --summary "All clear, no issues" --steps "heartbeat:OK,inbox-check:OK,health-scan:OK"
   gt patrol report --summary "Dolt latency elevated, filed escalation"`,
 	RunE: runPatrolReport,
+	// Print operational errors on their own. Without this cobra follows the
+	// error with the Flags block, and the block is what the reader sees: the
+	// Deacon that filed gastown-9pc read "no active patrol found for deacon"
+	// as a malformed-argument problem and went looking at its own quoting.
+	// A usage block in place of an error sends the reader to their input
+	// rather than to the state.
+	SilenceUsage: true,
 }
 
 func init() {
@@ -95,37 +102,118 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	// Print the step audit for visibility
 	fmt.Println(stepAudit)
 
+	rotated, err := rotatePatrolCycle(b, cfg, patrolID, patrolReportSummary)
+	if err != nil {
+		return err
+	}
+	if rotated && cfg.RoleName == "deacon" {
+		stampDeaconHeartbeatOnReport(cfg.BeadsDir, patrolReportSummary)
+	}
+	return nil
+}
+
+// patrolSpawnSuccessor is the successor-minting step of a patrol cycle,
+// indirected so tests can exercise the mint/close ORDER without a live
+// formula catalog. The order is the whole point of gastown-9pc, and a
+// happy-path test cannot see it: it passes against either ordering.
+var patrolSpawnSuccessor = autoSpawnPatrol
+
+// rotatePatrolCycle ends one patrol cycle and begins the next. It reports
+// whether the rotation completed — a partial mint leaves the outgoing cycle
+// open, so the caller must not treat that as a finished report.
+//
+// THE SUCCESSOR IS MINTED BEFORE THE OUTGOING ROOT IS CLOSED, and the order is
+// load-bearing (gastown-9pc / town gt-9dwa). Close and mint cannot be made
+// atomic, so the question is only which side of the window a death lands on,
+// and the two failure modes are NOT symmetric:
+//
+//	close-then-mint, death in the window -> ZERO hooked patrol wisps. Terminal.
+//	  Nothing recovers it, and the role cannot tell it happened: gt hook and the
+//	  town-scoped bd query BOTH report empty, truthfully. A respawning agent
+//	  reads that, believes it, and stands down — which looks like diligence.
+//	mint-then-close, death in the window -> TWO hooked patrol wisps. Self-healing:
+//	  the next cycle's burnPreviousPatrolWisps closes the superseded root by
+//	  design (patrol_helpers.go, "burned: replaced by new patrol cycle").
+//
+// So the reordered failure mode is one the system already handles, and the
+// original one is the state this workspace's own banner is written about.
+//
+// Death is not an error branch, so no amount of error handling closes this
+// window — only the order does.
+func rotatePatrolCycle(b *beads.Beads, cfg PatrolConfig, patrolID, summary string) (bool, error) {
+	// Mint the successor FIRST. The outgoing root is still hooked at this
+	// point, so it is excluded from the new cycle's burn — otherwise the burn
+	// would close it as "burned: replaced by new patrol cycle" and the summary
+	// would never reach close_reason.
+	newPatrolID, err := patrolSpawnSuccessor(cfg, patrolID)
+	if err != nil {
+		if newPatrolID != "" {
+			// Created but not hooked. The outgoing root is still hooked, so the
+			// role keeps a patrol; leave it open rather than closing it and
+			// landing in exactly the hookless state this ordering prevents.
+			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
+			fmt.Printf("New patrol: %s\n", newPatrolID)
+			return false, nil
+		}
+		return false, fmt.Errorf("starting next patrol cycle: %w", err)
+	}
+
+	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
+
+	// The successor exists and is hooked. Now the outgoing cycle can be closed.
+	//
 	// Close all descendant wisps first (recursive), then the patrol root.
 	// Without this, every patrol cycle leaks ~10 orphan wisps into the DB.
 	// If descendants can't be closed, abort so patrol retries next cycle (gt-7lx3).
 	closed, closeDescErr := forceCloseDescendants(b, patrolID)
 	if closeDescErr != nil {
-		return fmt.Errorf("closing descendants of patrol %s (closed %d): %w", patrolID, closed, closeDescErr)
+		rollbackSuccessorPatrol(b, cfg, newPatrolID, patrolID)
+		return false, fmt.Errorf("closing descendants of patrol %s (closed %d): %w", patrolID, closed, closeDescErr)
 	}
 
 	// Close the patrol root
-	if err := b.ForceCloseWithReason("patrol cycle complete: "+patrolReportSummary, patrolID); err != nil {
-		return fmt.Errorf("closing patrol %s: %w", patrolID, err)
+	if err := b.ForceCloseWithReason("patrol cycle complete: "+summary, patrolID); err != nil {
+		rollbackSuccessorPatrol(b, cfg, newPatrolID, patrolID)
+		return false, fmt.Errorf("closing patrol %s: %w", patrolID, err)
 	}
 
 	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
+	return true, nil
+}
 
-	// Start next cycle
-	newPatrolID, err := autoSpawnPatrol(cfg)
-	if err != nil {
-		if newPatrolID != "" {
-			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
-			fmt.Printf("New patrol: %s\n", newPatrolID)
-			return nil
-		}
-		return fmt.Errorf("starting next patrol cycle: %w", err)
+// rollbackSuccessorPatrol closes a successor that was minted for a cycle whose
+// outgoing root then failed to close.
+//
+// Without it a failed close ends the call with TWO hooked roots, and the retry
+// picks the WRONG one: findActivePatrol takes the first active bead from a list
+// mergeBeadLists sorts newest-first, which is the successor. The next cycle then
+// reports against the successor and burns the outgoing root as superseded, so
+// its close_reason reads "burned: replaced by new patrol cycle" instead of the
+// summary that cycle actually produced — and close_reason cannot be amended once
+// written. The step audit survives in the outgoing root's description, which is
+// written before any of this, so what is lost is the close record rather than
+// the whole report; it is still a transient failure turning into a permanent
+// wrong answer.
+//
+// Rolling the successor back restores the invariant the retry depends on —
+// exactly one hooked patrol root — and it cannot strand the role, because the
+// outgoing root is still hooked at this point (its close is what just failed).
+// That keeps gt-7lx3's intent intact: abort, and let the next cycle retry the
+// same patrol.
+func rollbackSuccessorPatrol(b *beads.Beads, cfg PatrolConfig, newPatrolID, patrolID string) {
+	if newPatrolID == "" {
+		return
 	}
-
-	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
-	if cfg.RoleName == "deacon" {
-		stampDeaconHeartbeatOnReport(cfg.BeadsDir, patrolReportSummary)
+	reason := fmt.Sprintf("rolled back: patrol %s could not be closed, so its cycle must be retried", patrolID)
+	closeDescendants(b, newPatrolID)
+	if err := b.ForceCloseWithReason(reason, newPatrolID); err != nil {
+		// Both roots stay hooked. The role is not stranded, but the next cycle
+		// will report against the successor, so say so rather than leaving the
+		// operator to infer it from a close_reason months later.
+		style.PrintWarning("could not roll back successor patrol %s after %s failed to close: %v; "+
+			"two patrols are now hooked for %s and the next cycle will report against %s",
+			newPatrolID, patrolID, err, cfg.Assignee, newPatrolID)
 	}
-	return nil
 }
 
 func stampDeaconHeartbeatOnReport(townRoot, summary string) {

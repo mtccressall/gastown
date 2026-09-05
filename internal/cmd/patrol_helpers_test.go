@@ -112,7 +112,7 @@ func TestAutoSpawnPatrol_RefinerySafetyStoppedSkipsWispCreate(t *testing.T) {
 		PatrolMolName: constants.MolRefineryPatrol,
 		BeadsDir:      townRoot,
 		Assignee:      "testrig/refinery",
-	})
+	}, "")
 	if !errors.Is(err, refinery.ErrSafetyStopped) {
 		t.Fatalf("autoSpawnPatrol error = %v, want ErrSafetyStopped", err)
 	}
@@ -1167,7 +1167,7 @@ func TestBurnPreviousPatrolWisps(t *testing.T) {
 		Beads:         b,
 	}
 
-	burnPreviousPatrolWisps(cfg)
+	burnPreviousPatrolWisps(cfg, "")
 
 	// All 3 patrols should now be closed
 	for _, id := range []string{id1, id2, id3} {
@@ -1214,7 +1214,7 @@ func TestBurnPreviousPatrolWisps_IgnoresOtherBeads(t *testing.T) {
 		Beads:         b,
 	}
 
-	burnPreviousPatrolWisps(cfg)
+	burnPreviousPatrolWisps(cfg, "")
 
 	// Patrol should be closed
 	issue, err := b.Show(patrolID)

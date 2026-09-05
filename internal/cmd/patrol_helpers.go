@@ -153,7 +153,15 @@ func formatBeadLine(issue *beads.Issue) string {
 // This prevents orphaned root wisp accumulation when a new patrol cycle starts
 // without the previous one being properly closed (gt-92jh).
 // Errors are logged as warnings but don't block new patrol creation.
-func burnPreviousPatrolWisps(cfg PatrolConfig) {
+//
+// keepPatrolID, when non-empty, names one patrol root the burn must leave
+// hooked. gt patrol report mints the successor BEFORE closing the cycle it is
+// reporting on (gastown-9pc), so during that call the outgoing root is still
+// hooked and would otherwise be burned here — closing it with "burned:
+// replaced by new patrol cycle" instead of the cycle summary, and destroying
+// the one field that records what the cycle did. The report path closes it
+// itself, with the summary, once the successor exists.
+func burnPreviousPatrolWisps(cfg PatrolConfig, keepPatrolID string) {
 	b := cfg.Beads
 	if b == nil {
 		b = beads.New(cfg.BeadsDir)
@@ -169,6 +177,9 @@ func burnPreviousPatrolWisps(cfg PatrolConfig) {
 	var burned int
 	for _, bead := range hookedBeads {
 		if !strings.HasPrefix(bead.Title, cfg.PatrolMolName) {
+			continue
+		}
+		if keepPatrolID != "" && bead.ID == keepPatrolID {
 			continue
 		}
 
@@ -190,8 +201,13 @@ func burnPreviousPatrolWisps(cfg PatrolConfig) {
 // Before creating, it burns any existing patrol wisps for this role to prevent
 // orphaned root wisp accumulation (gt-92jh). This makes the function
 // self-cleaning regardless of the caller.
+//
+// keepPatrolID, when non-empty, is a patrol root the burn must not touch —
+// see burnPreviousPatrolWisps. Pass "" unless you are minting a successor
+// while the outgoing root is still hooked.
+//
 // Returns the patrol ID or an error.
-func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
+func autoSpawnPatrol(cfg PatrolConfig, keepPatrolID string) (string, error) {
 	if stop, err := refineryPatrolSafetyStop(cfg); err != nil {
 		return "", err
 	} else if stop != nil {
@@ -206,7 +222,7 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 	// Burn any existing patrol wisps for this role before creating a new one.
 	// Without this, each patrol cycle leaks a root wisp into the DB, producing
 	// ~500-700 orphans/day across all patrol formulas (gt-92jh).
-	burnPreviousPatrolWisps(cfg)
+	burnPreviousPatrolWisps(cfg, keepPatrolID)
 
 	// Find the proto ID for the patrol molecule
 	cmdCatalog := exec.Command("gt", "formula", "list")
@@ -368,7 +384,7 @@ func outputPatrolContext(cfg PatrolConfig) {
 		fmt.Println()
 
 		var err error
-		patrolID, err = autoSpawnPatrol(cfg)
+		patrolID, err = autoSpawnPatrol(cfg, "")
 		if err != nil {
 			if errors.Is(err, refinery.ErrSafetyStopped) {
 				fmt.Println(style.Dim.Render(err.Error()))
