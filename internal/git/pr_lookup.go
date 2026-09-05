@@ -38,6 +38,7 @@ type PullRequestInfo struct {
 	HeadOwner    string `json:"head_owner,omitempty"`
 	HeadRepo     string `json:"head_repo,omitempty"`
 	HeadSHA      string `json:"head_sha,omitempty"`
+	MergeCommit  string `json:"merge_commit,omitempty"`
 	BaseRepo     string `json:"base_repo,omitempty"`
 	LookupSource string `json:"lookup_source,omitempty"`
 }
@@ -137,7 +138,7 @@ func githubRepoFromRemoteURL(raw string) (string, error) {
 }
 
 func (g *Git) viewPullRequest(selector, targetRepo string) (*PullRequestInfo, error) {
-	args := []string{"pr", "view", selector, "--json", "number,url,state,mergedAt,headRefName,headRefOid,headRepository,headRepositoryOwner"}
+	args := []string{"pr", "view", selector, "--json", "number,url,state,mergedAt,mergeCommit,headRefName,headRefOid,headRepository,headRepositoryOwner"}
 	if targetRepo != "" && !strings.HasPrefix(selector, "http://") && !strings.HasPrefix(selector, "https://") {
 		args = append(args, "--repo", targetRepo)
 	}
@@ -164,7 +165,7 @@ func (g *Git) viewPullRequest(selector, targetRepo string) (*PullRequestInfo, er
 }
 
 func (g *Git) lookupPullRequestByHead(targetRepo, branch, headSHA string) (*PullRequestInfo, error) {
-	out, err := g.runGH("pr", "list", "--repo", targetRepo, "--head", branch, "--state", "all", "--json", "number,url,state,mergedAt,headRefName,headRefOid,headRepository,headRepositoryOwner", "--limit", "100")
+	out, err := g.runGH("pr", "list", "--repo", targetRepo, "--head", branch, "--state", "all", "--json", "number,url,state,mergedAt,mergeCommit,headRefName,headRefOid,headRepository,headRepositoryOwner", "--limit", "100")
 	if err != nil {
 		return nil, fmt.Errorf("gh pr list head %s in %s failed: %w", branch, targetRepo, err)
 	}
@@ -270,6 +271,7 @@ type ghPullRequest struct {
 	URL                 string `json:"url"`
 	State               string `json:"state"`
 	MergedAt            string `json:"mergedAt"`
+	MergeCommit         ghOID  `json:"mergeCommit"`
 	HeadRefName         string `json:"headRefName"`
 	HeadRefOID          string `json:"headRefOid"`
 	HeadRepository      ghRepo `json:"headRepository"`
@@ -283,6 +285,10 @@ type ghRepo struct {
 
 type ghUser struct {
 	Login string `json:"login"`
+}
+
+type ghOID struct {
+	OID string `json:"oid"`
 }
 
 func (p ghPullRequest) toInfo() *PullRequestInfo {
@@ -299,6 +305,7 @@ func (p ghPullRequest) toInfo() *PullRequestInfo {
 		HeadOwner:   p.HeadRepositoryOwner.Login,
 		HeadRepo:    p.HeadRepository.NameWithOwner,
 		HeadSHA:     p.HeadRefOID,
+		MergeCommit: p.MergeCommit.OID,
 		BaseRepo:    p.BaseRepository.NameWithOwner,
 	}
 }
@@ -308,6 +315,7 @@ type ghRESTPullRequest struct {
 	HTMLURL  string  `json:"html_url"`
 	State    string  `json:"state"`
 	MergedAt *string `json:"merged_at"`
+	MergeSHA *string `json:"merge_commit_sha"`
 	Head     struct {
 		Ref  string `json:"ref"`
 		SHA  string `json:"sha"`
@@ -333,6 +341,10 @@ func (p ghRESTPullRequest) toGH() ghPullRequest {
 	if p.MergedAt != nil {
 		mergedAt = *p.MergedAt
 	}
+	mergeSHA := ""
+	if p.MergeSHA != nil {
+		mergeSHA = *p.MergeSHA
+	}
 	headRepo := ""
 	headOwner := p.Head.User.Login
 	if p.Head.Repo != nil {
@@ -346,6 +358,7 @@ func (p ghRESTPullRequest) toGH() ghPullRequest {
 		URL:                 p.HTMLURL,
 		State:               p.State,
 		MergedAt:            mergedAt,
+		MergeCommit:         ghOID{OID: mergeSHA},
 		HeadRefName:         p.Head.Ref,
 		HeadRefOID:          p.Head.SHA,
 		HeadRepository:      ghRepo{NameWithOwner: headRepo},

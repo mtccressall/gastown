@@ -1542,21 +1542,13 @@ func (e *Engineer) verifyMRInfoPostMergeProof(mr *MRInfo) error {
 	if e.git == nil {
 		return fmt.Errorf("git client is missing")
 	}
-	target := strings.TrimSpace(mr.Target)
-	if target == "" {
-		return fmt.Errorf("missing target branch")
-	}
-	if source := strings.TrimSpace(mr.Branch); source != "" && source == target {
-		return fmt.Errorf("source branch %s matches target branch", source)
-	}
-	commit := strings.TrimSpace(mr.CommitSHA)
-	if commit == "" {
-		return fmt.Errorf("missing submitted commit_sha")
-	}
-	if err := e.git.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("target %s does not contain submitted head %s: %w", target, commit, err)
-	}
-	return nil
+	return VerifyMergeProof(e.git, MergeProofRequest{
+		Target:    mr.Target,
+		Branch:    mr.Branch,
+		CommitSHA: mr.CommitSHA,
+		PRURL:     mr.PRURL,
+		PRNumber:  mr.PRNumber,
+	})
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
