@@ -631,3 +631,68 @@ func TestQueueLen(t *testing.T) {
 		t.Errorf("QueueLen after drain = %d, want 0", got)
 	}
 }
+
+// TestNudgeLeavesNoProductionRecords is the regression control for gastown-adj.
+//
+// GT_TEST_NUDGE_LOG gates the nudge TRANSPORT. The record of a delivery was
+// ungated, so a suite run inside an agent's worktree appended nudge events to
+// the town's .events.jsonl and logs/town.log under that agent's identity — an
+// artifact indistinguishable from a real send, and the one everyone reads.
+//
+// This runs the same fixture path the phantom bursts came from, inside a
+// throwaway town root, and asserts neither record was created.
+func TestNudgeLeavesNoProductionRecords(t *testing.T) {
+	origMode := nudgeModeFlag
+	origPriority := nudgePriorityFlag
+	origMessage := nudgeMessageFlag
+	origStdin := nudgeStdinFlag
+	origForce := nudgeForceFlag
+	defer func() {
+		nudgeModeFlag = origMode
+		nudgePriorityFlag = origPriority
+		nudgeMessageFlag = origMessage
+		nudgeStdinFlag = origStdin
+		nudgeForceFlag = origForce
+	}()
+
+	// A town root of our own, so a regression writes here and not into the
+	// real feed the assertions below could never safely inspect.
+	townRoot := filepath.Join(t.TempDir(), "town")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatalf("creating town root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("writing town.json: %v", err)
+	}
+	t.Chdir(townRoot)
+
+	logPath := filepath.Join(t.TempDir(), "nudge.log")
+	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
+
+	nudgeModeFlag = NudgeModeImmediate
+	nudgePriorityFlag = nudge.PriorityNormal
+	nudgeMessageFlag = "hello dog"
+	nudgeStdinFlag = false
+	nudgeForceFlag = true
+
+	if err := runNudge(nudgeCmd, []string{"deacon/dogs/fido"}); err != nil {
+		t.Fatalf("runNudge: %v", err)
+	}
+
+	// Positive control: without this the assertions below would pass for any
+	// early return, including one that never reaches the logging calls.
+	if _, err := os.ReadFile(logPath); err != nil {
+		t.Fatalf("nudge transport log missing, so the logging path was never reached: %v", err)
+	}
+
+	for _, rec := range []string{
+		filepath.Join(townRoot, ".events.jsonl"),
+		filepath.Join(townRoot, "logs", "town.log"),
+	} {
+		if data, err := os.ReadFile(rec); err == nil {
+			t.Errorf("%s was written by a test run:\n%s", rec, data)
+		} else if !os.IsNotExist(err) {
+			t.Errorf("stat %s: %v", rec, err)
+		}
+	}
+}

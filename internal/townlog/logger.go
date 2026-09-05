@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/testmode"
 )
 
 // EventType represents the type of agent lifecycle event.
@@ -49,7 +51,7 @@ const (
 type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 	Type      EventType `json:"type"`
-	Agent     string    `json:"agent"`            // e.g., "gastown/crew/max" or "gastown/polecats/Toast"
+	Agent     string    `json:"agent"`             // e.g., "gastown/crew/max" or "gastown/polecats/Toast"
 	Context   string    `json:"context,omitempty"` // Additional context (issue ID, error message, etc.)
 }
 
@@ -77,7 +79,17 @@ func NewLogger(townRoot string) *Logger {
 }
 
 // LogEvent logs a single event to the town log.
+//
+// Writes are dropped inside a `go test` binary: the town root usually comes
+// from the caller's cwd, so fixture traffic landed in the production
+// logs/town.log under the running agent's identity (gastown-adj — 31 phantom
+// "hello dog" nudge lines from internal/cmd/nudge_test.go). Tests that exercise
+// this writer opt back in with t.Setenv(testmode.EnvSuppress, "0").
 func (l *Logger) LogEvent(event Event) error {
+	if testmode.WritesSuppressed() {
+		return nil
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

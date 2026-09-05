@@ -1,7 +1,12 @@
 package events
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/testmode"
 )
 
 func TestSlingPayload(t *testing.T) {
@@ -255,5 +260,79 @@ func TestSessionPayload_Minimal(t *testing.T) {
 	}
 	if _, ok := p["cwd"]; ok {
 		t.Error("expected no cwd key when empty")
+	}
+}
+
+// --- Suppression under `go test` (gastown-adj) -------------------------------
+//
+// write() resolves the town root from the cwd, so a suite run inside an agent's
+// worktree used to append to the production feed under that agent's identity.
+
+// newTownRoot creates a minimal town root and makes it the working directory.
+func newTownRoot(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "town")
+	if err := os.MkdirAll(filepath.Join(root, "mayor"), 0o755); err != nil {
+		t.Fatalf("creating town root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("writing town.json: %v", err)
+	}
+	t.Chdir(root)
+	return root
+}
+
+func TestSuppressedByDefaultInTestBinary(t *testing.T) {
+	// Positive control on the mechanism itself. Without it,
+	// TestWriteDoesNotGrowFeedUnderTest would pass for any reason the writer
+	// failed to produce a file, not because suppression engaged.
+	if got := os.Getenv(EnvSuppress); got != "1" {
+		t.Fatalf("%s = %q at test time, want \"1\" (init did not detect the test binary)", EnvSuppress, got)
+	}
+	if !testmode.WritesSuppressed() {
+		t.Fatal("testmode.WritesSuppressed() = false inside a test binary")
+	}
+}
+
+func TestWriteDoesNotGrowFeedUnderTest(t *testing.T) {
+	root := newTownRoot(t)
+	eventsPath := filepath.Join(root, EventsFile)
+
+	if err := LogFeed(TypeNudge, "gastown/polecats/garnet", NudgePayload("gastown", "hq-mayor", "test")); err != nil {
+		t.Fatalf("LogFeed: %v", err)
+	}
+	if err := LogAudit(TypeSessionDeath, "daemon", SessionDeathPayload("gt-mycat", "myr/polecats/mycat", "crash detected by daemon", "daemon")); err != nil {
+		t.Fatalf("LogAudit: %v", err)
+	}
+
+	if _, err := os.Stat(eventsPath); !os.IsNotExist(err) {
+		data, _ := os.ReadFile(eventsPath)
+		t.Fatalf("%s exists after logging from a test binary (stat err %v); contents:\n%s", EventsFile, err, data)
+	}
+}
+
+func TestWriteWritesWhenSuppressionDisabled(t *testing.T) {
+	// The negative control above only means something if the writer works when
+	// it is allowed to, in exactly the same setup.
+	root := newTownRoot(t)
+	t.Setenv(EnvSuppress, "0")
+
+	if err := LogFeed(TypeNudge, "gastown/polecats/garnet", NudgePayload("gastown", "hq-mayor", "test")); err != nil {
+		t.Fatalf("LogFeed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, EventsFile))
+	if err != nil {
+		t.Fatalf("reading events file: %v", err)
+	}
+	var got Event
+	if err := json.Unmarshal(data[:len(data)-1], &got); err != nil {
+		t.Fatalf("unmarshaling event %q: %v", data, err)
+	}
+	if got.Type != TypeNudge {
+		t.Errorf("type = %q, want %q", got.Type, TypeNudge)
+	}
+	if got.Actor != "gastown/polecats/garnet" {
+		t.Errorf("actor = %q, want gastown/polecats/garnet", got.Actor)
 	}
 }

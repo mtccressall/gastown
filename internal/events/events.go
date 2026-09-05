@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/testmode"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -55,9 +56,9 @@ const (
 	TypeMassDeath    = "mass_death"    // Multiple sessions died in short window
 
 	// Witness patrol events
-	TypePatrolStarted   = "patrol_started"
-	TypePolecatChecked  = "polecat_checked"
-	TypePolecatNudged   = "polecat_nudged"
+	TypePatrolStarted    = "patrol_started"
+	TypePolecatChecked   = "polecat_checked"
+	TypePolecatNudged    = "polecat_nudged"
 	TypeEscalationSent   = "escalation_sent"
 	TypeEscalationAcked  = "escalation_acked"
 	TypeEscalationClosed = "escalation_closed"
@@ -78,6 +79,10 @@ const (
 
 // EventsFile is the name of the raw events log.
 const EventsFile = ".events.jsonl"
+
+// EnvSuppress disables all event writes when set to anything but "0".
+// It is set automatically inside a test binary; see package testmode for why.
+const EnvSuppress = testmode.EnvSuppress
 
 // Log writes an event to the events log.
 // The event is appended to ~/gt/.events.jsonl.
@@ -108,6 +113,10 @@ func LogAudit(eventType, actor string, payload map[string]interface{}) error {
 // Uses flock for cross-process synchronization — sync.Mutex only protects
 // intra-process goroutines, but multiple gt processes write concurrently.
 func write(event Event) error {
+	if testmode.WritesSuppressed() {
+		return nil
+	}
+
 	// Find town root
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
