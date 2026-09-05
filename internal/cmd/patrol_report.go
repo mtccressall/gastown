@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -97,8 +98,10 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 		b = beads.New(cfg.BeadsDir)
 	}
 
-	// Build step audit checklist
-	stepAudit := buildStepAudit(cfg.PatrolMolName, patrolReportSteps)
+	// Build step audit checklist. Grade against the SAME formula the patrol was
+	// rendered from — town and rig overrides win over the embedded copy — or the
+	// audit scores the agent against a checklist it was never shown.
+	stepAudit := buildStepAudit(cfg.PatrolMolName, roleInfo.TownRoot, roleInfo.Rig, patrolReportSteps)
 
 	// Update the description with the patrol summary and step audit
 	desc := fmt.Sprintf("Patrol report: %s\n\n%s", patrolReportSummary, stepAudit)
@@ -169,9 +172,21 @@ func stampDeaconHeartbeatOnReport(townRoot, summary string) {
 //	Steps: heartbeat OK | inbox-check OK | orphan-cleanup SKIP | ... (14/25)
 //
 // If stepsFlag is empty, returns a line indicating the audit was not reported.
-func buildStepAudit(formulaName string, stepsFlag string) string {
+//
+// The formula is resolved with the same three-tier precedence gt prime uses to
+// RENDER the checklist — rig override, then town override, then embedded. Reading
+// the embedded copy directly is the root of gastown-c1x: the Deacon executed the
+// town's 28-step formula and was graded against the embedded 26-step fallback, so
+// the two ids only the town copy defined were dropped from four cycles with no
+// warning, no error, rc=0 and nothing on stderr.
+//
+// Anything reported that the resolved formula does not define, and anything that
+// is not a step:STATUS pair at all, is warned about on stderr AND named in the
+// audit line. stderr is gone by the next command; the audit line is what lands in
+// the ledger, so both belong there.
+func buildStepAudit(formulaName, townRoot, rigName string, stepsFlag string) string {
 	// Load the formula to get the canonical step list
-	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	content, err := formula.ResolveFormulaContent(formulaName, townRoot, rigName)
 	if err != nil {
 		if stepsFlag == "" {
 			return "Steps: NOT REPORTED (formula not found)"
@@ -198,7 +213,10 @@ func buildStepAudit(formulaName string, stepsFlag string) string {
 	}
 
 	// Parse the reported step results
-	reported := parseStepResults(stepsFlag)
+	reported, malformed := parseStepResults(stepsFlag)
+	for _, entry := range malformed {
+		style.PrintWarning("--steps entry %q is not a step:STATUS pair; it was dropped from the audit", entry)
+	}
 
 	// Build the audit line: map each formula step to its reported status
 	var parts []string
@@ -214,23 +232,71 @@ func buildStepAudit(formulaName string, stepsFlag string) string {
 		parts = append(parts, stepID+" "+status)
 	}
 
-	return fmt.Sprintf("Steps: %s (%d/%d)", strings.Join(parts, " | "), okCount, len(allStepIDs))
+	audit := fmt.Sprintf("Steps: %s (%d/%d)", strings.Join(parts, " | "), okCount, len(allStepIDs))
+
+	// Report anything the formula does not define, both on stderr and in the
+	// audit line itself — the stderr warning is gone by the next command, but
+	// the audit line is what lands in the ledger.
+	unrecognized := unrecognizedStepIDs(reported, allStepIDs)
+	for _, stepID := range unrecognized {
+		style.PrintWarning("--steps reported %q, which is not a step in formula %s; it was dropped from the audit", stepID, formulaName)
+	}
+	if len(unrecognized) > 0 {
+		audit += fmt.Sprintf(" [%d unrecognized: %s]", len(unrecognized), strings.Join(unrecognized, ", "))
+	}
+	if len(malformed) > 0 {
+		audit += fmt.Sprintf(" [%d malformed: %s]", len(malformed), strings.Join(malformed, ", "))
+	}
+
+	return audit
+}
+
+// unrecognizedStepIDs returns the reported step ids that the formula does not
+// define, sorted so the warning order is stable across runs.
+func unrecognizedStepIDs(reported map[string]string, allStepIDs []string) []string {
+	known := make(map[string]bool, len(allStepIDs))
+	for _, stepID := range allStepIDs {
+		known[stepID] = true
+	}
+	var unrecognized []string
+	for stepID := range reported {
+		if !known[stepID] {
+			unrecognized = append(unrecognized, stepID)
+		}
+	}
+	sort.Strings(unrecognized)
+	return unrecognized
 }
 
 // parseStepResults parses a comma-separated string of step:STATUS pairs.
-// Returns a map of step ID to uppercase status.
+// Returns a map of step ID to uppercase status, plus every entry that did not
+// carry both halves, so the caller can report them rather than drop them
+// silently.
+//
+// An entry counts only if it names a step AND carries a status. "inbox-check",
+// "inbox-check:" and ":OK" are all reports of nothing: the first has no status
+// at all, the second an empty one that would print as a blank in the audit line,
+// and the third an empty step id that would be reported as an unrecognized step
+// named "". Splitting on ":" alone accepts the last two, which is the same
+// silent-drop this change exists to remove (gastown-c1x).
+//
 // Example input: "heartbeat:OK,inbox-check:OK,orphan-cleanup:SKIP"
-func parseStepResults(stepsFlag string) map[string]string {
+func parseStepResults(stepsFlag string) (map[string]string, []string) {
 	results := make(map[string]string)
+	var malformed []string
 	for _, entry := range strings.Split(stepsFlag, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
-		parts := strings.SplitN(entry, ":", 2)
-		if len(parts) == 2 {
-			results[strings.TrimSpace(parts[0])] = strings.ToUpper(strings.TrimSpace(parts[1]))
+		stepID, status, found := strings.Cut(entry, ":")
+		stepID = strings.TrimSpace(stepID)
+		status = strings.TrimSpace(status)
+		if !found || stepID == "" || status == "" {
+			malformed = append(malformed, entry)
+			continue
 		}
+		results[stepID] = strings.ToUpper(status)
 	}
-	return results
+	return results, malformed
 }
