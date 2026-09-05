@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/style"
@@ -54,33 +53,15 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 
 	roleName := string(roleInfo.Role)
 
-	// Build config based on role
-	var cfg PatrolConfig
-	switch roleInfo.Role {
-	case RoleDeacon:
-		cfg = PatrolConfig{
-			RoleName:      "deacon",
-			PatrolMolName: constants.MolDeaconPatrol,
-			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      "deacon",
-		}
-	case RoleWitness:
-		cfg = PatrolConfig{
-			RoleName:      "witness",
-			PatrolMolName: constants.MolWitnessPatrol,
-			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      roleInfo.Rig + "/witness",
-		}
-	case RoleRefinery:
-		cfg = PatrolConfig{
-			RoleName:      "refinery",
-			PatrolMolName: constants.MolRefineryPatrol,
-			BeadsDir:      roleInfo.TownRoot,
-			Assignee:      roleInfo.Rig + "/refinery",
-			ExtraVars:     buildRefineryPatrolVars(roleInfo),
-		}
-	default:
-		return fmt.Errorf("unsupported role for patrol report: %q", roleName)
+	// Build config through the shared builder so the assignee is derived from
+	// buildAgentIdentity -- the same function gt hook queries with. This path
+	// used to restate the assignee as a literal "deacon", which is what left
+	// gt-7rne alive after PR #15 fixed only gt patrol new: report is the
+	// ROUTINE minting path (every cycle of every role ends here) while new is
+	// the recovery path, so the broken site was the universal one.
+	cfg, err := patrolConfigForRole(roleName, roleInfo)
+	if err != nil {
+		return fmt.Errorf("patrol report: %w", err)
 	}
 
 	// Find the active patrol

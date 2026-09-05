@@ -51,17 +51,23 @@ func TestPatrolNewCmd_HasRoleFlag(t *testing.T) {
 
 // TestPatrolConfigAssigneeMatchesHookLookup is the regression test for gt-7rne.
 //
-// gt patrol new writes a wisp with cfg.Assignee; gt hook (gt mol status) looks
-// that wisp up using buildAgentIdentity(). listAssignedActiveWork matches the
-// assignee EXACTLY -- nothing on that path trims or normalizes a trailing
-// slash. So if the two disagree by even one character, gt patrol new produces
-// a HOOKED wisp that gt hook reports as "Nothing on hook", and the agent reads
+// A patrol wisp is written with cfg.Assignee; gt hook (gt mol status) looks it
+// up using buildAgentIdentity(). listAssignedActiveWork matches the assignee
+// EXACTLY -- nothing on that path trims or normalizes a trailing slash. So if
+// the two disagree by even one character, the minting command produces a
+// HOOKED wisp that gt hook reports as "Nothing on hook", and the agent reads
 // its own hook as empty.
 //
-// The original defect was exactly one character: patrol_new wrote "deacon"
-// while buildAgentIdentity queried "deacon/". This asserts the INVARIANT for
-// every patrol-capable role, not just the instance that broke, so drift in
-// any of them fails here instead of silently blanking an agent's hook.
+// The original defect was exactly one character: the assignee was written as
+// "deacon" while buildAgentIdentity queried "deacon/". This asserts the
+// INVARIANT for every patrol-capable role, not just the instance that broke.
+//
+// It now covers all three minting paths -- gt patrol new, gt patrol report and
+// gt prime -- because all three build their config here. It did not when it was
+// written, and that is why gt-7rne survived PR #15: this test was green while
+// gt patrol report, the path every cycle of every role runs, still wrote a
+// literal. See TestNoPatrolMintingSiteWritesAssigneeLiteral in
+// patrol_assignee_test.go for the structural assertion that keeps it that way.
 func TestPatrolConfigAssigneeMatchesHookLookup(t *testing.T) {
 	const rig = "testrig"
 
