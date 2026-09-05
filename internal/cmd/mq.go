@@ -195,7 +195,7 @@ type mqPostMergeManager interface {
 }
 
 type mqPostMergeGit interface {
-	VerifyPushedCommitReachableFromPushTarget(remote, branch, commit string) error
+	refinery.MergeProofGit
 	PushRemoteBranchTip(remote, branch string) (string, error)
 	HasOpenPullRequest(ref git.PullRequestRef) bool
 	Rev(ref string) (string, error)
@@ -602,19 +602,14 @@ func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) er
 	if mr == nil {
 		return fmt.Errorf("merge proof failed: merge request is missing")
 	}
-	target := strings.TrimSpace(mr.TargetBranch)
-	if target == "" {
-		return fmt.Errorf("merge proof failed for MR %s: missing target branch", mr.ID)
-	}
-	if source := strings.TrimSpace(mr.Branch); source != "" && source == target {
-		return fmt.Errorf("merge proof failed for MR %s: source branch %s matches target branch", mr.ID, source)
-	}
-	commit := strings.TrimSpace(mr.CommitSHA)
-	if commit == "" {
-		return fmt.Errorf("merge proof failed for MR %s: missing submitted commit_sha", mr.ID)
-	}
-	if err := rigGit.VerifyPushedCommitReachableFromPushTarget("origin", target, commit); err != nil {
-		return fmt.Errorf("merge proof failed for MR %s: target %s does not contain submitted head %s: %w", mr.ID, target, commit, err)
+	if err := refinery.VerifyMergeProof(rigGit, refinery.MergeProofRequest{
+		Target:    mr.TargetBranch,
+		Branch:    mr.Branch,
+		CommitSHA: mr.CommitSHA,
+		PRURL:     mr.PRURL,
+		PRNumber:  mr.PRNumber,
+	}); err != nil {
+		return fmt.Errorf("merge proof failed for MR %s: %w", mr.ID, err)
 	}
 	return nil
 }
