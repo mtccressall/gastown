@@ -238,7 +238,16 @@ func issueFilterFromListOpts(opts ListOptions) beadsdk.IssueFilter {
 	if opts.Ephemeral {
 		eph := true
 		f.Ephemeral = &eph
-	} else {
+	} else if !opts.IncludeInfra {
+		// IncludeInfra is the in-process twin of --include-infra on the subprocess
+		// path: leave Ephemeral unset so BOTH permanent issues and wisps come back,
+		// rather than skipping wisps outright.
+		//
+		// Without this branch the two paths disagree, and the disagreement is
+		// invisible: a caller that sets IncludeInfra gets wisps from the bd
+		// subprocess and silently does not get them from the store. That is how a
+		// fix for gt-qh0g would have covered only half its call sites while looking
+		// complete.
 		f.SkipWisps = true
 	}
 
