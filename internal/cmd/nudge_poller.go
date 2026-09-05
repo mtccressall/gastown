@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -86,6 +87,19 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Claim the pid-file slot. StartPoller writes this file for the pollers it
+	// spawns; a direct invocation used to write nothing, so the "already running"
+	// guard could not see us and a later StartPoller would put a second poller on
+	// the same queue (gt-di75). Claiming also refuses to start when a live poller
+	// already holds the slot — writing over it would make this command the second
+	// consumer itself. Release is deferred so it also covers SIGTERM and the
+	// session-died exit, not only the clean return.
+	untrack, err := trackPollerPidFile(townRoot, sessionName, os.Getpid())
+	if err != nil {
+		return err
+	}
+	defer untrack()
+
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -138,4 +152,29 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
 	return hasPromptDetection && waitErr != nil
+}
+
+// trackPollerPidFile claims session's pid-file slot for pid and returns the
+// cleanup that gives it back.
+//
+// Losing the slot to a live poller IS fatal — proceeding would put a second
+// consumer on one queue, which is double delivery into a live composer and the
+// thing the pid file exists to prevent. Any other failure is not: the poller
+// still drains the queue, and running untracked is what this command did before
+// it wrote a pid file at all. Those are reported on stderr rather than swallowed,
+// so the next person asking why a pid-file census came up short has something to
+// read.
+func trackPollerPidFile(townRoot, session string, pid int) (func(), error) {
+	if err := nudge.ClaimPollerPidFile(townRoot, session, pid); err != nil {
+		if errors.Is(err, nudge.ErrPollerAlreadyRunning) {
+			return nil, fmt.Errorf("refusing to start a second poller for %s: %w", session, err)
+		}
+		fmt.Fprintf(os.Stderr, "nudge-poller: %v\n", err)
+	}
+
+	return func() {
+		if err := nudge.ReleasePollerPidFile(townRoot, session, pid); err != nil {
+			fmt.Fprintf(os.Stderr, "nudge-poller: %v\n", err)
+		}
+	}, nil
 }
