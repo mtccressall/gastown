@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -128,6 +129,9 @@ type testMayorEvent struct {
 
 func setupSlotOpenTestTown(t *testing.T) (string, string) {
 	t.Helper()
+	// Exercises the channel-event writer itself, so it opts out of the
+	// test-binary suppression channelevents applies by default (gastown-rv6).
+	t.Setenv(channelevents.EnvSuppress, "0")
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
 		t.Fatal(err)
@@ -2698,6 +2702,10 @@ func TestZombieSubmittedStillRunning_Classification(t *testing.T) {
 }
 
 func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
+	// Exercises the channel-event writer itself, so it opts out of the
+	// test-binary suppression channelevents applies by default (gastown-rv6).
+	t.Setenv(channelevents.EnvSuppress, "0")
+
 	// Create a fake town root with the workspace marker so workspace.Find recognizes it
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {

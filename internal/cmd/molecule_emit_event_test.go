@@ -11,6 +11,9 @@ import (
 )
 
 func TestEmitEvent(t *testing.T) {
+	// Exercises the channel-event writer itself, so it opts out of the
+	// test-binary suppression channelevents applies by default (gastown-rv6).
+	t.Setenv(channelevents.EnvSuppress, "0")
 	t.Run("basic event creation", func(t *testing.T) {
 		townRoot := t.TempDir()
 
@@ -152,6 +155,9 @@ func TestEmitEventChannelValidation(t *testing.T) {
 }
 
 func TestEmitEventPIDInFilename(t *testing.T) {
+	// Exercises the channel-event writer itself, so it opts out of the
+	// test-binary suppression channelevents applies by default (gastown-rv6).
+	t.Setenv(channelevents.EnvSuppress, "0")
 	townRoot := t.TempDir()
 	path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", nil)
 	if err != nil {
