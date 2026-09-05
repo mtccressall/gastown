@@ -835,13 +835,6 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 		return nil, b.wrapError(err, stderr.String(), args)
 	}
 
-	// Handle bd exit code 0 bug: when issue not found,
-	// bd may exit 0 but write error to stderr with empty stdout.
-	// Detect this case and treat as error to avoid JSON parse failures.
-	if stdout.Len() == 0 && stderr.Len() > 0 {
-		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
-	}
-
 	return stripStdoutWarnings(stdout.Bytes()), nil
 }
 
@@ -876,10 +869,6 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	err := cmd.Run()
 	if err != nil {
 		return nil, b.wrapError(err, stderr.String(), args)
-	}
-
-	if stdout.Len() == 0 && stderr.Len() > 0 {
-		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
 	}
 
 	return stripStdoutWarnings(stdout.Bytes()), nil
