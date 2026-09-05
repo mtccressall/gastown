@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/channelevents"
 )
 
 func TestCalculateEventTimeout(t *testing.T) {
@@ -703,5 +705,108 @@ func TestEventFileStruct(t *testing.T) {
 	}
 	if parsed["type"] != "MQ_SUBMIT" {
 		t.Errorf("type = %v, want MQ_SUBMIT", parsed["type"])
+	}
+}
+
+// TestBackoffEngagesOnceOwnChannelDrains is the liveness half of gt-a3qs.
+//
+// The refinery's idle path was a hot loop by construction: the shared channel
+// held 69 events that were never that rig's to consume, waitForEventFiles
+// checks pending events FIRST and returns immediately, so the timeout that
+// drives the 30s-doubling-to-15m backoff could never be reached — and neither
+// could EFFORT: reduced, which is derived from the backoff state.
+//
+// With the channel scoped per rig and drained, an idle refinery reaches the
+// timeout branch, which is what increments the idle counter.
+func TestBackoffEngagesOnceOwnChannelDrains(t *testing.T) {
+	townRoot := t.TempDir()
+
+	ourDir, err := channelevents.ChannelDir(townRoot, "gastown", "refinery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(ourDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another rig's channel is busy. Ours is empty.
+	theirDir, err := channelevents.ChannelDir(townRoot, "liveop", "refinery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(theirDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		name := filepath.Join(theirDir, fmt.Sprintf("%d-1-1.event", i))
+		if err := os.WriteFile(name, []byte(`{"type":"MQ_SUBMIT","rig":"liveop"}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Our wait must reach the timeout branch — the one that increments idle —
+	// rather than returning "event" instantly on someone else's backlog.
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	result, err := waitForEventFiles(ctx, ourDir, 0)
+	if err != nil {
+		t.Fatalf("waitForEventFiles: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Errorf("reason = %q, want timeout: an idle refinery woke on another rig's %d events",
+			result.Reason, len(result.Events))
+	}
+
+	// And the other rig's events are untouched — no consumption, no deletion.
+	entries, err := os.ReadDir(theirDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 5 {
+		t.Errorf("liveop's channel holds %d events after our wait, want 5", len(entries))
+	}
+}
+
+// TestCleanupDrainsOnlyOurOwnChannel pins that --cleanup, which is what makes
+// the directory drain and therefore what lets backoff engage, cannot reach
+// another rig's events. --cleanup on a shared channel is exactly what deleted
+// six of liveop's events; on a scoped channel it is safe, and that safety is
+// the whole reason the flag can be used again.
+func TestCleanupDrainsOnlyOurOwnChannel(t *testing.T) {
+	townRoot := t.TempDir()
+
+	ourDir, _ := channelevents.ChannelDir(townRoot, "gastown", "refinery")
+	theirDir, _ := channelevents.ChannelDir(townRoot, "liveop", "refinery")
+	for _, d := range []string{ourDir, theirDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "1-1-1.event"), []byte(`{"type":"MQ_SUBMIT"}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := waitForEventFiles(ctx, ourDir, 0)
+	if err != nil {
+		t.Fatalf("waitForEventFiles: %v", err)
+	}
+	if result.Reason != "event" || len(result.Events) != 1 {
+		t.Fatalf("reason=%q events=%d, want event and 1", result.Reason, len(result.Events))
+	}
+
+	// Simulate --cleanup over exactly what the wait returned.
+	for _, ef := range result.Events {
+		if err := os.Remove(ef.Path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if entries, _ := os.ReadDir(ourDir); len(entries) != 0 {
+		t.Errorf("our channel did not drain: %d files remain", len(entries))
+	}
+	if entries, _ := os.ReadDir(theirDir); len(entries) != 1 {
+		t.Errorf("cleanup reached liveop's channel: %d files remain, want 1", len(entries))
 	}
 }
