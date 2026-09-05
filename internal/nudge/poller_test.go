@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -180,4 +181,101 @@ func TestSetProcessGroup_InstallsCancelHook(t *testing.T) {
 	if cmd.Cancel == nil {
 		t.Fatal("SetProcessGroup() should install a cancel hook")
 	}
+}
+
+func TestPollerStartLockFile(t *testing.T) {
+	townRoot := t.TempDir()
+	got := pollerStartLockFile(townRoot, "some/session")
+	want := filepath.Join(townRoot, ".runtime", "nudge_poller", "some_session.start.lock")
+	if got != want {
+		t.Errorf("pollerStartLockFile() = %q, want %q", got, want)
+	}
+}
+
+// TestStartPoller_SkipsWhenAnotherStarterHoldsLock covers the concurrent
+// recovery case: two senders both see the same stale PID file and both try to
+// start a poller. Without the lock each spawns one, and StopPoller can only
+// ever track the last PID written — the rest survive until the session dies.
+// The loser of the race must return without spawning.
+func TestStartPoller_SkipsWhenAnotherStarterHoldsLock(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-liveop-refinery"
+
+	pidDir := pollerPidDir(townRoot)
+	if err := os.MkdirAll(pidDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.WriteFile(pidPath, []byte("999999999"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for the sender that got there first and is mid-start.
+	release, locked, err := lock.FlockTryAcquire(pollerStartLockFile(townRoot, session))
+	if err != nil {
+		t.Fatalf("FlockTryAcquire: %v", err)
+	}
+	if !locked {
+		t.Fatal("could not acquire the start lock on a fresh temp dir")
+	}
+	defer release()
+
+	pid, err := StartPoller(townRoot, session)
+	if err != nil {
+		t.Errorf("StartPoller() error = %v, want nil (contended start is not a failure)", err)
+	}
+	if pid != 0 {
+		t.Errorf("StartPoller() pid = %d, want 0 (should not spawn while another starter holds the lock)", pid)
+	}
+
+	// The stale PID file must be untouched: StartPoller returned before it
+	// reached the aliveness check, so nothing was spawned or recorded.
+	data, readErr := os.ReadFile(pidPath)
+	if readErr != nil {
+		t.Fatalf("reading pid file: %v", readErr)
+	}
+	if string(data) != "999999999" {
+		t.Errorf("pid file = %q, want %q (a second poller was started)", string(data), "999999999")
+	}
+}
+
+// Positive control for the test above: the lock is what makes StartPoller
+// return early, not some unrelated short-circuit. Deliberately does NOT let
+// StartPoller spawn — it launches os.Executable(), which under `go test` is
+// the test binary itself, and a test binary re-invoked with stray positional
+// args re-runs the whole suite.
+func TestStartPollerLock_IsTheDiscriminator(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-liveop-refinery"
+	lockPath := pollerStartLockFile(townRoot, session)
+
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Held: a second acquirer must be turned away — this is the state
+	// TestStartPoller_SkipsWhenAnotherStarterHoldsLock runs StartPoller in.
+	release, locked, err := lock.FlockTryAcquire(lockPath)
+	if err != nil || !locked {
+		t.Fatalf("FlockTryAcquire on a fresh lock: locked=%v err=%v", locked, err)
+	}
+	_, contended, err := lock.FlockTryAcquire(lockPath)
+	if err != nil {
+		t.Fatalf("contended FlockTryAcquire: %v", err)
+	}
+	if contended {
+		t.Fatal("acquired a held lock; the contention test above proves nothing")
+	}
+
+	// Released: the same call now succeeds, so the early return in the test
+	// above was caused by contention and not by a permanently stuck lock.
+	release()
+	release2, free, err := lock.FlockTryAcquire(lockPath)
+	if err != nil {
+		t.Fatalf("post-release FlockTryAcquire: %v", err)
+	}
+	if !free {
+		t.Fatal("lock still held after release")
+	}
+	release2()
 }

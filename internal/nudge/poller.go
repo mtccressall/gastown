@@ -1,7 +1,12 @@
-// poller.go provides a background nudge-queue poller for agents that lack
-// turn-boundary drain hooks (e.g., Gemini, Codex). Claude Code drains its
-// queue via the UserPromptSubmit hook on every turn. Other runtimes have no
-// equivalent hook, so queued nudges would sit undelivered forever.
+// poller.go provides a background nudge-queue poller.
+//
+// The poller is the ONLY drain path for the nudge queue, for every runtime
+// including Claude Code. An earlier version of this comment claimed Claude
+// agents drain via the UserPromptSubmit hook on every turn and therefore did
+// not need a poller. That is wrong: the UserPromptSubmit hooks deployed in a
+// Gas Town workspace drain MAIL, not the nudge queue. A session whose poller
+// dies has no fallback, and its queued nudges sit until they expire — measured
+// as 24 expired, undelivered nudges town-wide (gastown-ku3, gt-gpwt).
 //
 // The poller runs as a background goroutine launched by crew/manager.Start().
 // It polls the queue every PollInterval, waits for the agent to be idle, then
@@ -25,6 +30,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -44,8 +50,18 @@ func pollerPidDir(townRoot string) string {
 
 // pollerPidFile returns the PID file path for a session's poller.
 func pollerPidFile(townRoot, session string) string {
-	safe := strings.ReplaceAll(session, "/", "_")
-	return filepath.Join(pollerPidDir(townRoot), safe+".pid")
+	return filepath.Join(pollerPidDir(townRoot), safePollerName(session)+".pid")
+}
+
+// pollerStartLockFile returns the lock path guarding StartPoller's
+// check-then-start for a session.
+func pollerStartLockFile(townRoot, session string) string {
+	return filepath.Join(pollerPidDir(townRoot), safePollerName(session)+".start.lock")
+}
+
+// safePollerName turns a session name into a single path segment.
+func safePollerName(session string) string {
+	return strings.ReplaceAll(session, "/", "_")
 }
 
 // StartPoller launches a background `gt nudge-poller <session>` process.
@@ -56,6 +72,24 @@ func StartPoller(townRoot, session string) (int, error) {
 	if err := os.MkdirAll(pidDir, 0755); err != nil {
 		return 0, fmt.Errorf("creating poller pid dir: %w", err)
 	}
+
+	// Serialize check-then-start across processes. Every wait-idle nudge now
+	// calls StartPoller, so two senders can both observe the same stale PID
+	// file and each spawn a poller. Only the last PID written is tracked, so
+	// StopPoller would leave the others running until the session dies.
+	//
+	// Try, do not block: if another process holds this lock it is starting a
+	// poller for this session right now, which is the outcome we wanted. A
+	// blocking acquire would hang `gt nudge` behind a stuck starter.
+	// (gastown-ku3)
+	release, locked, lockErr := lock.FlockTryAcquire(pollerStartLockFile(townRoot, session))
+	if lockErr != nil {
+		return 0, fmt.Errorf("locking poller start: %w", lockErr)
+	}
+	if !locked {
+		return 0, nil // another process is starting one
+	}
+	defer release()
 
 	// Check if a poller is already running for this session.
 	if pid, alive := pollerAlive(townRoot, session); alive {
