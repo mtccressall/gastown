@@ -265,20 +265,371 @@ gt dolt kill-imposters 2>/dev/null || true
 
 **2. Stale test temp dirs**
 
-Glob `beads-test-dolt-*` and `beads-bd-tests-*` in TMPDIR. If the directory
-name contains a PID and that PID is dead, clean up.
+Glob `beads-test-dolt-*` and `beads-bd-tests-*` in TMPDIR and remove the ones
+no live process is using.
+
+This used to say "if the directory name contains a PID and that PID is dead".
+IT DOES NOT CONTAIN A PID. These names come from Go's `os.MkdirTemp`, whose
+suffix is random: the directory involved in the 2026-09-04 data loss was
+`beads-bd-tests-2712382386`, and 2712382386 is larger than this host's
+`pid_max` of 4194304, so it cannot ever have been a process id. Do not write a
+PID-extraction check against that sentence - it would be a well-formed test of
+a premise that is false, which is how this step got into trouble the first time.
+
+Two things stand in for it, and both are real:
+  - the /proc holder scan below, which asks who is using the directory NOW
+  - an AGE GATE, because a scan is a single instant and a live test process can
+    momentarily hold nothing between reopening files. A fixture whose tree has
+    not been touched in an hour is not mid-test.
+
+READ THIS BEFORE CHANGING THE CONDITION, AND DO NOT PUT `lsof` BACK.
+
+This guard decides whether to `rm -rf` a directory. Two successive versions of
+it were wrong in the same direction - both reported "nobody is using this" when
+they had established nothing - so the rule here is that the check must FAIL
+CLOSED and must PRINT HOW MUCH IT SCANNED.
+
+**Version 1, live until 2026-09-04, unconditionally inverted:**
+
+    if ! lsof +D "$dir" >/dev/null 2>&1; then rm -rf "$dir"; fi
+
+`lsof` exits non-zero for ANY warning, not only for "found nothing", and this
+host always warns because the fuse mount is always mounted:
+
+    lsof: WARNING: can't stat() fuse file system
+          /run/user/1001/gnome-remote-desktop/cliprdr-sC1bEr
+
+So `lsof +D` ALWAYS exited 1, the negation was ALWAYS true, and the guard
+deleted every matching directory on every patrol cycle. The `>/dev/null`
+discarded the very lines naming the holders. It cost real data: patrol removed
+`/tmp/beads-bd-tests-2712382386` while dolt PID 1088047 (ps STAT `Sl`, up since
+05:40) held ~30 descriptors inside it, including `.dolt/noms/LOCK` files, which
+CLAUDE.md says must never be removed. A bd test fixture that time. The guard
+could not have confined it.
+
+**Version 2, caught by codex before it shipped, fail-open on an unreadable dir:**
+
+    users=$(lsof +D "$dir" 2>/dev/null | tail -n +2)
+    [ -n "$users" ] && continue
+
+Better - it reads OUTPUT rather than the exit code - and still wrong. If lsof
+cannot descend the tree (a mode-000 subdirectory, an I/O error, a fatal
+diagnostic) it prints nothing, `2>/dev/null` eats the reason, and the pipeline
+returns `tail`'s status, so a scan that FAILED is byte-identical to a scan that
+found nothing. Verified: a subdir at mode 000 yields empty stdout and pipeline
+rc=0. That is CLAUDE.md's "an exit code read through a pipe describes the LAST
+stage" defect, inside the guard written to fix the first instance of it.
+
+**Version 3, below: ask /proc, not the filesystem.**
+
+The fix is not a better lsof invocation. Every lsof form asks the DIRECTORY
+whether it may be inspected, so directory permissions can blind the check. `/proc`
+asks each PROCESS what it holds, which is the actual question, and stays readable
+whatever the target directory's mode is. Confirmed against the mode-000 case that
+defeats version 2.
+
+It prints `SCANNED <n> pids` so a vacuous scan is visible - this town's own rule
+that a scan matching nothing and a scan finding nothing return the same zero.
+That count is for a human to read; it is NOT what makes the result trustworthy,
+because any threshold on it is a guess. The scan ENFORCES its own validity with
+a positive control instead: it must observe its OWN pid, or it reports
+SCAN-FAILED and nothing is deleted. A scan that cannot see the process running
+it has measured nothing, whatever number it printed.
+`opaque` counts processes owned by other users, whose descriptors we cannot read;
+they are reported rather than hidden, and they cannot hold handles inside a
+test directory this user created under its own TMPDIR.
+
+Positive control before trusting any edit to this - it must print HOLDERS 1:
+
+    mkdir -p /tmp/g/sub && echo hi > /tmp/g/sub/f
+    ( exec 9< /tmp/g/sub/f; sleep 20 ) &
+    # then run the scan below against /tmp/g
 
 ```bash
 TMPDIR="${TMPDIR:-/tmp}"
+MIN_IDLE_MIN=60
+# If we cannot capture stderr we cannot detect a failed age scan, and the whole
+# step degrades to the fail-open form it was rewritten to remove. Skip the step
+# rather than run it blind. (The earlier version printed "SKIP ALL" and then
+# carried on with /dev/null, which is a message contradicting its own code.)
+if SP_ERR=$(mktemp); then
+  trap 'rm -f "$SP_ERR"' EXIT
 for dir in "$TMPDIR"/beads-test-dolt-* "$TMPDIR"/beads-bd-tests-*; do
   [ -d "$dir" ] || continue
-  # Extract PID from dir name if present, or check if any process has it open
-  # Use lsof to check if any process is using files in this dir
-  if ! lsof +D "$dir" >/dev/null 2>&1; then
-    chmod -R u+w "$dir" 2>/dev/null
-    rm -rf "$dir" && echo "Cleaned stale test dir: $(basename "$dir")"
+
+  # AGE GATE: the holder scan below is one instant, and a running test can sit
+  # briefly with nothing open between closing and reopening its files. Newest
+  # mtime anywhere in the tree, not just the top dir, which barely changes.
+  # CAPTURE, DO NOT DISCARD. An unreadable subdir makes find print to stderr and
+  # exit non-zero while producing no stdout -- and "no stdout" here would mean
+  # "nothing recent", i.e. safe to delete. That is EXACTLY the defect this whole
+  # step was rewritten to fix, and it was reintroduced here in the age gate.
+  # A scan that could not traverse the tree has not established the tree is old.
+  newest=$(find "$dir" -newermt "-${MIN_IDLE_MIN} minutes" -print -quit 2>"$SP_ERR"); find_rc=$?
+  find_err=$(cat "$SP_ERR" 2>/dev/null); : >"$SP_ERR"
+  if [ "$find_rc" -ne 0 ] || [ -n "$find_err" ]; then
+    echo "SKIP (age scan incomplete, rc=$find_rc): $(basename "$dir")"
+    [ -n "$find_err" ] && printf '%s\n' "$find_err" | sed 's/^/    /'
+    continue
   fi
+  if [ -n "$newest" ]; then
+    echo "SKIP (active within ${MIN_IDLE_MIN}m): $(basename "$dir")"
+    continue
+  fi
+
+  dir_born=$(stat -c %W "$dir" 2>/dev/null || echo 0)
+  report=$(python3 - "$dir" "$dir_born" <<'PY'
+import os, sys, errno
+root = os.path.realpath(sys.argv[1])
+target = root + os.sep
+def held(t):
+    # readlink on a removed path yields "<path> (deleted)"; strip it before
+    # comparing, or a process sitting in a just-unlinked dir reads as absent.
+    if t.endswith(" (deleted)"): t = t[:-len(" (deleted)")]
+    # Equality as well as prefix: a process whose cwd IS the directory, or which
+    # holds the directory itself open, yields the path with NO trailing slash and
+    # a prefix-only test misses it entirely. That is the shape of the incident
+    # this guard exists for.
+    return t == root or t.startswith(target)
+holders, scanned, opaque, hidden = [], 0, 0, 0
+unexplained = []
+self_seen = False
+
+# TRUE CREATION TIME, passed in from stat(1)'s %W (statx STATX_BTIME).
+# NOT ctime -- ctime is the last METADATA-change time, so a chmod or chown moves
+# it forward, and this step's own "chmod -R u+rwX" does exactly that. Dating a
+# process against ctime would classify a genuinely older holder as "started
+# after the directory" and clear it. %W is immutable; verified that chmod leaves
+# it unchanged on this host (tmpfs). Where the filesystem cannot report a birth
+# time, %W is 0 and we do NOT date processes at all -- same-uid opaque processes
+# then stay unexplained and the directory is skipped.
+dir_born = None
+try:
+    _b = float(sys.argv[2])
+    if _b > 0: dir_born = _b
+except (IndexError, ValueError):
+    dir_born = None
+boot_time = 0.0
+try:
+    for line in open("/proc/stat"):
+        if line.startswith("btime "): boot_time = float(line.split()[1]); break
+except OSError:
+    dir_born = None   # cannot date processes, so do not use the start-time test
+
+# BOUND UNIX SOCKETS ARE INVISIBLE IN /proc/<pid>/fd. A socket fd reads as
+# "socket:[<inode>]" with no path, so a server whose ONLY presence in this
+# directory is its listening socket -- no cwd, no open file, no mapping --
+# scans as HOLDERS 0 and the directory gets deleted out from under it. Verified:
+# a process bound to <dir>/s.sock produced HOLDERS 0 before this map existed.
+# That matters here specifically: a dolt sql-server is exactly such a process.
+# /proc/net/unix carries the inode-to-path mapping, so build it once and resolve
+# socket fds through it.
+sock_by_inode = {}
+try:
+    with open("/proc/net/unix") as fh:
+        next(fh, None)
+        for line in fh:
+            # split(None, 7) so the pathname keeps any spaces it contains --
+            # a bare split() shatters "/tmp/my dir/s.sock" and parts[-1] is then
+            # a fragment that matches nothing, so the holder goes unseen.
+            parts = line.split(None, 7)
+            if len(parts) >= 8:
+                path = parts[7].rstrip("\n")
+                if path.startswith("/"):
+                    sock_by_inode[parts[6]] = path
+except (OSError, IndexError):
+    # Cannot rule out socket holders -> the scan is not trustworthy.
+    print("SCAN-FAILED cannot read /proc/net/unix; bound sockets unverifiable")
+    raise SystemExit(0)
+try:
+    pids = [p for p in os.listdir("/proc") if p.isdigit()]
+except OSError as e:
+    print("SCAN-FAILED cannot read /proc: %s" % e); raise SystemExit(0)
+
+# DETECT A RESTRICTED procfs INDEPENDENTLY OF THE ENUMERATION ITSELF.
+# Under hidepid=2 (or a restricted pid namespace) inaccessible processes are
+# omitted from os.listdir entirely -- they raise no error, so no per-entry check
+# can ever notice them, and the scan reports a confident HOLDERS 0 over a
+# population it cannot see. That is this file's own false-empty shape: a large,
+# well-formed, plausible answer with a hole in it. So it must be caught BEFORE
+# trusting the list, by two signals that do not depend on the list:
+#
+#   1. the procfs mount options, read from /proc/self/mountinfo
+#   2. PID 1, which always exists on Linux and is root-owned, so it is hidden
+#      from a non-root reader under hidepid=2
+try:
+    with open("/proc/self/mountinfo") as fh:
+        for line in fh:
+            parts = line.split(" - ")
+            if len(parts) != 2: continue
+            fields = parts[1].split()
+            if len(fields) >= 3 and fields[0] == "proc" and parts[0].split()[4] == "/proc":
+                if "hidepid" in fields[2]:
+                    print("SCAN-FAILED /proc mounted with %s" % fields[2])
+                    raise SystemExit(0)
+except OSError:
+    pass  # absence of mountinfo is not evidence; PID 1 check below still applies
+if "1" not in pids:
+    print("SCAN-FAILED PID 1 absent from /proc listing (%d pids); enumeration is "
+          "restricted, so unseen processes could hold this dir" % len(pids))
+    raise SystemExit(0)
+for pid in pids:
+    live = False
+    try:
+        t = os.readlink("/proc/%s/cwd" % pid); live = True
+        if held(t): holders.append((pid, "cwd", t))
+    except OSError: pass
+    fdd = "/proc/%s/fd" % pid
+    try:
+        for fd in os.listdir(fdd):
+            live = True
+            try: t = os.readlink(os.path.join(fdd, fd))
+            except OSError: continue
+            if t.startswith("socket:["):
+                sp = sock_by_inode.get(t[len("socket:["):-1])
+                if sp is not None and held(sp):
+                    holders.append((pid, "unix-socket fd" + fd, sp))
+                continue
+            if held(t): holders.append((pid, "fd" + fd, t))
+    except OSError: pass
+    try:
+        with open("/proc/%s/maps" % pid) as fh:
+            live = True
+            for line in fh:
+                p = line.rstrip("\n").split(" ", 5)[-1].strip()
+                if held(p):
+                    holders.append((pid, "map", p)); break
+    except (OSError, IndexError): pass
+    if live:
+        scanned += 1
+        if int(pid) == os.getpid(): self_seen = True
+    else:
+        opaque += 1
+        # AN OPAQUE PROCESS IS ONE WE CANNOT INSPECT. Only two facts clear one,
+        # and NEITHER is its uid or its start time:
+        #   - a KERNEL THREAD has no userspace and holds no files (422 of 465
+        #     opaque pids here; without excluding them kworkers spawn constantly
+        #     and this step would never delete anything, a silent failure of its
+        #     own)
+        #   - a ZOMBIE has released every descriptor
+        #
+        # REJECTED, and recorded because it is a tempting argument that is FALSE:
+        # "a process that started before this directory existed cannot hold it".
+        # It cannot hold it AT START TIME. It is free to open the directory at any
+        # moment afterwards, so a long-lived daemon is not cleared by being old.
+        # An earlier revision of this guard used exactly that reasoning.
+        #
+        # KNOWN RESIDUAL, stated rather than argued away. What is left is a
+        # process we cannot inspect that holds a fixture NOTHING HAS MODIFIED FOR
+        # MIN_IDLE_MIN. The age gate above is the control for it, not this scan:
+        # anything actively using a dolt fixture writes to it. This is not proof,
+        # and it is not dressed up as proof. Making the step fail closed on every
+        # opaque process instead is a one-line change -- drop the two continues
+        # below -- and it renders the step permanently inert on any host running
+        # ssh-agent. That trade is a human's call; see gt-r6kd.
+        try:
+            cmdline = open("/proc/%s/cmdline" % pid, "rb").read()
+            st = open("/proc/%s/status" % pid).read()
+        except OSError:
+            continue
+        if not cmdline: continue                 # kernel thread: holds no files
+        state = ""; name = "?"
+        for line in st.splitlines():
+            if line.startswith("State:"): state = line.split(None, 1)[1]
+            elif line.startswith("Name:"): name = line.split(None, 1)[1]
+        if state.startswith("Z"): continue       # zombie holds no descriptors
+        unexplained.append((pid, state.split()[0] if state else "?", name))
+        # Separate the TWO reasons a process is opaque, because only one of them
+        # is safe. Ordinary case: the process belongs to another user, so its
+        # fd/cwd links are unreadable but /proc/<pid>/stat still is. Dangerous
+        # case: /proc is mounted hidepid, where the whole entry is unreadable --
+        # then ANY process could hold this directory and we can see none of them.
+        # Measured on this host: 468 opaque, 0 with unreadable stat (not hidepid).
+        # ENOENT is NOT hidepid -- it is a process that exited between our
+        # listdir of /proc and this read. Counting that as hidden made the whole
+        # scan fail intermittently under ordinary process churn, which would have
+        # left the step randomly inert. Only a permission denial means hidepid.
+        try:
+            with open("/proc/%s/stat" % pid) as fh: fh.read(1)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM):
+                hidden += 1
+            elif e.errno == errno.ENOENT:
+                opaque -= 1   # it is gone, not opaque; do not hold it against the scan
+# POSITIVE CONTROL, and it is the whole acceptance criterion for this scan.
+# Four review rounds on this guard all found the same defect class: it could
+# report "clean" without having established anything. Counting rows cannot fix
+# that -- a threshold is a guess, and every previous version looked fine.
+# The invariant instead: A SCAN THAT CANNOT SEE ITS OWN PROCESS HAS MEASURED
+# NOTHING. This process is provably running, provably has a cwd and open fds,
+# and is provably inside /proc. If it is absent from the result, /proc is
+# restricted (hidepid), unmounted, or the loop is broken -- and every one of
+# those must fail closed. This is falsifiable by a single counterexample and
+# needs no tuning, unlike "is SCANNED implausibly low".
+if not self_seen:
+    print("SCAN-FAILED could not observe own pid %d among %d scanned; "
+          "/proc is restricted or the scan is broken" % (os.getpid(), scanned))
+    raise SystemExit(0)
+if hidden:
+    print("SCAN-FAILED /proc appears hidepid-restricted: %d of %d opaque pids "
+          "hide even stat, so unseen processes could hold this dir"
+          % (hidden, opaque))
+    raise SystemExit(0)
+import stat as _stat
+# Opaque pids are processes we cannot inspect (other users; root owns ~448 here,
+# so opaque is NEVER 0 on this host). Refusing to delete whenever opaque > 0
+# would therefore make this step permanently inert -- a guard that never fires,
+# which reads as success and is the "conservative fallback becomes a quiet day"
+# trap. The mode of the directory is the real discriminator: at 0700 no non-root
+# user can open anything inside it, so uninspectable non-root processes cannot be
+# holders. Go's os.MkdirTemp creates these dirs 0700 (verified).
+# RESIDUAL RISK, stated rather than omitted: root can traverse any mode. We accept
+# that -- root processes here are system daemons, not users of this TMPDIR.
+try:
+    mode = _stat.S_IMODE(os.stat(root).st_mode)
+    owner_only = not (mode & 0o077)
+except OSError:
+    mode, owner_only = None, False
+print("SCANNED %d pids (%d opaque other-user, 0 hidden) mode=%s owner_only=%s"
+      % (scanned, opaque, oct(mode) if mode is not None else "?", owner_only))
+if unexplained:
+    # Reported on EVERY run, so the residual this guard carries is visible in the
+    # patrol log rather than buried in a comment. It does NOT block deletion --
+    # the age gate is what covers these. See the note above.
+    print("RESIDUAL %d uninspectable process(es), cleared only by the %s-minute "
+          "idle gate: %s" % (len(unexplained), os.environ.get("MIN_IDLE_MIN", "60"),
+          ", ".join("%s/%s/%s" % h for h in unexplained[:5])))
+if not owner_only and opaque:
+    print("UNVERIFIABLE dir is group/other-accessible and %d pids are opaque" % opaque)
+for h in holders[:5]: print("HOLDER pid=%s %s -> %s" % h)
+print("HOLDERS %d" % len(holders))
+PY
+)
+
+  # FAIL CLOSED: anything other than a completed scan reporting zero holders.
+  case "$report" in
+    *SCAN-FAILED*)
+      echo "SKIP (scan failed, usage unverified): $(basename "$dir")"; continue ;;
+    *UNVERIFIABLE*)
+      echo "SKIP (others could hold it, usage unverified): $(basename "$dir")"
+      printf '%s\n' "$report" | sed 's/^/    /'; continue ;;
+  esac
+  if ! printf '%s\n' "$report" | grep -q '^HOLDERS 0$'; then
+    echo "SKIP in use: $(basename "$dir")"
+    printf '%s\n' "$report" | sed 's/^/    /'
+    continue
+  fi
+  echo "  $(printf '%s\n' "$report" | grep '^SCANNED')"
+
+  # u+rwX, not u+w: without the traverse bit rm cannot descend an unreadable
+  # subdir and leaves the tree HALF-DELETED, which is worse than not deleting.
+  chmod -R u+rwX "$dir" 2>/dev/null
+  if rm -rf "$dir"; then echo "Cleaned stale test dir: $(basename "$dir")"
+  else echo "FAILED to remove (left in place): $(basename "$dir")"; fi
 done
+else
+  echo "SKIPPED test-dir cleanup entirely: mktemp failed, cannot capture scan errors"
+fi
 ```
 
 **3. Stale PID/lock files**
@@ -335,7 +686,9 @@ If all counts are 0, log "Test pollution cleanup: clean" and move on.
 
 **Safety:**
 - NEVER kill this workspace's own legitimate dolt server (checked via data-dir)
-- NEVER remove dirs where lsof shows active file handles
+- NEVER remove a dir without a COMPLETED /proc scan reporting zero holders. Do not
+  reintroduce lsof here: it asks the directory for permission to look, so an
+  unreadable subdir reads as unused, and its exit code is non-zero on any warning.
 - NEVER remove PID files where the PID is still alive
 - NEVER prune worktrees for dogs with live tmux sessions
 
