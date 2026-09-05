@@ -415,8 +415,11 @@ func (m *Model) renderFeed() string {
 
 // renderEvent renders a single event line
 func (m *Model) renderEvent(e Event) string {
-	// Timestamp - compact HH:MM format, no brackets
-	ts := TimestampStyle.Render(e.Time.Local().Format("15:04"))
+	// Timestamp - compact HH:MM format, no brackets, WITH THE ZONE.
+	// The store is UTC and this renders local; an unlabelled time is read as
+	// UTC by agents comparing it against beads and transcripts. See the note in
+	// print_events.go for the incident.
+	ts := TimestampStyle.Render(e.Time.Local().Format("15:04 MST"))
 
 	// Symbol based on event type
 	symbol := EventSymbols[e.Type]

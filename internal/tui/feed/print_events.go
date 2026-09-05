@@ -16,10 +16,10 @@ import (
 type PrintOptions struct {
 	Limit  int
 	Follow bool
-	Since  string // duration string like "5m", "1h"
-	Mol    string // molecule/issue ID prefix filter
-	Type   string // event type filter
-	Rig    string // rig name filter (matches event's Rig field)
+	Since  string          // duration string like "5m", "1h"
+	Mol    string          // molecule/issue ID prefix filter
+	Type   string          // event type filter
+	Rig    string          // rig name filter (matches event's Rig field)
 	Ctx    context.Context // optional: controls follow-mode lifecycle; nil uses signal.NotifyContext
 }
 
@@ -142,7 +142,16 @@ func matchesFilters(event *Event, sinceTime time.Time, mol, eventType, rig strin
 // printEvent formats and prints a single event line.
 func printEvent(event Event) {
 	symbol := typeSymbol(event.Type)
-	ts := event.Time.Local().Format("15:04:05")
+	// LABEL THE ZONE. The store is UTC (.events.jsonl rows end in Z) and this
+	// renders LOCAL, so an unlabelled "12:43:45" for an event written as
+	// "18:43:45Z" reads as UTC to anyone comparing it against a bead, a
+	// transcript, or another agent's report.
+	//
+	// That is not hypothetical: it produced a six-hour phantom gap on
+	// 2026-09-03 and was the fifth local-vs-UTC error in this town in one day.
+	// The mitigation in CLAUDE.md made it worse by asserting the feed was UTC,
+	// which is why the fix belongs here at the source rather than only in prose.
+	ts := event.Time.Local().Format("15:04:05 MST")
 	actor := event.Actor
 	if actor == "" {
 		actor = "system"
