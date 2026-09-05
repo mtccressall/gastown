@@ -440,6 +440,36 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		})
 	}
 
+	// isStandaloneFormula answers the ONE question both deferred paths below need:
+	// is args[0] a formula rather than a bead?
+	//
+	// WHY THIS IS HOISTED OUT OF THE isRig BRANCH. The formula exemption used to
+	// live inside `if isRig`, so it only fired when the SECOND argument was a
+	// rig. That made both documented ways of bootstrapping the Deacon fail:
+	//
+	//   gt sling mol-deacon-patrol deacon   -> "deacon" is not a rig, so the
+	//                                          exemption was skipped entirely
+	//   gt sling mol-deacon-patrol          -> the 1-arg path never had the
+	//                                          exemption at all
+	//
+	// Both then fell into "deferred dispatch requires a rig target", which
+	// misclassifies a formula as a task bead. The exemption's own rationale is
+	// that standalone formula slinging is not bead-based dispatch and does not
+	// consume a scheduler slot — and that is true regardless of what the target
+	// is, so the check belongs here rather than behind a rig test (gt-h8j).
+	isStandaloneFormula := func(rigName string) bool {
+		if verifyBeadExists(args[0]) == nil {
+			return false
+		}
+		formulaWorkDir := townRoot
+		if rigName != "" {
+			if rigBeadsDir, ok := beads.ResolveRepoAliasBeadsDir(townRoot, rigName); ok {
+				formulaWorkDir = filepath.Dir(rigBeadsDir)
+			}
+		}
+		return verifyFormulaExists(args[0], formulaWorkDir, townRoot) == nil
+	}
+
 	// Single bead + rig (2 args): deferred check before resolveTarget side-effects
 	if deferred && len(args) == 2 {
 		rigName, isRig := IsRigName(args[1])
@@ -451,17 +481,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 				return fmt.Errorf("%s cannot be scheduled with an explicit rig\nUse: gt sling %s (children auto-resolve rigs)",
 					idType, args[0])
 			}
-			if verifyBeadExists(args[0]) != nil {
-				formulaWorkDir := townRoot
-				if rigBeadsDir, ok := beads.ResolveRepoAliasBeadsDir(townRoot, rigName); ok {
-					formulaWorkDir = filepath.Dir(rigBeadsDir)
-				}
-				if verifyFormulaExists(args[0], formulaWorkDir, townRoot) == nil {
-					// Standalone formula slinging (cook+wisp+attach) is not bead-based
-					// dispatch and does not consume a scheduler slot — fall through to
-					// runSlingFormula, which handles polecat spawning via resolveTarget.
-					return runSlingFormula(ctx, args)
-				}
+			if isStandaloneFormula(rigName) {
+				// Standalone formula slinging (cook+wisp+attach) is not bead-based
+				// dispatch and does not consume a scheduler slot — fall through to
+				// runSlingFormula, which handles polecat spawning via resolveTarget.
+				return runSlingFormula(ctx, args)
 			}
 			beadID := args[0]
 			formula := resolveFormula(slingFormula, slingHookRawBead, townRoot, rigName)
@@ -490,6 +514,12 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		// Without this fallthrough, dispatchFeedDog can't feed stranded convoys when a
 		// scheduler is active (bead aa-4yf2).
 		if _, isDog := IsDogTarget(args[1]); !isDog {
+			// A formula with a non-rig target (e.g. `gt sling mol-deacon-patrol
+			// deacon`) is still standalone formula slinging and consumes no
+			// scheduler slot, so it is exempt here too (gt-h8j).
+			if isStandaloneFormula("") {
+				return runSlingFormula(ctx, args)
+			}
 			// Non-rig, non-dog target in deferred mode — reject to prevent bypassing capacity control
 			return fmt.Errorf("deferred dispatch requires a rig target: gt sling %s <rig>\n'%s' is not a known rig", args[0], args[1])
 		}
@@ -542,6 +572,23 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 					NoBoot:      slingNoBoot,
 				})
 			}
+		}
+		// A bare formula name is not a task bead. Without this the 1-arg path
+		// misclassifies it and rejects the documented Deacon bootstrap (gt-h8j).
+		//
+		// GUARDED ON --on, AND THE GUARD IS LOAD-BEARING. The pre-existing
+		// standalone-formula return further down sits in the ELSE of
+		// `if slingOnTarget != ""`, i.e. the original structure says that when
+		// --on is set, standalone slinging is NOT the destination: the formula
+		// is meant to be attached to that bead. Without this condition,
+		// `gt sling <formula> --on <bead>` with the scheduler INACTIVE would
+		// return here and silently do a different thing.
+		//
+		// The deferred case cannot reach this — `deferred && slingOnTarget != ""`
+		// has already returned above — so this only bites with deferred false,
+		// which is precisely the configuration gt-h8j's repro never exercised.
+		if slingOnTarget == "" && isStandaloneFormula("") {
+			return runSlingFormula(ctx, args)
 		}
 		// task bead with deferred + no rig: error — must specify a rig
 		if deferred {
