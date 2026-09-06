@@ -1209,13 +1209,21 @@ This must resolve exactly one bead ID. If it fails, STOP and report the error. I
 Then use await-event to subscribe to the refinery event channel with exponential backoff:
 
 ```bash
-gt mol step await-event --channel refinery --agent-bead "$YOUR_AGENT_BEAD" \
-  --backoff-base 30s --backoff-mult 2 --backoff-max 15m \
+gt mol step await-event --channel refinery --rig {{rig}} --agent-bead "$YOUR_AGENT_BEAD" \
+  --backoff-base 30s --backoff-mult 2 --backoff-max 15m --cleanup \
   --context-check-interval 5m
 ```
 
+**`--rig` is required here.** The refinery channel is per-rig: every rig runs its
+own refinery, and until the channel was scoped they all watched one directory.
+One rig then consumed — and with `--cleanup`, deleted — another rig's events
+(gt-a3qs: six of liveop's MQ_SUBMIT events, gone). With `--rig` you watch only
+your own rig's channel, which is what makes `--cleanup` safe again, and draining
+your own directory is what lets the backoff actually engage. Without `--rig` the
+command falls back to `GT_RIG` or your cwd and warns if it still cannot tell.
+
 This command:
-1. Watches `~/gt/events/refinery/` for event files (polling-based)
+1. Watches `~/gt/events/rigs/{{rig}}/refinery/` for event files (polling-based)
 2. Returns IMMEDIATELY when an event is emitted (MERGE_READY, PATROL_WAKE, MQ_SUBMIT)
 3. If no events, times out with exponential backoff:
    - First timeout: 30s
@@ -1224,29 +1232,8 @@ This command:
    - ...capped at 15 minutes max
 4. Tracks `idle:N` label on refinery agent bead for backoff state
 5. Returns `reason: context-yield` after 5m if no event arrived (see below)
-6. `--cleanup` would auto-delete processed event files -- deliberately NOT passed, see below
+6. `--cleanup` auto-deletes processed event files
 7. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
-
-**NO `--cleanup` HERE, deliberately (gt-a3qs).** The channel is ROLE-scoped, not
-rig-scoped: `~/gt/events/refinery/` is shared by gastown/refinery AND liveop/refinery.
-`await-event --help` states it plainly -- *"Channels are single-consumer... if multiple
-consumers watch the same channel with --cleanup, events may be deleted before all
-consumers read them."* This formula used to prescribe exactly that unsafe configuration
-to every refinery.
-
-Observed live 2026-09-02 11:37Z: gastown/refinery woke on 6 MQ_SUBMIT events with its own
-queue empty and `--cleanup` deleted them. They were liveop's, whose MQ had a ready MR aged
-20s. Two costs per occurrence -- the victim never wakes, and the thief burns a full
-EFFORT:full cycle on an empty queue. Candidate cause of the recurring "refinery idle while
-MRs wait" reports (gt-rhb, gt-zy1): the wake-up WAS delivered, to the wrong rig.
-
-Dropping `--cleanup` stops the theft immediately. Events accumulate in the shared directory
-instead of being consumed by whoever wakes first, so both refineries see every event. The
-real fix is namespacing the channel per rig, which needs the Go emitters changed in lockstep
-(`internal/witness/handlers.go`, `internal/cmd/sling_helpers.go` both hardcode `"refinery"`)
--- namespacing the listener alone would stop refineries waking at all. Tracked on gt-a3qs.
-
-Until then, prune the directory periodically rather than racing for it.
 
 **Supported events:**
 - `MERGE_READY` — from witness when polecat branch is pushed and ready to merge

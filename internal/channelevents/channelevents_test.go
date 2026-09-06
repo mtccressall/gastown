@@ -14,7 +14,7 @@ func TestEmitToTown(t *testing.T) {
 	t.Setenv(EnvSuppress, "0")
 	townRoot := t.TempDir()
 
-	path, err := EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
+	path, err := EmitToTown(townRoot, TownScope, "refinery", "MERGE_READY", []string{
 		"source=witness",
 		"rig=dashboard",
 	})
@@ -59,7 +59,7 @@ func TestEmitToTown_InvalidChannel(t *testing.T) {
 	// No opt-in: name validation is rejected ahead of the suppression gate,
 	// so this path is the same in a test binary and in production.
 	t.Parallel()
-	_, err := EmitToTown(t.TempDir(), "../escape", "TEST", nil)
+	_, err := EmitToTown(t.TempDir(), TownScope, "../escape", "TEST", nil)
 	if err == nil {
 		t.Error("expected error for invalid channel name")
 	}
@@ -73,7 +73,7 @@ func TestEmitToTown_UniqueFilenames(t *testing.T) {
 	seen := make(map[string]bool)
 
 	for i := 0; i < 10; i++ {
-		path, err := EmitToTown(townRoot, "test", "EVENT", nil)
+		path, err := EmitToTown(townRoot, TownScope, "test", "EVENT", nil)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
@@ -112,7 +112,7 @@ func TestEmitToTown_CreatesDirectory(t *testing.T) {
 		t.Fatal("channel dir should not exist yet")
 	}
 
-	_, err := EmitToTown(townRoot, "newchannel", "TEST", nil)
+	_, err := EmitToTown(townRoot, TownScope, "newchannel", "TEST", nil)
 	if err != nil {
 		t.Fatalf("EmitToTown failed: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestEmitToTown_CreatesDirectory(t *testing.T) {
 func TestEmitSuppressedInsideTestBinary(t *testing.T) {
 	townRoot := t.TempDir()
 
-	path, err := EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{"message=test message"})
+	path, err := EmitToTown(townRoot, "gastown", "refinery", "MQ_SUBMIT", []string{"message=test message"})
 	if err != nil {
 		t.Fatalf("a suppressed emit must not error, got %v", err)
 	}
@@ -154,19 +154,19 @@ func TestEmitSuppressedInsideTestBinary(t *testing.T) {
 func TestEmitSuppressionIsOptOut(t *testing.T) {
 	townRoot := t.TempDir()
 
-	if _, err := EmitToTown(townRoot, "refinery", "MQ_SUBMIT", nil); err != nil {
+	if _, err := EmitToTown(townRoot, "gastown", "refinery", "MQ_SUBMIT", nil); err != nil {
 		t.Fatalf("suppressed emit: %v", err)
 	}
-	suppressed, err := filepath.Glob(filepath.Join(townRoot, "events", "refinery", "*.event"))
+	suppressed, err := filepath.Glob(filepath.Join(townRoot, "events", RigsDirName, "gastown", "refinery", "*.event"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Setenv(EnvSuppress, "0")
-	if _, err := EmitToTown(townRoot, "refinery", "MQ_SUBMIT", nil); err != nil {
+	if _, err := EmitToTown(townRoot, "gastown", "refinery", "MQ_SUBMIT", nil); err != nil {
 		t.Fatalf("opted-in emit: %v", err)
 	}
-	allowed, err := filepath.Glob(filepath.Join(townRoot, "events", "refinery", "*.event"))
+	allowed, err := filepath.Glob(filepath.Join(townRoot, "events", RigsDirName, "gastown", "refinery", "*.event"))
 	if err != nil {
 		t.Fatal(err)
 	}

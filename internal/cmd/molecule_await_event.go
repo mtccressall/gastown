@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
@@ -26,6 +25,7 @@ var (
 	awaitEventAgentBead            string
 	awaitEventCleanup              bool
 	awaitEventContextCheckInterval string
+	awaitEventRig                  string
 )
 
 // validChannelName is a convenience alias for the canonical regex in channelevents.
@@ -34,7 +34,7 @@ var validChannelName = channelevents.ValidChannelName
 var moleculeAwaitEventCmd = &cobra.Command{
 	Use:   "await-event",
 	Short: "Wait for a file-based event on a named channel",
-	Long: `Wait for event files to appear in ~/gt/events/<channel>/, with optional backoff.
+	Long: `Wait for event files to appear in a channel directory, with optional backoff.
 
 Unlike await-signal (which subscribes to the generic beads activity feed),
 await-event watches a dedicated event channel directory for .event files.
@@ -44,9 +44,20 @@ Channels are single-consumer: only one process should watch a given channel
 at a time. If multiple consumers watch the same channel with --cleanup,
 events may be deleted before all consumers read them.
 
+CHANNEL SCOPING:
+Per-rig channels (refinery, witness) live under a rig, which is what keeps
+that invariant true when the town runs more than one rig:
+  ~/gt/events/rigs/<rig>/<channel>/
+Town-level channels (mayor) are shared by the whole town:
+  ~/gt/events/<channel>/
+
+The rig is taken from --rig, else GT_RIG, else the rig containing the current
+directory. Watching a per-rig channel without a rig watches a directory no
+emitter writes to; the command warns rather than reporting a silent empty.
+
 EVENT FORMAT:
-Events are JSON files in ~/gt/events/<channel>/*.event:
-  {"type": "...", "channel": "...", "timestamp": "...", "payload": {...}}
+Events are JSON files in the channel directory, named *.event:
+  {"type": "...", "channel": "...", "rig": "...", "timestamp": "...", "payload": {...}}
 
 BEHAVIOR:
 1. Check for already-pending events (return immediately if found)
@@ -78,8 +89,8 @@ EXIT CODES:
   1 - Error
 
 EXAMPLES:
-  # Wait for refinery events with 10min timeout
-  gt mol step await-event --channel refinery --timeout 10m
+  # Wait for a rig's refinery events with 10min timeout
+  gt mol step await-event --channel refinery --rig gastown --timeout 10m
 
   # Backoff mode with agent bead tracking
   gt mol step await-event --channel refinery --agent-bead VAS-refinery \
@@ -99,6 +110,7 @@ EXAMPLES:
 type AwaitEventResult struct {
 	Reason      string        `json:"reason"`                // "event" or "timeout"
 	Elapsed     time.Duration `json:"elapsed"`               // how long we waited
+	Rig         string        `json:"rig,omitempty"`         // rig whose channel was watched
 	Events      []EventFile   `json:"events,omitempty"`      // event files found
 	IdleCycles  int           `json:"idle_cycles,omitempty"` // current idle cycle count
 	EffortLevel string        `json:"effort_level"`          // "full" or "abbreviated"
@@ -127,6 +139,8 @@ func init() {
 		"Suppress output (for scripting)")
 	moleculeAwaitEventCmd.Flags().BoolVar(&awaitEventCleanup, "cleanup", false,
 		"Delete event files after reading them")
+	moleculeAwaitEventCmd.Flags().StringVar(&awaitEventRig, "rig", "",
+		"Rig owning this channel (default: GT_RIG, else the rig containing the cwd)")
 	moleculeAwaitEventCmd.Flags().StringVar(&awaitEventContextCheckInterval, "context-check-interval", "",
 		"Yield after this wall-clock interval so the caller can assess context (e.g., 5m). Returns reason 'context-yield'.")
 	moleculeAwaitEventCmd.Flags().BoolVar(&moleculeJSON, "json", false,
@@ -142,14 +156,19 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", awaitEventChannel)
 	}
 
-	// Resolve event directory
-	townRoot, err := workspace.FindFromCwd()
-	if err != nil || townRoot == "" {
-		// Fallback to ~/gt
-		home, _ := os.UserHomeDir()
-		townRoot = filepath.Join(home, "gt")
+	// Resolve event directory through the same builder the emitters use, so a
+	// consumer and an emitter cannot disagree about the path (gt-a3qs).
+	townRoot := resolveTownRootOrDefault()
+	rigName, err := resolveChannelRig(townRoot, awaitEventChannel, awaitEventRig)
+	if err != nil {
+		return err
 	}
-	eventDir := filepath.Join(townRoot, "events", awaitEventChannel)
+	warnIfChannelUnscoped(awaitEventChannel, rigName)
+
+	eventDir, err := channelevents.ChannelDir(townRoot, rigName, awaitEventChannel)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		return fmt.Errorf("creating event directory: %w", err)
 	}
@@ -222,8 +241,9 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	}
 
 	if !awaitEventQuiet && !moleculeJSON {
-		fmt.Printf("%s Awaiting event on channel %q (timeout: %v, idle: %d)...\n",
-			style.Dim.Render("⏳"), awaitEventChannel, timeout, idleCycles)
+		fmt.Printf("%s Awaiting event on channel %q rig %q (timeout: %v, idle: %d)...\n",
+			style.Dim.Render("⏳"), awaitEventChannel, rigName, timeout, idleCycles)
+		fmt.Printf("%s watching %s\n", style.Dim.Render("  "), eventDir)
 	}
 
 	startTime := time.Now()
@@ -237,6 +257,7 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("event watch failed: %w", err)
 	}
 	result.Elapsed = time.Since(startTime)
+	result.Rig = rigName
 
 	// Update agent bead idle cycles and heartbeat
 	if awaitEventAgentBead != "" && beadsDir != "" {

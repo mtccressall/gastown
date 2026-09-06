@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"io"
 	"log"
 	"os"
@@ -160,7 +161,9 @@ func TestEnsureRefineryRunningSafetyStoppedDoesNotSpawn(t *testing.T) {
 	townRoot := t.TempDir()
 	writeDaemonTownFile(t, townRoot, "mayor/town.json", `{"name":"test"}`)
 	writeDaemonTownFile(t, townRoot, ".beads/metadata.json", `{"prefix":"hq"}`)
-	writeDaemonTownFile(t, townRoot, "events/refinery/pending.event", "{}")
+	// The refinery channel is rig-scoped (gt-a3qs), so the pending event that
+	// opens the spawn gate must be this rig's own.
+	writeDaemonTownFile(t, townRoot, "events/rigs/testrig/refinery/pending.event", "{}")
 	if err := os.MkdirAll(filepath.Join(townRoot, "testrig"), 0o755); err != nil {
 		t.Fatalf("mkdir rig: %v", err)
 	}
@@ -192,7 +195,9 @@ func TestEnsureRefineryRunningForkRigDoesNotSpawn(t *testing.T) {
 		t.Skip("mock tmux script uses POSIX shell")
 	}
 	townRoot := t.TempDir()
-	writeDaemonTownFile(t, townRoot, "events/refinery/pending.event", "{}")
+	// The refinery channel is rig-scoped (gt-a3qs), so the pending event that
+	// opens the spawn gate must be this rig's own.
+	writeDaemonTownFile(t, townRoot, "events/rigs/testrig/refinery/pending.event", "{}")
 	writeDaemonTownFile(t, townRoot, "testrig/config.json", `{"upstream_url":"https://github.com/upstream/repo","beads":{"prefix":"gt"}}`)
 
 	binDir := t.TempDir()
@@ -819,16 +824,55 @@ func TestIsRunningFromPID_LiveProcess(t *testing.T) {
 	}
 }
 
+// mustChannelDir resolves a channel directory through the production builder.
+// Tests that join the path by hand cannot detect a change in the layout, which
+// is how the daemon's gate drifted away from the emitters in the first place.
+func mustChannelDir(t *testing.T, townRoot, rig, channel string) string {
+	t.Helper()
+	dir, err := channelevents.ChannelDir(townRoot, rig, channel)
+	if err != nil {
+		t.Fatalf("ChannelDir(%q, %q): %v", rig, channel, err)
+	}
+	return dir
+}
+
+// TestHasPendingEvents_IgnoresOtherRigs is the daemon-side regression test for
+// gt-a3qs. The spawn gate is the third consumer of a channel directory, and
+// while it read the unscoped events/<channel> one rig's pending events spawned
+// every other rig's refinery — burning a Claude session on work that was never
+// that rig's. On the pre-fix code this test fails.
+func TestHasPendingEvents_IgnoresOtherRigs(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	liveopDir := mustChannelDir(t, tmpDir, "liveop", "refinery")
+	if err := os.MkdirAll(liveopDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(liveopDir, "1-1-1.event"),
+		[]byte(`{"type":"MQ_SUBMIT","rig":"liveop"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if d.hasPendingEvents("gastown", "refinery") {
+		t.Error("gastown's spawn gate fired on liveop's pending events")
+	}
+	if !d.hasPendingEvents("liveop", "refinery") {
+		t.Error("liveop's spawn gate did not fire on its own pending events")
+	}
+}
+
 func TestHasPendingEvents_EmptyDir(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := mustChannelDir(t, tmpDir, "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false for empty event directory")
 	}
 }
@@ -838,14 +882,14 @@ func TestHasPendingEvents_MissingDir(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when event directory doesn't exist")
 	}
 }
 
 func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := mustChannelDir(t, tmpDir, "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -858,14 +902,14 @@ func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected true when .event files exist")
 	}
 }
 
 func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := mustChannelDir(t, tmpDir, "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -877,7 +921,7 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when only non-.event files exist")
 	}
 }
@@ -985,4 +1029,90 @@ func TestIsRigOperational_DockedRig(t *testing.T) {
 		t.Error("isRigOperational should return false when rig bead is missing")
 	}
 	t.Logf("Docked rig check returned: operational=%v, reason=%q", operational, reason)
+}
+
+// TestHasPendingEventsClaimsLegacyEventNamingThisRig covers the upgrade
+// transition. An event written before scoping sits in the unscoped directory;
+// if it names this rig on its own contents it is still ours and must open the
+// spawn gate, or upgrading strands queued work behind a gate pointed at a
+// directory nothing has written to yet.
+func TestHasPendingEventsClaimsLegacyEventNamingThisRig(t *testing.T) {
+	tmpDir := t.TempDir()
+	legacyDir := filepath.Join(tmpDir, "events", "refinery")
+	if err := os.MkdirAll(legacyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "1-1-1.event"),
+		[]byte(`{"type":"MERGE_READY","payload":{"rig":"gastown"}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	d.logger = log.New(io.Discard, "", 0)
+
+	if !d.hasPendingEvents("gastown", "refinery") {
+		t.Error("legacy event naming gastown did not open gastown's gate")
+	}
+
+	// The event must have MOVED to where gastown's await-event actually looks.
+	// Opening the gate without moving it is a spawn loop: the refinery starts,
+	// watches only the scoped directory, finds nothing, exits — and the legacy
+	// event is still there to do it again on the next heartbeat.
+	scoped := mustChannelDir(t, tmpDir, "gastown", "refinery")
+	if _, err := os.Stat(filepath.Join(scoped, "1-1-1.event")); err != nil {
+		t.Errorf("legacy event was recognised but not delivered to %s: %v", scoped, err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyDir, "1-1-1.event")); err == nil {
+		t.Error("legacy event still sits in the shared directory; the gate will fire again next tick")
+	}
+
+	// Second call must now be quiet — the loop terminates.
+	if d.hasPendingEvents("gastown", "refinery") {
+		// The scoped dir still holds it until the refinery consumes it, which
+		// is correct; what must NOT happen is another delivery from legacy.
+		if entries, _ := os.ReadDir(legacyDir); len(entries) != 0 {
+			t.Error("second call re-read the legacy directory")
+		}
+	}
+
+	// And it was never claimable by anyone else.
+	if d.hasPendingEvents("liveop", "refinery") {
+		t.Error("liveop claimed a legacy event that names gastown")
+	}
+}
+
+// TestHasPendingEventsIgnoresUnattributableLegacyEvents pins the other half:
+// a pre-scoping event that names no rig belongs to nobody. Claiming it for
+// whichever rig asked first is the original defect with extra steps. Every one
+// of the 69 events in the live town at the time of this change was of this
+// kind, which is why they are reported rather than delivered.
+func TestHasPendingEventsIgnoresUnattributableLegacyEvents(t *testing.T) {
+	tmpDir := t.TempDir()
+	legacyDir := filepath.Join(tmpDir, "events", "refinery")
+	if err := os.MkdirAll(legacyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "1-1-1.event"),
+		[]byte(`{"type":"MQ_SUBMIT","payload":{"source":"sling"}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}, logger: log.New(io.Discard, "", 0)}
+
+	if d.hasPendingEvents("gastown", "refinery") {
+		t.Error("an unattributable legacy event was claimed by gastown")
+	}
+	if d.hasPendingEvents("liveop", "refinery") {
+		t.Error("an unattributable legacy event was claimed by liveop")
+	}
+	// It must also still be there — unclaimed is not the same as consumed.
+	if _, err := os.Stat(filepath.Join(legacyDir, "1-1-1.event")); err != nil {
+		t.Errorf("an unattributable legacy event was moved or destroyed: %v", err)
+	}
+	// But it must be COUNTED, so the daemon can say so rather than skipping in
+	// silence. A stranded event nobody mentions reads as a quiet channel.
+	if n := d.legacyEventsNeedMigration("refinery"); n != 1 {
+		t.Errorf("legacyEventsNeedMigration = %d, want 1", n)
+	}
 }
