@@ -126,6 +126,17 @@ func init() {
 	compactCmd.AddCommand(compactReportCmd)
 }
 
+// compactSubprocessArgs builds the argv for the `gt compact` child process the
+// digest shells out to. A previewing report must preview the compaction too,
+// not merely withhold the mail.
+func compactSubprocessArgs(dryRun bool) []string {
+	args := []string{"compact", "--json"}
+	if dryRun {
+		args = append(args, "--dry-run")
+	}
+	return args
+}
+
 func runCompactReport(cmd *cobra.Command, args []string) error {
 	if compactReportWeekly {
 		return runWeeklyRollup()
@@ -156,8 +167,15 @@ func runDailyDigest() error {
 		return nil
 	}
 
-	// Run compaction with --json to get results
-	compactOut, err := exec.Command("gt", "compact", "--json").Output()
+	// Run compaction with --json to get results.
+	//
+	// --dry-run propagates. Without it `gt compact report --dry-run`, whose own
+	// help promises "preview report without sending", performed a real
+	// compaction — promoting and deleting wisps — and only the mail at the end
+	// was suppressed. That is inert today solely because the scan omits
+	// --include-infra and therefore sees no wisps at all (gastown-mq9); the
+	// moment that scan widens, the preview becomes the destructive path.
+	compactOut, err := exec.Command("gt", compactSubprocessArgs(compactReportDryRun)...).Output()
 	if err != nil {
 		return fmt.Errorf("running compaction: %w", err)
 	}

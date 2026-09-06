@@ -668,3 +668,28 @@ func assertNoMailSent(t *testing.T, mailLog string) {
 		t.Fatalf("mail was sent unexpectedly: %s", string(data))
 	}
 }
+
+// TestCompactSubprocessArgs pins the digest's child compaction to the report's
+// own --dry-run. `gt compact report --dry-run` used to run a live compaction
+// and suppress only the mail, so a command whose help says "preview report
+// without sending" promoted and deleted wisps. It is inert today solely because
+// the scan cannot see wisps (gastown-mq9), which is not a property to rely on.
+func TestCompactSubprocessArgs(t *testing.T) {
+	tests := []struct {
+		name   string
+		dryRun bool
+		want   []string
+	}{
+		{"live run compacts", false, []string{"compact", "--json"}},
+		{"preview must not mutate", true, []string{"compact", "--json", "--dry-run"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := compactSubprocessArgs(tc.dryRun)
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Errorf("compactSubprocessArgs(%v) = %v, want %v", tc.dryRun, got, tc.want)
+			}
+		})
+	}
+}
