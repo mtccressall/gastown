@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -196,7 +198,19 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		return snapshot, fmt.Errorf("listing tmux sessions for polecat capacity: %w", err)
 	}
 	sessions := newPolecatSessionSet(sessionNames)
+
+	// Rig names come out of a map, so sort them: the probe list below is
+	// applied in order and a stable order keeps one town's snapshot
+	// reproducible between passes, which is what makes a discrepancy
+	// investigable rather than attributable to map iteration.
+	rigNames := make([]string, 0, len(rigsConfig.Rigs))
 	for rigName := range rigsConfig.Rigs {
+		rigNames = append(rigNames, rigName)
+	}
+	sort.Strings(rigNames)
+
+	var probes []polecatCapacityProbe
+	for _, rigName := range rigNames {
 		rigPath := filepath.Join(townRoot, rigName)
 		if _, err := os.Stat(rigPath); err != nil {
 			if !os.IsNotExist(err) {
@@ -224,10 +238,16 @@ func polecatCapacitySnapshotForTownNoCleanup(townRoot string) (polecatCapacitySn
 		prefix := beads.GetPrefixForRig(townRoot, rigName)
 		for _, name := range polecatNames {
 			agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, name)
-			issue := agents[agentID]
-			fields := parsePolecatAgentFields(issue)
-			applyAgentFieldsToCapacitySnapshot(&snapshot, rigName, name, fields, activeWork[name], sessions)
+			probes = append(probes, polecatCapacityProbe{
+				rigName:     rigName,
+				polecatName: name,
+				fields:      parsePolecatAgentFields(agents[agentID]),
+				activeWork:  activeWork[name],
+			})
 		}
+	}
+	for _, contribution := range resolvePolecatCapacityContributions(probes, sessions) {
+		applyWorkstateDispositionToCapacitySnapshot(&snapshot, contribution.state, contribution.disposition)
 	}
 
 	reservations, err := readPolecatAdmissionReservations(townRoot)
@@ -262,12 +282,86 @@ func listPolecatDirectoryNames(rigPath string) ([]string, error) {
 	return names, nil
 }
 
-func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) {
-	item := buildPolecatInventoryItem(rigName, polecatName, fields, activeWork, sessions)
+// polecatCapacityProbe is one polecat's cheap, already-fetched evidence, held
+// so the expensive per-polecat assessment can be fanned out.
+type polecatCapacityProbe struct {
+	rigName     string
+	polecatName string
+	fields      *beads.AgentFields
+	activeWork  *beads.Issue
+}
+
+// polecatCapacityContribution is what one polecat adds to the snapshot.
+type polecatCapacityContribution struct {
+	state       polecat.State
+	disposition polecat.WorkstateDisposition
+}
+
+// polecatCapacityProbeConcurrency bounds the per-polecat fan-out.
+//
+// Every probe can spawn several `bd` and `git` subprocesses, one of which is a
+// network `git ls-remote`, so the work is latency-bound rather than CPU-bound
+// and a serial walk pays the full round-trip 43 times over. It is bounded and
+// not unlimited because the town's polecat pool grows: an unbounded fan-out
+// would spawn hundreds of subprocesses at once and trade a slow dispatch pass
+// for a loaded host, which is the same defect wearing better numbers.
+const polecatCapacityProbeConcurrency = 8
+
+// resolvePolecatCapacityContributions assesses every probe, in parallel, and
+// returns the contributions IN PROBE ORDER.
+//
+// The order matters even though addition commutes: it keeps a snapshot
+// reproducible across passes, so two operators reading `gt scheduler status`
+// seconds apart can attribute a difference to the town rather than to
+// scheduling. (gastown-o8q)
+func resolvePolecatCapacityContributions(probes []polecatCapacityProbe, sessions polecatSessionSet) []polecatCapacityContribution {
+	contributions := make([]polecatCapacityContribution, len(probes))
+	if len(probes) == 0 {
+		return contributions
+	}
+
+	// One ls-remote memo window spanning the whole fan-out. Two polecats in one
+	// rig frequently ask the remote the same question, and sync.Once inside the
+	// memo collapses those into a single round-trip even when they race.
+	git.BeginRemoteRefCache()
+	defer git.EndRemoteRefCache()
+
+	sem := make(chan struct{}, polecatCapacityProbeConcurrency)
+	var wg sync.WaitGroup
+	for i := range probes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			contributions[i] = polecatCapacityContributionFor(probes[i], sessions)
+		}(i)
+	}
+	wg.Wait()
+	return contributions
+}
+
+// polecatCapacityContributionFor is the expensive half: it spawns the bd and
+// git subprocesses that decide whether a polecat occupies a slot.
+func polecatCapacityContributionFor(probe polecatCapacityProbe, sessions polecatSessionSet) polecatCapacityContribution {
+	item := buildPolecatInventoryItem(probe.rigName, probe.polecatName, probe.fields, probe.activeWork, sessions)
 	// gt-b3a2: this is a GATE, not a display. It must consult the same
 	// reconciled disposition `gt polecat list` shows, or the scheduler refuses
 	// to dispatch against polecats the rest of the CLI reports as free.
-	applyWorkstateDispositionToCapacitySnapshot(snapshot, item.State, reconcilePolecatDispositionFn(rigName, polecatName, item))
+	return polecatCapacityContribution{
+		state:       item.State,
+		disposition: reconcilePolecatDispositionFn(probe.rigName, probe.polecatName, item),
+	}
+}
+
+func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) {
+	contribution := polecatCapacityContributionFor(polecatCapacityProbe{
+		rigName:     rigName,
+		polecatName: polecatName,
+		fields:      fields,
+		activeWork:  activeWork,
+	}, sessions)
+	applyWorkstateDispositionToCapacitySnapshot(snapshot, contribution.state, contribution.disposition)
 }
 
 func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapshot, state polecat.State, disposition polecat.WorkstateDisposition) {
