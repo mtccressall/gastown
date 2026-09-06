@@ -195,6 +195,28 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	messages := make([]*Message, 0, len(assignee.messages)+len(cc.messages)+len(wisps.messages))
 	messages = appendBeadsMessages(messages, seen, assignee.messages, true)
 	messages = appendBeadsMessages(messages, seen, cc.messages, false)
+	// A wisp-query failure is tolerated, and it is worth saying why that is safe
+	// NOW when it was not before (gt-mff).
+	//
+	// This path runs `bd sql`, which legitimately fails in at least three
+	// supported configurations: an embedded store (the town store is embedded,
+	// and bd answers "not yet supported in embedded mode"), a bd old enough to
+	// lack `bd sql` at all (see scheduler_epic.go, which carries its own
+	// fallback for exactly that), and a store whose wisps table does not exist
+	// yet (runWispSQL says so at its own error return).
+	//
+	// What made the old silence harmful was not the silence. It was that this
+	// was the ONLY route to a wisp-backed message, so when it failed the inbox
+	// went blind and said nothing -- 227 messages invisible town-wide. Now that
+	// both issue queries pass --include-infra they return wisp-backed messages
+	// themselves, so this SQL query is a redundant second source and its failure
+	// cannot mean a message was dropped. Warning here would fire on every single
+	// inbox read in the configurations above, including the UserPromptSubmit
+	// hook's `gt mail check --inject` on every agent turn.
+	//
+	// The invariant that actually protects the inbox is therefore "--include-infra
+	// is present on the issue queries", and that is pinned structurally by
+	// TestMessageQueriesIncludeInfra rather than left to a runtime warning.
 	if wisps.err == nil {
 		messages = appendWispMessages(messages, seen, wisps.messages)
 	}
@@ -205,9 +227,14 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []string) ([]BeadsMessage, error) {
 	var messages []BeadsMessage
 	for _, id := range identities {
+		// --include-infra is REQUIRED, not optional: gt mail send writes wisp-backed
+		// messages (gt-wisp-*), wisps are infra beads, and bd list hides infra by
+		// default. Without this flag every wisp-backed message is invisible here --
+		// measured 0 rows against 73 for one recipient on one store (gt-mff).
 		args := []string{"list",
 			"--label", "gt:message",
 			"--assignee", id,
+			"--include-infra",
 			"--json",
 			"--limit", "0",
 		}
@@ -230,9 +257,12 @@ func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []str
 func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) []BeadsMessage {
 	var messages []BeadsMessage
 	for _, id := range identities {
+		// --include-infra: see queryIssueMessagesByAssignee. A CC'd wisp message is
+		// hidden by the same default filter (gt-mff).
 		args := []string{"list",
 			"--label", "gt:message",
 			"--label", "cc:" + id,
+			"--include-infra",
 			"--json",
 			"--limit", "0",
 		}
