@@ -31,6 +31,10 @@ import (
 // `runWithTimeout` drop the memo when they see a `push`, `fetch` or `remote`
 // subcommand, so this is enforced rather than merely documented -- a guard that
 // only lives in a comment is one refactor away from not existing.
+
+// remoteRefEntry is one memoized answer. The sync.Once collapses concurrent
+// callers asking the same question onto a single round-trip, which is what the
+// now-parallel capacity walk needs.
 type remoteRefEntry struct {
 	once sync.Once
 	out  string

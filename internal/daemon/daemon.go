@@ -3233,6 +3233,36 @@ func (d *Daemon) pruneStaleBranches() {
 // is released on process death, and dispatchSingleBead's label swap retry logic
 // prevents double-dispatch on the next cycle. The batch_size config (default: 1)
 // limits how many beads are in-flight per heartbeat, reducing the timeout window.
+func (d *Daemon) dispatchQueuedWork() {
+	// Parented on the daemon's context now that the pass runs off the heartbeat
+	// goroutine (gastown-o8q). While it was inline, a stopping daemon waited for
+	// the pass by construction; asynchronously it would outlive the daemon and
+	// hold the scheduler flock against its replacement.
+	parent := d.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
+	setSysProcAttr(cmd)
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		// CombinedOutput still returns whatever the child printed before the
+		// deadline killed it. Log it. Until gt-vkv9 this was the ONE branch that
+		// captured its evidence and threw it away, so a 5m hang was
+		// unattributable: the pass writes no feed event either, which makes a
+		// failing dispatcher indistinguishable from an idle one.
+		d.logger.Printf("Scheduler dispatch timed out after 5m (partial output: %s)", schedulerOutputTail(out))
+	} else if err != nil {
+		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, schedulerOutputTail(out))
+	} else if len(out) > 0 {
+		d.logger.Printf("Scheduler dispatch: %s", string(out))
+	}
+}
+
 // dispatchQueuedWorkAsync runs one dispatch pass off the heartbeat goroutine.
 //
 // gastown-o8q: dispatchQueuedWork was called inline, so the heartbeat could not
@@ -3257,28 +3287,6 @@ func (d *Daemon) dispatchQueuedWorkAsync() {
 		defer d.dispatchInFlight.Store(false)
 		d.dispatchQueuedWork()
 	}()
-}
-
-func (d *Daemon) dispatchQueuedWork() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
-	setSysProcAttr(cmd)
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		// CombinedOutput still returns whatever the child printed before the
-		// deadline killed it. Log it. Until gt-vkv9 this was the ONE branch that
-		// captured its evidence and threw it away, so a 5m hang was
-		// unattributable: the pass writes no feed event either, which makes a
-		// failing dispatcher indistinguishable from an idle one.
-		d.logger.Printf("Scheduler dispatch timed out after 5m (partial output: %s)", schedulerOutputTail(out))
-	} else if err != nil {
-		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, schedulerOutputTail(out))
-	} else if len(out) > 0 {
-		d.logger.Printf("Scheduler dispatch: %s", string(out))
-	}
 }
 
 // schedulerOutputTail renders a child pass's captured output for daemon.log.
