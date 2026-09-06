@@ -99,16 +99,42 @@ func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error)
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
-func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (info *SpawnedPolecatInfo, err error) {
 	// Find workspace
 	townRoot := opts.TownRoot
 	if townRoot == "" {
-		var err error
 		townRoot, err = workspace.FindFromCwdOrError()
 		if err != nil {
 			return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
 		}
 	}
+
+	// A SUCCESSFUL SPAWN CLEARS THE RESPAWN COUNTER (gt-iiih).
+	//
+	// The counter exists to answer "does this bead keep failing". A spawn that
+	// succeeds is the direct refutation, so leaving the count in place records a
+	// failure that did not happen and blocks the NEXT dispatch of a bead that
+	// demonstrably works.
+	//
+	// Measured 2026-09-06: liveop-vjq sat at the cap of 3 with last_respawn
+	// 06:36:34Z and spawned successfully at 06:37:08Z, 34 seconds later. Its
+	// counter was never cleared. Seven beads were at the cap and at least three
+	// of them (vjq, dgf, ewm) had already completed their work.
+	//
+	// This is a DEFER on a named return rather than a call before each success
+	// return, deliberately: there are two success paths (idle-polecat reuse and
+	// fresh allocation) and adding a call to each leaves the two free to drift
+	// and leaves any future third path uncovered. One deferred check cannot be
+	// bypassed by adding a return.
+	defer func() {
+		if err == nil && info != nil && opts.HookBead != "" {
+			if resetErr := witness.ResetBeadRespawnCount(townRoot, opts.HookBead); resetErr != nil {
+				// Non-fatal: the spawn already succeeded and the caller must not
+				// see a bookkeeping failure as a spawn failure.
+				style.PrintWarning("could not clear respawn counter for %s: %v", opts.HookBead, resetErr)
+			}
+		}
+	}()
 
 	// Load rig config
 	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
