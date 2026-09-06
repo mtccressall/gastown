@@ -29,14 +29,12 @@ import (
 // Declaration order is deliberately NOT asserted: these formulas contain genuine
 // parallel branches whose topological order legally differs from file order.
 func TestPatrolFormulasSequenceEveryStep(t *testing.T) {
-	// mol-deacon-patrol carries three orphans that predate gastown-c1x and are
-	// present in the town's live formula too; rewiring the Deacon health-check
-	// chain is a product decision, filed as gastown-7ip. This is a ratchet, not
-	// an allowlist: a fourth orphan fails the test, and fixing one of the three
-	// means deleting its name here. The list only ever shrinks.
-	knownOrphans := map[string][]string{
-		"mol-deacon-patrol": {"dolt-health", "plugin-run", "zombie-scan"},
-	}
+	// The ratchet is empty and stays empty. mol-deacon-patrol's three orphans —
+	// the dolt-health -> zombie-scan -> plugin-run chain that dead-ended below
+	// health-scan — were sequenced into loop-or-exit for gastown-7ip, so all
+	// three names came off this list. Nothing may be added back: a new orphan is
+	// the defect this test exists to catch, not an entry to record here.
+	knownOrphans := map[string][]string{}
 
 	for _, name := range []string{"mol-deacon-patrol", "mol-witness-patrol", "mol-refinery-patrol"} {
 		t.Run(name, func(t *testing.T) {
