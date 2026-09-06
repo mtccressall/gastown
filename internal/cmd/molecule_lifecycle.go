@@ -379,6 +379,18 @@ func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, err
 	children, err := b.List(beads.ListOptions{
 		Parent: parentID,
 		Status: "all",
+		// Molecule steps are WISPS, and bd hides infra beads by default. Without
+		// this the listing returns zero children from a molecule that has open
+		// ones, this function takes its len==0 early return, and it reports
+		// (0, nil) -- nothing closed, NO ERROR -- while the caller goes on to
+		// close the parent. Every step is then orphaned under a closed root and
+		// nothing can ever close it.
+		//
+		// Measured before the fix, one closed dog-molecule root:
+		//   bd list --parent <root> --status=all                  -> 0 children
+		//   bd list --parent <root> --status=all --include-infra  -> 3 (2 OPEN)
+		// That leak ran at roughly 800-960 permanent open wisps per day (gt-qh0g).
+		IncludeInfra: true,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("listing children of %s: %w", parentID, err)

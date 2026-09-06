@@ -508,6 +508,16 @@ type ListOptions struct {
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
 	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
 	Rig        string // filter merge-request descriptions by rig before hydration
+
+	// IncludeInfra passes --include-infra, so the result includes infrastructure
+	// beads (wisps: molecule steps, mail, patrol records). bd HIDES these by
+	// default, and the omission leaves no trace in the output -- a query over a
+	// store holding thousands of them returns a well-formed empty list at rc=0.
+	//
+	// Set it whenever the answer must cover wisps. Leaving it false is correct
+	// only when you genuinely mean "permanent issues"; it is NOT a safe default
+	// for questions like "does this molecule still have open children" (gt-qh0g).
+	IncludeInfra bool
 }
 
 // CreateOptions specifies options for creating an issue.
@@ -1080,6 +1090,9 @@ func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.NoAssignee {
 		args = append(args, "--no-assignee")
+	}
+	if opts.IncludeInfra {
+		args = append(args, "--include-infra")
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
