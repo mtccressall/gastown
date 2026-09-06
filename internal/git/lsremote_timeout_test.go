@@ -21,56 +21,130 @@ import (
 //
 // Same reasoning as the canonical-assignee AST test that closed gt-7rne: pin the
 // invariant, not the instances.
+//
+// gastown-o8q moved the literal into `lsRemote`, the canonical read path that
+// carries the pass-scoped memo. That is exactly the change that would have made
+// this scan VACUOUS -- the call sites in git.go stopped mentioning "ls-remote",
+// so a scan of git.go alone would find zero sites and report zero unbounded
+// ones, which is the same green as a passing test. The scan now covers both
+// files AND asserts it found sites at all.
 func TestLsRemoteCallsAreBounded(t *testing.T) {
+	fset := token.NewFileSet()
+
+	var unbounded []string
+	scanned := 0
+
+	for _, file := range []string{"git.go", "remote_cache.go"} {
+		f, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+
+		// The literal now sits inside a composite literal that is an argument to
+		// the bounded call, so "is it a direct argument of a bounded call" no
+		// longer describes the shape. Collect the SOURCE RANGE of every bounded
+		// call, then ask whether each literal falls inside one. That is robust
+		// to how the argument list happens to be built, and it is a predicate
+		// with no hidden state to get wrong.
+		var boundedLo, boundedHi []token.Pos
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee := ""
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				callee = fn.Sel.Name
+			case *ast.Ident:
+				callee = fn.Name
+			}
+			switch callee {
+			case "runWithTimeout", "runWithEnvAndTimeout", "CommandContext":
+				boundedLo = append(boundedLo, call.Pos())
+				boundedHi = append(boundedHi, call.End())
+			}
+			return true
+		})
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING || !strings.Contains(lit.Value, "ls-remote") {
+				return true
+			}
+			scanned++
+			for i := range boundedLo {
+				if lit.Pos() >= boundedLo[i] && lit.End() <= boundedHi[i] {
+					return true
+				}
+			}
+			unbounded = append(unbounded, file+":"+itoa(fset.Position(lit.Pos()).Line))
+			return true
+		})
+	}
+
+	// The denominator. Without it a refactor that renames or relocates the
+	// literal turns this whole test into a scan that matched nothing, and a
+	// scan that matched nothing is indistinguishable from a scan that found
+	// nothing wrong. It has already fired once, on the gastown-o8q refactor
+	// that moved the literal into remote_cache.go.
+	if scanned == 0 {
+		t.Fatal("no ls-remote literal found in git.go or remote_cache.go; this scan " +
+			"is now vacuous. Point it at wherever the literal moved.")
+	}
+
+	if len(unbounded) > 0 {
+		t.Errorf("ls-remote invoked without a deadline at %d of %d site(s): %s\n"+
+			"A hung remote blocks these forever; the only bound would be the daemon's "+
+			"outer 5m dispatch deadline, which names no cause (gt-vkv9). "+
+			"Use runWithTimeout(remoteReadTimeout, ...) or exec.CommandContext.",
+			len(unbounded), scanned, strings.Join(unbounded, ", "))
+	}
+}
+
+// TestLsRemoteReadsRouteThroughCanonicalHelper is the other half of the same
+// invariant, and it is the one gastown-o8q needs: a read that spells the
+// subprocess out for itself is bounded but NOT memoized, so it silently
+// reintroduces the repeat round-trips the memo exists to remove.
+//
+// A bypass is by definition not a caller, so grepping for callers of lsRemote
+// cannot find one. This asserts the shape of the construction instead.
+func TestLsRemoteReadsRouteThroughCanonicalHelper(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "git.go", nil, parser.ParseComments)
 	if err != nil {
 		t.Fatalf("parse git.go: %v", err)
 	}
 
-	var unbounded []string
+	var direct []string
+	routed := 0
 	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-
-		// Does this call mention "ls-remote" as a literal argument?
-		mentionsLsRemote := false
-		for _, a := range call.Args {
-			if lit, ok := a.(*ast.BasicLit); ok && lit.Kind == token.STRING &&
-				strings.Contains(lit.Value, "ls-remote") {
-				mentionsLsRemote = true
+		switch node := n.(type) {
+		case *ast.BasicLit:
+			if node.Kind == token.STRING && strings.Contains(node.Value, "ls-remote") {
+				direct = append(direct, "git.go:"+itoa(fset.Position(node.Pos()).Line))
+			}
+		case *ast.CallExpr:
+			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "lsRemote" {
+				routed++
 			}
 		}
-		if !mentionsLsRemote {
-			return true
-		}
-
-		// It is bounded iff the callee is a timeout-carrying form.
-		callee := ""
-		switch fn := call.Fun.(type) {
-		case *ast.SelectorExpr:
-			callee = fn.Sel.Name
-		case *ast.Ident:
-			callee = fn.Name
-		}
-		switch callee {
-		case "runWithTimeout", "runWithEnvAndTimeout", "CommandContext":
-			return true
-		}
-
-		pos := fset.Position(call.Pos())
-		unbounded = append(unbounded, callee+" at git.go:"+itoa(pos.Line))
 		return true
 	})
 
-	if len(unbounded) > 0 {
-		t.Errorf("ls-remote invoked without a deadline at %d site(s): %s\n"+
-			"A hung remote blocks these forever; the only bound would be the daemon's "+
-			"outer 5m dispatch deadline, which names no cause (gt-vkv9). "+
-			"Use runWithTimeout(remoteReadTimeout, ...) or exec.CommandContext.",
-			len(unbounded), strings.Join(unbounded, ", "))
+	// Positive control: if git.go stopped calling lsRemote entirely, the
+	// zero-direct-invocations result above would be true and meaningless.
+	if routed == 0 {
+		t.Fatal("git.go calls lsRemote zero times; either the reads moved or this " +
+			"test is asserting an absence over an empty population")
+	}
+
+	if len(direct) > 0 {
+		t.Errorf("git.go invokes ls-remote directly at %d site(s) (%d routed correctly): %s\n"+
+			"Read-only ls-remote must go through (*Git).lsRemote so a scheduler pass "+
+			"memoizes it (gastown-o8q). A direct invocation is bounded but repeats the "+
+			"network round-trip once per caller.",
+			len(direct), routed, strings.Join(direct, ", "))
 	}
 }
 
