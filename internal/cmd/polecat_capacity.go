@@ -354,16 +354,6 @@ func polecatCapacityContributionFor(probe polecatCapacityProbe, sessions polecat
 	}
 }
 
-func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, activeWork *beads.Issue, sessions polecatSessionSet) {
-	contribution := polecatCapacityContributionFor(polecatCapacityProbe{
-		rigName:     rigName,
-		polecatName: polecatName,
-		fields:      fields,
-		activeWork:  activeWork,
-	}, sessions)
-	applyWorkstateDispositionToCapacitySnapshot(snapshot, contribution.state, contribution.disposition)
-}
-
 func applyWorkstateDispositionToCapacitySnapshot(snapshot *polecatCapacitySnapshot, state polecat.State, disposition polecat.WorkstateDisposition) {
 	if disposition.ReuseStatus == "idle-pr-open" {
 		snapshot.addPendingMR()

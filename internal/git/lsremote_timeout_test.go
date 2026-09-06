@@ -33,27 +33,25 @@ func TestLsRemoteCallsAreBounded(t *testing.T) {
 
 	var unbounded []string
 	scanned := 0
-	inspect := func(file string, f *ast.File) {
+
+	for _, file := range []string{"git.go", "remote_cache.go"} {
+		f, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+
+		// The literal now sits inside a composite literal that is an argument to
+		// the bounded call, so "is it a direct argument of a bounded call" no
+		// longer describes the shape. Collect the SOURCE RANGE of every bounded
+		// call, then ask whether each literal falls inside one. That is robust
+		// to how the argument list happens to be built, and it is a predicate
+		// with no hidden state to get wrong.
+		var boundedLo, boundedHi []token.Pos
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
-
-			// Does this call mention "ls-remote" as a literal argument?
-			mentionsLsRemote := false
-			for _, a := range call.Args {
-				if lit, ok := a.(*ast.BasicLit); ok && lit.Kind == token.STRING &&
-					strings.Contains(lit.Value, "ls-remote") {
-					mentionsLsRemote = true
-				}
-			}
-			if !mentionsLsRemote {
-				return true
-			}
-			scanned++
-
-			// It is bounded iff the callee is a timeout-carrying form.
 			callee := ""
 			switch fn := call.Fun.(type) {
 			case *ast.SelectorExpr:
@@ -63,29 +61,35 @@ func TestLsRemoteCallsAreBounded(t *testing.T) {
 			}
 			switch callee {
 			case "runWithTimeout", "runWithEnvAndTimeout", "CommandContext":
-				return true
+				boundedLo = append(boundedLo, call.Pos())
+				boundedHi = append(boundedHi, call.End())
 			}
-
-			pos := fset.Position(call.Pos())
-			unbounded = append(unbounded, callee+" at "+file+":"+itoa(pos.Line))
 			return true
 		})
-	}
 
-	for _, file := range []string{"git.go", "remote_cache.go"} {
-		f, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
-		if err != nil {
-			t.Fatalf("parse %s: %v", file, err)
-		}
-		inspect(file, f)
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING || !strings.Contains(lit.Value, "ls-remote") {
+				return true
+			}
+			scanned++
+			for i := range boundedLo {
+				if lit.Pos() >= boundedLo[i] && lit.End() <= boundedHi[i] {
+					return true
+				}
+			}
+			unbounded = append(unbounded, file+":"+itoa(fset.Position(lit.Pos()).Line))
+			return true
+		})
 	}
 
 	// The denominator. Without it a refactor that renames or relocates the
 	// literal turns this whole test into a scan that matched nothing, and a
 	// scan that matched nothing is indistinguishable from a scan that found
-	// nothing wrong.
+	// nothing wrong. It has already fired once, on the gastown-o8q refactor
+	// that moved the literal into remote_cache.go.
 	if scanned == 0 {
-		t.Fatal("no ls-remote invocation found in git.go or remote_cache.go; this scan " +
+		t.Fatal("no ls-remote literal found in git.go or remote_cache.go; this scan " +
 			"is now vacuous. Point it at wherever the literal moved.")
 	}
 
@@ -112,30 +116,35 @@ func TestLsRemoteReadsRouteThroughCanonicalHelper(t *testing.T) {
 		t.Fatalf("parse git.go: %v", err)
 	}
 
-	var bypasses []string
+	var direct []string
+	routed := 0
 	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		for _, a := range call.Args {
-			lit, ok := a.(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING || !strings.Contains(lit.Value, "ls-remote") {
-				continue
+		switch node := n.(type) {
+		case *ast.BasicLit:
+			if node.Kind == token.STRING && strings.Contains(node.Value, "ls-remote") {
+				direct = append(direct, "git.go:"+itoa(fset.Position(node.Pos()).Line))
 			}
-			pos := fset.Position(call.Pos())
-			bypasses = append(bypasses, "git.go:"+itoa(pos.Line))
-			break
+		case *ast.CallExpr:
+			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "lsRemote" {
+				routed++
+			}
 		}
 		return true
 	})
 
-	if len(bypasses) > 0 {
-		t.Errorf("git.go invokes ls-remote directly at %d site(s): %s\n"+
+	// Positive control: if git.go stopped calling lsRemote entirely, the
+	// zero-direct-invocations result above would be true and meaningless.
+	if routed == 0 {
+		t.Fatal("git.go calls lsRemote zero times; either the reads moved or this " +
+			"test is asserting an absence over an empty population")
+	}
+
+	if len(direct) > 0 {
+		t.Errorf("git.go invokes ls-remote directly at %d site(s) (%d routed correctly): %s\n"+
 			"Read-only ls-remote must go through (*Git).lsRemote so a scheduler pass "+
 			"memoizes it (gastown-o8q). A direct invocation is bounded but repeats the "+
 			"network round-trip once per caller.",
-			len(bypasses), strings.Join(bypasses, ", "))
+			len(direct), routed, strings.Join(direct, ", "))
 	}
 }
 
