@@ -90,10 +90,25 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. Debug with: `BD_DEBUG_R
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool bugs, features) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool bugs, features) | **gastown** | `bd create --repo gastown "..."` |
-| Dog/deacon/patrol code | **gastown** | `bd create --repo gastown "..."` |
-| Cross-rig coordination | **HQ** | `bd create "..."` (default) |
+| `bd` CLI (beads tool bugs, features) | **beadsrig** | `bd -C {{ .TownRoot }}/beadsrig create "..."` |
+| `gt` CLI (gas town tool bugs, features) | **gastown** | `bd -C {{ .TownRoot }}/gastown create "..."` |
+| Dog/deacon/patrol code | **gastown** | `bd -C {{ .TownRoot }}/gastown create "..."` |
+| Cross-rig coordination | **HQ** | `bd -C {{ .TownRoot }} create "..."` |
+
+Rig directory names come from `{{ cmd }} rig list`. There is no rig named `beads`.
+
+**Never use `bd create --repo <name>`.** A bare name is not resolved as a rig name. `bd`
+treats it as a path relative to your cwd, SILENTLY CREATES a beads store there, files the
+bead into it, and prints a normal `Created issue: ...` line. That bead is then invisible to
+every real store. `-C` cannot do this: a wrong path fails loudly with
+`cannot use -C directory ...: no such file or directory`.
+
+**Read the bead back before you cite its id.** A create that succeeded and a show that
+fails is the only signal this defect produces:
+
+```bash
+id=$(bd -C {{ .TownRoot }}/gastown create "..." --silent) && bd -C {{ .TownRoot }}/gastown show "$id"
+```
 
 ## Key Commands
 
