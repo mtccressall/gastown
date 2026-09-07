@@ -1289,6 +1289,153 @@ func (c *BareRepoRefspecCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
+// MayorRigRefspecCheck verifies the mayor rig can resolve origin/<branch> for
+// branches other than the one it was cloned at.
+//
+// The mayor rig is a NON-BARE `git clone --single-branch`, so git writes the
+// restricted refspec +refs/heads/<branch>:refs/remotes/origin/<branch> and
+// nothing widens it. BareRepoRefspecCheck cannot see this: it only inspects
+// .repo.git, which is bare and therefore correct. That blind spot is why the
+// defect shipped — every bare-backed worktree in the town was fine and only the
+// four mayor rigs, the one role whose job is judging branch divergence, were
+// stranded on origin/main (gastown-rxl).
+//
+// New rigs are provisioned correctly as of the git.setWildcardRefspec fix; this
+// check repairs rigs provisioned before it.
+type MayorRigRefspecCheck struct {
+	FixableCheck
+}
+
+// NewMayorRigRefspecCheck creates a new mayor rig refspec check.
+func NewMayorRigRefspecCheck() *MayorRigRefspecCheck {
+	return &MayorRigRefspecCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "mayor-rig-refspec",
+				CheckDescription: "Verify mayor rig can resolve branches other than the default",
+				CheckCategory:    CategoryRig,
+			},
+		},
+	}
+}
+
+// mayorRigRefspecTarget returns the mayor rig path if it is a clone worth
+// checking, or "" when there is nothing to inspect.
+func mayorRigRefspecTarget(ctx *CheckContext) string {
+	if ctx.RigName == "" {
+		return ""
+	}
+	mayorRig := filepath.Join(ctx.RigPath(), "mayor", "rig")
+	if _, err := os.Stat(filepath.Join(mayorRig, ".git")); err != nil {
+		return ""
+	}
+	return mayorRig
+}
+
+// populatesOriginWildcard reports whether one refspec makes `git fetch` create
+// refs/remotes/origin/<branch> for every branch on the remote.
+//
+// It matches source AND destination, not merely "contains refs/heads/*": a
+// refspec like +refs/heads/*:refs/heads/* is a wildcard that leaves origin/*
+// empty, which is precisely the state this check exists to detect. The leading
+// + is optional because a non-forced refspec still populates the tracking refs.
+func populatesOriginWildcard(spec string) bool {
+	return strings.TrimPrefix(strings.TrimSpace(spec), "+") == "refs/heads/*:refs/remotes/origin/*"
+}
+
+// hasWildcardRefspec reports whether any configured fetch refspec populates
+// refs/remotes/origin/*, and returns every configured refspec for reporting.
+//
+// It reads --get-all: the documented hand repair for this defect adds the
+// wildcard alongside the restricted line rather than replacing it, and such a
+// rig is healthy. `git config --get` returns only the LAST value, so a rig whose
+// wildcard is not last would be reported broken.
+func hasWildcardRefspec(repoPath string) (bool, []string) {
+	cmd := exec.Command("git", "-C", repoPath, "config", "--get-all", "remote.origin.fetch")
+	out, err := cmd.Output()
+	if err != nil {
+		return false, nil
+	}
+	var specs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		specs = append(specs, line)
+	}
+	for _, spec := range specs {
+		if populatesOriginWildcard(spec) {
+			return true, specs
+		}
+	}
+	return false, specs
+}
+
+// Run checks whether the mayor rig has a wildcard fetch refspec.
+func (c *MayorRigRefspecCheck) Run(ctx *CheckContext) *CheckResult {
+	mayorRig := mayorRigRefspecTarget(ctx)
+	if mayorRig == "" {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No mayor rig clone found, skipping refspec check",
+		}
+	}
+
+	ok, specs := hasWildcardRefspec(mayorRig)
+	if ok {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "Mayor rig refspec configured correctly",
+		}
+	}
+
+	current := "(unset)"
+	if len(specs) > 0 {
+		current = strings.Join(specs, ", ")
+	}
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusWarning,
+		Message: "Mayor rig can only resolve its default branch",
+		Details: []string{
+			fmt.Sprintf("Current: %s", current),
+			fmt.Sprintf("Expected to contain: %s", "+refs/heads/*:refs/remotes/origin/*"),
+			"Without a wildcard refspec 'git fetch origin <branch>' exits 0, prints nothing,",
+			"and leaves the tracking ref absent — so merge-base, 'origin/<branch>..HEAD' and",
+			"staleness judgements in this rig are silently wrong.",
+		},
+		FixHint: "Run 'gt doctor --fix' to widen the refspec",
+	}
+}
+
+// Fix adds the wildcard refspec to the mayor rig.
+//
+// It ADDS rather than sets, so a rig carrying a hand-added wildcard alongside
+// the restricted line is left alone, and no ref that resolved before stops
+// resolving. It does not fetch: creating the new tracking refs is a network
+// operation the caller can run when it wants them.
+func (c *MayorRigRefspecCheck) Fix(ctx *CheckContext) error {
+	mayorRig := mayorRigRefspecTarget(ctx)
+	if mayorRig == "" {
+		return nil
+	}
+	if ok, _ := hasWildcardRefspec(mayorRig); ok {
+		return nil
+	}
+
+	cmd := exec.Command("git", "-C", mayorRig, "config", "--add",
+		"remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("adding mayor rig refspec: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // DefaultBranchExistsCheck verifies that the configured default_branch exists
 // as a remote tracking ref in the bare repo.
 type DefaultBranchExistsCheck struct {
@@ -2055,6 +2202,7 @@ func RigChecks() []Check {
 		NewHooksPathConfiguredCheck(),
 		NewBareRepoExistsCheck(),
 		NewBareRepoRefspecCheck(),
+		NewMayorRigRefspecCheck(),
 		NewDefaultBranchExistsCheck(),
 		NewWitnessExistsCheck(),
 		NewRefineryExistsCheck(),
