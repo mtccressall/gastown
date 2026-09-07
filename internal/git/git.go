@@ -690,6 +690,14 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 		// fetching all branches (which would defeat the purpose of --single-branch).
 		return configureRefspec(dest, opts.singleBranch)
 	}
+	// Non-bare clones need the wildcard refspec too. --single-branch leaves the
+	// restricted refspec behind, stranding the checkout on origin/<branch>
+	// forever (gastown-rxl). Config only, no fetch: the clone already created
+	// refs/remotes/origin/<branch>, and a --depth 1 fetch would shallow a
+	// partial (depth 0) clone and break the ancestry queries this exists for.
+	if err := setWildcardRefspec(dest); err != nil {
+		return err
+	}
 	// Configure hooks path for Gas Town clones
 	if err := configureHooksPath(dest); err != nil {
 		return err
@@ -790,6 +798,44 @@ func (g *Git) ConfigureHooksPath() error {
 	return configureHooksPath(g.workDir)
 }
 
+// wildcardRefspec makes `git fetch` populate refs/remotes/origin/* for every
+// branch on the remote. It is what git writes for an ordinary clone.
+const wildcardRefspec = "+refs/heads/*:refs/remotes/origin/*"
+
+// resolveGitDir returns the git directory for repoPath, handling both bare
+// repos (repoPath itself) and normal clones (repoPath/.git).
+func resolveGitDir(repoPath string) string {
+	gitDir := repoPath
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
+		gitDir = filepath.Join(repoPath, ".git")
+	}
+	return filepath.Clean(gitDir)
+}
+
+// setWildcardRefspec sets remote.origin.fetch to wildcardRefspec.
+//
+// `git clone --single-branch` writes the restricted refspec
+// +refs/heads/<branch>:refs/remotes/origin/<branch> and nothing ever widens it,
+// so such a checkout can only ever resolve origin/<branch>. `git fetch origin
+// <other>` then exits 0, prints nothing, and leaves the tracking ref absent —
+// every merge-base, `origin/<other>..HEAD` and staleness judgement made there is
+// silently wrong (gastown-rxl).
+//
+// This sets rather than adds, replacing the restricted refspec with a superset,
+// so nothing that resolved before stops resolving.
+func setWildcardRefspec(repoPath string) error {
+	gitDir := resolveGitDir(repoPath)
+
+	var stderr bytes.Buffer
+	cmd := exec.Command("git", "--git-dir", gitDir, "config", "remote.origin.fetch", wildcardRefspec)
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // configureRefspec sets remote.origin.fetch to the standard refspec for bare repos.
 // Bare clones don't have this set by default, which breaks worktrees that need to
 // fetch and see origin/* refs. Without this, `git fetch` only updates FETCH_HEAD
@@ -800,20 +846,13 @@ func (g *Git) ConfigureHooksPath() error {
 // branches. This prevents failures on repos with many branches where a full fetch
 // would error with "some local refs could not be updated".
 func configureRefspec(repoPath string, singleBranch bool) error {
-	gitDir := repoPath
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
-		gitDir = filepath.Join(repoPath, ".git")
+	gitDir := resolveGitDir(repoPath)
+
+	if err := setWildcardRefspec(repoPath); err != nil {
+		return err
 	}
-	gitDir = filepath.Clean(gitDir)
 
 	var stderr bytes.Buffer
-	configCmd := exec.Command("git", "--git-dir", gitDir, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
-	util.SetDetachedProcessGroup(configCmd)
-	configCmd.Stderr = &stderr
-	if err := configCmd.Run(); err != nil {
-		return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
-	}
-
 	// Empty remotes clone successfully but have no refs to fetch. Let callers
 	// perform their own empty-repository validation instead of returning a
 	// misleading "couldn't find remote ref" error from the fetch below.
