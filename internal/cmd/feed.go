@@ -3,11 +3,16 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/krc"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/tui/feed"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -226,7 +231,102 @@ func runFeedDirect(townRoot string) error {
 		Rig:    feedRig,
 	}
 
-	return feed.PrintGtEvents(townRoot, opts)
+	// DISCLOSE THE RETENTION WINDOW AT THE POINT OF READING (gastown-yu4).
+	//
+	// .events.jsonl is pruned per row at a per type TTL, so every event type
+	// has its own horizon and they differ by an order of magnitude in one
+	// file. Nothing in the feed's output said so, and the obvious sanity
+	// check -- the first line of the file -- is correct for a 30d type and
+	// wrong for a 3d one. Print the horizon of whatever is being shown.
+	//
+	// Printed at BOTH ends when not following, because head always keeps the
+	// first line and tail always keeps the last, so a marker at each end
+	// survives any truncation by construction. In follow mode there is no
+	// end, so the header is all there can be.
+	banner := feedRetentionBanner(townRoot, feedType)
+	if banner != "" {
+		fmt.Println(banner)
+	}
+
+	if err := feed.PrintGtEvents(townRoot, opts); err != nil {
+		return err
+	}
+
+	if banner != "" && !shouldFollow {
+		fmt.Println(banner)
+	}
+	return nil
+}
+
+// feedRetentionBanner describes how far back the events file actually reaches.
+//
+// Filtered to one type, it names that type's TTL and oldest surviving row.
+// Unfiltered, it says plainly that horizons differ per type and points at the
+// command that prints the table. It returns "" rather than an error on any
+// failure: a feed read must not break because the window could not be measured.
+func feedRetentionBanner(townRoot, eventType string) string {
+	config, err := krc.LoadConfig(townRoot)
+	if err != nil {
+		return ""
+	}
+	w, err := krc.ScanFileWindow(filepath.Join(townRoot, events.EventsFile), config, time.Now())
+	if err != nil || !w.Exists || w.FirstRow.IsZero() {
+		return ""
+	}
+
+	head := fmt.Sprintf("%s (type %q)", w.FirstRow.UTC().Format(time.RFC3339), w.FirstRowType)
+
+	if eventType != "" {
+		ttl := krcFormatDuration(config.GetTTL(eventType))
+		t := w.Type(eventType)
+		if t == nil {
+			return style.Dim.Render(fmt.Sprintf(
+				"retention: type %q has TTL %s and no surviving rows in .events.jsonl. "+
+					"The file's own first row is %s, which is not this type's horizon.",
+				eventType, ttl, head))
+		}
+
+		oldest := t.Oldest.UTC().Format(time.RFC3339)
+		reach := krcFormatDuration(t.Reach)
+
+		// Two different things can set a horizon, and conflating them is the
+		// mirror of the error this banner exists to fix: a type under its TTL
+		// has had nothing pruned, so its reach is where its data starts and
+		// says nothing about the TTL.
+		cause := fmt.Sprintf("has TTL %s and has not reached it, so %s is where this "+
+			"type's data starts rather than where pruning cut", ttl, oldest)
+		if t.TTLBound {
+			cause = fmt.Sprintf("has TTL %s and is being pruned at it, so %s is a "+
+				"ceiling rather than a start", ttl, oldest)
+		}
+
+		// For the head type the file head IS the horizon. Claiming otherwise
+		// would be the same false statement pointed the other way.
+		contrast := fmt.Sprintf("The file's own first row is %s, which is NOT this "+
+			"type's horizon.", head)
+		if w.IsHeadType(t) {
+			contrast = "This type's oldest row is also the file's first row, so here " +
+				"the two agree -- they do not for shorter-lived types."
+		}
+
+		return style.Dim.Render(fmt.Sprintf(
+			"retention: type %q %s. A %q census reaches back %s. %s",
+			eventType, cause, eventType, reach, contrast))
+	}
+
+	spread := ""
+	if shortest, ok := w.ShortestReach(); ok {
+		if longest, ok2 := w.LongestReach(); ok2 {
+			spread = fmt.Sprintf(" Horizons here run %s (%s) to %s (%s).",
+				krcFormatDuration(shortest.Reach), shortest.EventType,
+				krcFormatDuration(longest.Reach), longest.EventType)
+		}
+	}
+	return style.Dim.Render(fmt.Sprintf(
+		"retention: .events.jsonl is pruned per row at a per type TTL, so each event type has "+
+			"its OWN horizon.%s The file's own first row is %s and is not the horizon for any "+
+			"other type. Run 'gt krc window' for the per-type table.",
+		spread, head))
 }
 
 // runFeedTUI runs the interactive TUI feed.

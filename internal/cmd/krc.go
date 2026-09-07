@@ -30,6 +30,7 @@ Examples:
   gt krc stats              # Show event statistics
   gt krc prune              # Remove expired events
   gt krc prune --dry-run    # Preview what would be pruned
+  gt krc window             # Real retention horizon per event type
   gt krc config             # Show TTL configuration
   gt krc config set patrol_* 12h   # Set TTL for patrol events`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -128,11 +129,33 @@ var krcAutoPruneStatusCmd = &cobra.Command{
 	RunE: runKrcAutoPruneStatus,
 }
 
+var krcWindowCmd = &cobra.Command{
+	Use:   "window",
+	Short: "Show the real retention horizon of every event type",
+	Long: `Show how far back the event files actually reach, per event type.
+
+.events.jsonl and .feed.jsonl are pruned PER ROW at a PER TYPE TTL. That is not
+a prefix cut: after a prune pass the surviving rows of every type interleave
+exactly as before and the file's head is untouched. So the first line of the
+file reports the horizon of its own (long-TTL) type and nothing else, while a
+3d type reaches back only three days in the same file.
+
+This command prints, per type, the configured TTL beside the OLDEST SURVIVING
+ROW of that type, next to the file's own first timestamp -- so a census cannot
+silently span mismatched horizons.
+
+Examples:
+  gt krc window            # per-type horizons for both event files
+  gt krc window --json     # machine-readable`,
+	RunE: runKrcWindow,
+}
+
 var (
 	krcPruneDryRun bool
 	krcPruneAuto   bool
 	krcStatsJSON   bool
 	krcDecayJSON   bool
+	krcWindowJSON  bool
 )
 
 func init() {
@@ -142,6 +165,7 @@ func init() {
 	krcCmd.AddCommand(krcConfigCmd)
 	krcCmd.AddCommand(krcDecayCmd)
 	krcCmd.AddCommand(krcAutoPruneStatusCmd)
+	krcCmd.AddCommand(krcWindowCmd)
 	krcConfigCmd.AddCommand(krcConfigSetCmd)
 	krcConfigCmd.AddCommand(krcConfigResetCmd)
 
@@ -149,6 +173,7 @@ func init() {
 	krcPruneCmd.Flags().BoolVar(&krcPruneAuto, "auto", false, "Daemon mode: only prune if PruneInterval has elapsed")
 	krcStatsCmd.Flags().BoolVar(&krcStatsJSON, "json", false, "Output in JSON format")
 	krcDecayCmd.Flags().BoolVar(&krcDecayJSON, "json", false, "Output in JSON format")
+	krcWindowCmd.Flags().BoolVar(&krcWindowJSON, "json", false, "Output in JSON format")
 }
 
 func runKrcStats(cmd *cobra.Command, args []string) error {
@@ -631,4 +656,140 @@ func runKrcAutoPruneStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// runKrcWindow prints the real retention horizon of every event type.
+//
+// The whole point of this command is the contradiction it prints: the file's
+// own first timestamp says one thing and a short-TTL type's oldest surviving
+// row says something an order of magnitude different, in the same file. Both
+// numbers appear together so a reader cannot take the first for the second.
+func runKrcWindow(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	config, err := krc.LoadConfig(townRoot)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	windows, err := krc.GetWindows(townRoot, config, time.Now())
+	if err != nil {
+		return fmt.Errorf("scanning event files: %w", err)
+	}
+
+	if krcWindowJSON {
+		data, err := json.MarshalIndent(windows, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
+	}
+
+	fmt.Println(style.Bold.Render("Event Retention Window"))
+	fmt.Println()
+	fmt.Println(style.Dim.Render("Rows are pruned per row at a per type TTL, not by a prefix cut, so the"))
+	fmt.Println(style.Dim.Render("file's head survives while each type reaches back only as far as its own"))
+	fmt.Println(style.Dim.Render("oldest surviving row. REACH is that row's age: the real horizon of a"))
+	fmt.Println(style.Dim.Render("census of that type; LIMITED BY says whether the pruner set it or the"))
+	fmt.Println(style.Dim.Render("type's own data simply starts there. Timestamps are UTC."))
+
+	for _, w := range windows {
+		fmt.Println()
+		printKrcFileWindow(w)
+	}
+
+	return nil
+}
+
+func printKrcFileWindow(w *krc.FileWindow) {
+	fmt.Println(style.Bold.Render(w.Path))
+
+	if !w.Exists {
+		fmt.Printf("  %s\n", style.Dim.Render("file does not exist"))
+		return
+	}
+	if w.RowCount == 0 {
+		fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("%s, no rows", formatBytes(w.Size))))
+		return
+	}
+
+	fmt.Printf("  %s, %d rows", formatBytes(w.Size), w.RowCount)
+	if w.Unparsable > 0 {
+		fmt.Printf(" (%d unparsable, excluded below)", w.Unparsable)
+	}
+	fmt.Println()
+
+	if w.FirstRow.IsZero() {
+		fmt.Printf("  %s\n", style.Warning.Render("no row carried a parsable type and timestamp"))
+		return
+	}
+
+	// The number a reader gets from `head -1`, stated so the table below can
+	// contradict it explicitly rather than by implication.
+	fmt.Printf("  First row in file:  %s  (%s ago, type %q)\n",
+		w.FirstRow.UTC().Format(time.RFC3339),
+		krcFormatDuration(w.FirstRowAge),
+		w.FirstRowType)
+
+	shortest, okS := w.ShortestReach()
+	longest, okL := w.LongestReach()
+	if okS && okL {
+		spread := ""
+		if shortest.Reach > 0 {
+			spread = fmt.Sprintf("   spread %.1fx", float64(longest.Reach)/float64(shortest.Reach))
+		}
+		fmt.Printf("  Real horizons:      %s (%s) .. %s (%s)%s\n",
+			krcFormatDuration(shortest.Reach), shortest.EventType,
+			krcFormatDuration(longest.Reach), longest.EventType,
+			spread)
+	}
+	fmt.Println()
+
+	fmt.Printf("  %-26s %-6s %-8s %-22s %-8s %-10s %s\n",
+		"TYPE", "TTL", "COUNT", "OLDEST SURVIVING ROW", "REACH", "LIMITED BY", "VS FILE HEAD")
+	fmt.Printf("  %-26s %-6s %-8s %-22s %-8s %-10s %s\n",
+		strings.Repeat("-", 26), "-----", "-------", strings.Repeat("-", 22), "-------", "---------", "------------")
+
+	for i := range w.Types {
+		t := w.Types[i]
+
+		// LIMITED BY separates the two reasons a horizon can be short, which
+		// REACH alone cannot distinguish. "prune" means the pruner is cutting
+		// this type and REACH is its real ceiling. "data" means nothing has
+		// been pruned yet and REACH is only where this type's rows begin --
+		// so it neither confirms nor refutes the TTL beside it.
+		limitedBy := style.Dim.Render("data")
+		if t.TTLBound {
+			limitedBy = "prune"
+		}
+
+		vs := ""
+		switch {
+		case w.IsHeadType(&t):
+			// For this one type the file head IS the horizon. Saying otherwise
+			// would be the same false claim in the opposite direction.
+			vs = style.Dim.Render("is the head")
+		case w.FirstRowAge > t.Reach:
+			vs = fmt.Sprintf("-%s", krcFormatDuration(w.FirstRowAge-t.Reach))
+			// A type seeing less than half of what the file head advertises,
+			// and cut by the pruner rather than by its own start date, is the
+			// case this command exists for. Say so on the row itself.
+			if t.TTLBound && t.Reach > 0 && t.Reach*2 <= w.FirstRowAge {
+				vs = style.Warning.Render(vs + "  ⚠ head is not this type's horizon")
+			}
+		}
+
+		fmt.Printf("  %-26s %-6s %-8d %-22s %-8s %-10s %s\n",
+			t.EventType,
+			krcFormatDuration(t.TTL),
+			t.Count,
+			t.Oldest.UTC().Format(time.RFC3339),
+			krcFormatDuration(t.Reach),
+			limitedBy,
+			vs)
+	}
 }
