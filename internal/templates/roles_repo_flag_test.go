@@ -14,10 +14,19 @@ import (
 //
 // A path-like value (contains / or ~ or starts with .) keeps bd's native --repo
 // semantics against an existing store and is not matched here.
-// The trailing quote-or-end-of-line requirement keeps the detector on runnable
-// commands: prose that merely mentions the flag ("removes a bd create --repo alias
-// from argv") is followed by another word and does not match.
-var bdCreateRepoAliasRe = regexp.MustCompile(`(?m)bd\s+create\s+[^\n]*--repo[= ]+([A-Za-z0-9_-]+)\s*(?:["'` + "`" + `]|$)`)
+//
+// The terminator set keeps the detector on runnable commands and off prose. A
+// prescription ends the bare value with a quote, the end of the line, or the next
+// option's leading dash; prose that merely mentions the flag ("removes a bd create
+// --repo alias from argv") continues with another bare word and does not match.
+// Plain whitespace is deliberately NOT a terminator: it would match that prose,
+// and TestBdCreateRepoAliasRe_Discriminates fails if it is widened that far.
+//
+// The set is deliberate and not exhaustive. A prescription that terminates the
+// value with a shell operator (`bd create --repo beads && ...`) is still missed;
+// no template uses that form today. Trailing OPTIONS are the common shape and are
+// covered (gastown-qs7).
+var bdCreateRepoAliasRe = regexp.MustCompile(`(?m)bd\s+create\s+[^\n]*--repo[= ]+([A-Za-z0-9_-]+)(?:\s+-|\s*(?:["'` + "`" + `]|$))`)
 
 // TestRoleTemplates_NoBareRepoAliasPrescription pins the invariant rather than the
 // instance: no role template may hand an agent a bd create --repo <bare-name>
@@ -74,6 +83,12 @@ func TestBdCreateRepoAliasRe_Discriminates(t *testing.T) {
 		"bd create --repo gastown \"x\"",
 		"bd create --repo=hq \"x\"",
 		"bd create --title=\"t\" --repo beads",
+		// gastown-qs7: option order is unrestricted, so the bare alias is at least
+		// as likely to be followed by another flag as by a quoted title. These are
+		// runnable, hit the phantom-store path, and used to pass the invariant.
+		"bd create --repo beads --title=\"bug\"",
+		"bd create --repo beads -t bug",
+		"bd create --repo gastown -p 2 -t bug \"phantom\"",
 	}
 	mustNotMatch := []string{
 		"bd -C /test/town/beadsrig create \"...\"",
