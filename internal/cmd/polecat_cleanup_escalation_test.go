@@ -136,7 +136,15 @@ func TestCapacitySnapshotUsesReconciledDisposition(t *testing.T) {
 	}
 
 	snapshot := polecatCapacitySnapshot{Max: 4}
-	applyAgentFieldsToCapacitySnapshot(&snapshot, "liveop", "chrome", nil, nil, nil)
+	// The scheduler reaches the reconciler through resolvePolecatCapacityContributions
+	// (gastown-o8q made the walk parallel). Pin the invariant on THAT path: a
+	// test aimed at a wrapper the scheduler no longer calls is the same green
+	// test beside a live bypass this bead exists to prevent.
+	for _, c := range resolvePolecatCapacityContributions([]polecatCapacityProbe{{
+		rigName: "liveop", polecatName: "chrome",
+	}}, nil) {
+		applyWorkstateDispositionToCapacitySnapshot(&snapshot, c.state, c.disposition)
+	}
 
 	if calls != 1 {
 		t.Fatalf("capacity path called the reconciler %d times, want exactly 1 — it is reading item.Disposition directly (gt-b3a2)", calls)

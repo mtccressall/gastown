@@ -99,6 +99,7 @@ func (g *Git) run(args ...string) (string, error) {
 	if err := g.guardUnsafeTownRootMutation(args); err != nil {
 		return "", err
 	}
+	maybeInvalidateRemoteRefCache(args)
 
 	// If gitDir is set (bare repo), prepend --git-dir flag
 	if g.gitDir != "" {
@@ -147,6 +148,7 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	if err := g.guardUnsafeTownRootMutation(args); err != nil {
 		return "", err
 	}
+	maybeInvalidateRemoteRefCache(args)
 
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
@@ -1800,7 +1802,7 @@ type RemoteRef struct {
 // The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
 // Returns full ref names like "refs/heads/polecat/furiosa-abc123".
 func (g *Git) ListRemoteRefsWithHashes(remote, prefix string) ([]RemoteRef, error) {
-	out, err := g.runWithTimeout(remoteReadTimeout, "ls-remote", "--refs", remote, prefix+"*")
+	out, err := g.lsRemote("--refs", remote, prefix+"*")
 	if err != nil {
 		return nil, err
 	}
@@ -1839,7 +1841,7 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 // includes tags so callers can distinguish a truly empty repo from a non-empty
 // repo with no branch refs or a broken remote HEAD.
 func (g *Git) RemoteHasRefs(remote string) (bool, error) {
-	out, err := g.runWithTimeout(remoteReadTimeout, "ls-remote", "--refs", remote)
+	out, err := g.lsRemote("--refs", remote)
 	if err != nil {
 		return false, err
 	}
@@ -2046,7 +2048,7 @@ func (g *Git) IsEmpty() (bool, error) {
 // NOTE: For named remotes with a separate pushurl, this checks the fetch URL.
 // Use PushRemoteBranchExists to verify branches that were pushed.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
-	out, err := g.runWithTimeout(remoteReadTimeout, "ls-remote", "--heads", remote, branch)
+	out, err := g.lsRemote("--heads", remote, branch)
 	if err != nil {
 		return false, err
 	}
@@ -2056,7 +2058,7 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 // RemoteBranchTip returns the SHA at refs/heads/<branch> on the remote.
 // An empty SHA with nil error means the branch is missing.
 func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
-	out, err := g.runWithTimeout(remoteReadTimeout, "ls-remote", "--heads", remote, branch)
+	out, err := g.lsRemote("--heads", remote, branch)
 	if err != nil {
 		return "", err
 	}
@@ -2073,7 +2075,7 @@ func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 	if pushTarget == remote {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.runWithTimeout(remoteReadTimeout, "ls-remote", "--heads", pushTarget, branch)
+	out, err := g.lsRemote("--heads", pushTarget, branch)
 	if err != nil {
 		return false, err
 	}
@@ -3574,16 +3576,17 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 		}
 	}
 
-	// Fallback: network query via ls-remote.
-	// Bounded like every other remote read: this one bypasses g.run entirely, so
-	// it inherits no guard from there and needs its own context (gt-vkv9).
+	// Fallback: network query via ls-remote, through the canonical read path so
+	// it inherits both the deadline (gt-vkv9) and the pass-scoped memo
+	// (gastown-o8q). It used to build its own exec.CommandContext, which was
+	// bounded but invisible to everything else -- and a second read path is how
+	// a guard added in one place quietly fails to cover the other.
+	//
+	// `--exit-code` is what carries the answer: git exits non-zero when nothing
+	// matched, so a nil error means the ref exists.
+	sub := NewGit(submodulePath)
 	for _, candidate := range []string{"main", "master"} {
-		ctx, cancel := context.WithTimeout(context.Background(), remoteReadTimeout)
-		check := exec.CommandContext(ctx, "git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
-		util.SetDetachedProcessGroup(check)
-		err := check.Run()
-		cancel()
-		if err == nil {
+		if _, err := sub.lsRemote("--exit-code", remote, "refs/heads/"+candidate); err == nil {
 			return candidate, nil
 		}
 	}

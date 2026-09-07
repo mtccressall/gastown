@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -194,6 +195,20 @@ func buildSchedulerDispatchPlan(townRoot string, batchOverride int, cleanup bool
 // dispatchScheduledWork is the main dispatch loop for the capacity scheduler.
 // Called by both `gt scheduler run` and the daemon heartbeat.
 func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun bool) (int, error) {
+	// One memo window for the whole pass. A pass builds the capacity snapshot
+	// more than once -- planning builds one, admission control builds another
+	// inside dispatchSingleBead -- and each walk asks the remote about every
+	// polecat's branch. Measured: the same `ls-remote --heads origin
+	// polecat/<name>/<bead>` fired three times in one pass (gastown-o8q).
+	//
+	// Serving one answer to all of them is what the pass already assumes: a
+	// capacity snapshot is a point-in-time read of a moving system, and the
+	// consumers inside one pass are entitled to the same point in time. The
+	// pass itself pushes nothing, and any git command that could change a
+	// remote drops the memo anyway.
+	git.BeginRemoteRefCache()
+	defer git.EndRemoteRefCache()
+
 	if dryRun {
 		dispatchPlan, err := buildSchedulerDispatchPlan(townRoot, batchOverride, false)
 		if err != nil {
@@ -980,8 +995,21 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	queried := make(map[string]bool)
 	for _, dir := range dirs {
 		beadsDir := beads.ResolveBeadsDir(dir)
+		// beadsSearchDirs returns DIRECTORIES, several of which resolve to the
+		// same STORE: a rig's own `.beads` is a redirect to its mayor rig's, so
+		// `<rig>` and `<rig>/mayor/rig` are two dirs over one database. Querying
+		// per directory therefore ran the identical `bd list` once per alias --
+		// measured as 7 byte-identical invocations inside a single dispatch pass
+		// (gastown-o8q). The results were already deduplicated by resolved store
+		// below, so the extra passes changed nothing and cost a subprocess and a
+		// Dolt round-trip each.
+		if queried[beadsDir] {
+			continue
+		}
+		queried[beadsDir] = true
 		b := beads.NewWithBeadsDir(dir, beadsDir)
 		contexts, err := b.ListOpenSlingContexts()
 		if err != nil {

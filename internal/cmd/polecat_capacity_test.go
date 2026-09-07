@@ -325,7 +325,15 @@ func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			snapshot := polecatCapacitySnapshot{}
-			applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", "synth", tt.fields, tt.activeWork, nil)
+			// Through the production pair -- resolve, then apply -- rather than
+			// a test-only wrapper. gastown-o8q parallelised this walk, and a
+			// helper kept alive only by its tests is how an invariant stays
+			// green beside the path that stopped using it.
+			for _, c := range resolvePolecatCapacityContributions([]polecatCapacityProbe{{
+				rigName: "gastown", polecatName: "synth", fields: tt.fields, activeWork: tt.activeWork,
+			}}, nil) {
+				applyWorkstateDispositionToCapacitySnapshot(&snapshot, c.state, c.disposition)
+			}
 			if snapshot.Working != tt.want.Working || snapshot.RecoveryBlocked != tt.want.RecoveryBlocked || snapshot.ReusableIdle != tt.want.ReusableIdle || snapshot.PendingMR != tt.want.PendingMR || snapshot.capacityUsed != tt.want.capacityUsed {
 				t.Fatalf("snapshot = %+v, want %+v", snapshot, tt.want)
 			}

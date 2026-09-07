@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -88,6 +89,10 @@ type Daemon struct {
 	// daemon lifetime. The heartbeat runs constantly, and a warning repeated
 	// every tick is a warning nobody reads.
 	warnLegacyEventsOnce sync.Once
+
+	// dispatchInFlight is set while an asynchronous `gt scheduler run` child is
+	// still running, so a slow pass cannot accumulate one child per heartbeat.
+	dispatchInFlight atomic.Bool
 
 	// PATCH-006: Resolved binary paths to avoid PATH issues in subprocesses.
 	gtPath string
@@ -1003,7 +1008,7 @@ func (d *Daemon) heartbeat(state *State) {
 	if p := d.checkPressure("polecat"); !p.OK {
 		d.logger.Printf("Deferring polecat dispatch: %s", p.Reason)
 	} else {
-		d.dispatchQueuedWork()
+		d.dispatchQueuedWorkAsync()
 	}
 
 	// 15. Rotate oversized Dolt logs (copytruncate for child process fds).
@@ -3229,7 +3234,15 @@ func (d *Daemon) pruneStaleBranches() {
 // prevents double-dispatch on the next cycle. The batch_size config (default: 1)
 // limits how many beads are in-flight per heartbeat, reducing the timeout window.
 func (d *Daemon) dispatchQueuedWork() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Parented on the daemon's context now that the pass runs off the heartbeat
+	// goroutine (gastown-o8q). While it was inline, a stopping daemon waited for
+	// the pass by construction; asynchronously it would outlive the daemon and
+	// hold the scheduler flock against its replacement.
+	parent := d.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
 	setSysProcAttr(cmd)
@@ -3248,6 +3261,32 @@ func (d *Daemon) dispatchQueuedWork() {
 	} else if len(out) > 0 {
 		d.logger.Printf("Scheduler dispatch: %s", string(out))
 	}
+}
+
+// dispatchQueuedWorkAsync runs one dispatch pass off the heartbeat goroutine.
+//
+// gastown-o8q: dispatchQueuedWork was called inline, so the heartbeat could not
+// finish until the pass did. With passes routinely burning their whole 5-minute
+// deadline the town's recovery cadence -- dead session restart, GUPP checks,
+// orphaned work -- inflated from 3 minutes to 8.7, measured. That is the safety
+// net being gated on the throughput of something it does not depend on.
+//
+// The pass is already safe to overlap with the rest of the heartbeat: it runs
+// as a separate `gt scheduler run` PROCESS and that process takes an exclusive
+// flock, returning quietly when a peer holds it. dispatchInFlight is a cheaper
+// local guard on top, so a slow pass leaves one child running rather than one
+// per tick -- without it a 5-minute pass against a 3-minute heartbeat would
+// have two children racing for that lock at all times, and the loser's work is
+// pure waste.
+func (d *Daemon) dispatchQueuedWorkAsync() {
+	if !d.dispatchInFlight.CompareAndSwap(false, true) {
+		d.logger.Printf("Skipping polecat dispatch: previous pass still running")
+		return
+	}
+	go func() {
+		defer d.dispatchInFlight.Store(false)
+		d.dispatchQueuedWork()
+	}()
 }
 
 // schedulerOutputTail renders a child pass's captured output for daemon.log.
