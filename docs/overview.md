@@ -137,8 +137,9 @@ For work that should be owned by the target rig:
 
 ```bash
 # Create issue in target rig
-bd -C ~/gt/beadsrig create "Fix authentication bug"   # NOT --repo: a bare name
-                                                      # silently creates a phantom store
+# NOT `--repo beads`: a bare name is not resolved as a rig, so bd treats it as a
+# path, silently creates a store there, and the bead is invisible to every real store.
+bd -C ~/gt/beads create "Fix authentication bug"
 
 # Create convoy and sling to target rig
 gt convoy create "Auth fix" bd-xyz
