@@ -18,6 +18,7 @@
 package nudge
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -102,7 +103,7 @@ func StartPoller(townRoot, session string) (int, error) {
 		return 0, fmt.Errorf("finding gt binary: %w", err)
 	}
 
-	cmd := buildPollerCommand(gtBin, townRoot, session)
+	cmd := spawnPollerCommand(gtBin, townRoot, session)
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("starting nudge-poller: %w", err)
@@ -110,10 +111,33 @@ func StartPoller(townRoot, session string) (int, error) {
 
 	pid := cmd.Process.Pid
 
-	// Write PID file for later cleanup.
-	pidPath := pollerPidFile(townRoot, session)
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
-		// Non-fatal — the process is running, we just can't track it.
+	// Register the child in the index, under the slot lock.
+	//
+	// This used to be a bare os.WriteFile, which is wrong twice over. It
+	// truncates before it writes, so a reader landing in the gap sees an empty
+	// file and concludes there is no poller; and it overwrites whoever holds the
+	// slot, so a directly invoked `gt nudge-poller` that claimed it during the
+	// window opened at the aliveness check above loses its registration to a
+	// child that is now the SECOND consumer on one queue. The child then adopts
+	// the entry naming it and runs, because the entry names its own pid.
+	// ClaimPollerPidFile closes both: the write is a rename, and the read that
+	// precedes it happens under the same lock every other claimant takes.
+	// (gastown-cb2)
+	if err := ClaimPollerPidFile(townRoot, session, pid); err != nil {
+		if errors.Is(err, ErrPollerAlreadyRunning) {
+			// Somebody registered a live poller while we were spawning, so the
+			// child we just started is the duplicate. Stop it here rather than
+			// relying on its own claim to turn it away: we started it, we can
+			// see it must not run, and killing it now closes the window instead
+			// of leaving a second consumer alive for as long as its startup
+			// takes. Reaped so it does not linger as a zombie (gt-5kri).
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return 0, nil
+		}
+		// Any other failure is not fatal: the poller is running and draining, it
+		// is merely untracked, which is exactly what this command did before it
+		// wrote a pid file at all.
 		fmt.Fprintf(os.Stderr, "Warning: failed to write poller PID file: %v\n", err)
 	}
 
@@ -122,6 +146,12 @@ func StartPoller(townRoot, session string) (int, error) {
 
 	return pid, nil
 }
+
+// spawnPollerCommand builds the detached poller command. Indirected through a
+// var because StartPoller launches os.Executable(), which under `go test` is the
+// test binary itself — a test binary re-invoked with stray positional args
+// re-runs the whole suite. Tests substitute a harmless child.
+var spawnPollerCommand = buildPollerCommand
 
 func buildPollerCommand(gtBin, townRoot, session string) *exec.Cmd {
 	cmd := exec.Command(gtBin, "nudge-poller", session)
@@ -132,7 +162,20 @@ func buildPollerCommand(gtBin, townRoot, session string) *exec.Cmd {
 	return cmd
 }
 
+// pidNobodyOwns stands in for "we could not read an owner out of the slot".
+// Process ids start at 1, so it can never collide with a real claimant, which is
+// what makes it safe to pass to ReleasePollerPidFile: an unparseable entry gets
+// cleared and a successor's valid entry does not.
+const pidNobodyOwns = 0
+
 // StopPoller terminates the nudge-poller for a session, if running.
+//
+// Every exit clears the slot through ReleasePollerPidFile rather than unlinking
+// the file directly. StopPoller reads the pid without the lock and then acts on
+// it, so a replacement poller can own the slot by the time it gets to the
+// cleanup — and removing THAT entry leaves a live poller untracked, which lets
+// the next StartPoller put a second consumer on the same queue. The ownership
+// check and the unlink have to be one critical section. (gastown-cb2)
 func StopPoller(townRoot, session string) error {
 	pidPath := pollerPidFile(townRoot, session)
 
@@ -146,30 +189,26 @@ func StopPoller(townRoot, session string) error {
 
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
-		_ = os.Remove(pidPath)
-		return nil // corrupt PID file, clean up
+		return ReleasePollerPidFile(townRoot, session, pidNobodyOwns) // corrupt, clean up
 	}
 
 	if !pollerProcessAlive(pid) {
 		// Process already dead.
-		_ = os.Remove(pidPath)
-		return nil
+		return ReleasePollerPidFile(townRoot, session, pid)
 	}
 
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		_ = os.Remove(pidPath)
-		return nil
+		return ReleasePollerPidFile(townRoot, session, pid)
 	}
 
 	// Send SIGTERM for graceful shutdown.
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		_ = os.Remove(pidPath)
+		_ = ReleasePollerPidFile(townRoot, session, pid)
 		return fmt.Errorf("sending SIGTERM to poller (pid %d): %w", pid, err)
 	}
 
-	_ = os.Remove(pidPath)
-	return nil
+	return ReleasePollerPidFile(townRoot, session, pid)
 }
 
 // pollerAlive checks if a poller is running for the given session.
@@ -188,8 +227,15 @@ func pollerAlive(townRoot, session string) (int, bool) {
 	}
 
 	if !pollerProcessAlive(pid) {
-		// Stale PID file — clean up.
-		_ = os.Remove(pidPath)
+		// Stale entry. Clear it under the slot lock and only while it still
+		// names the pid we read: this read is unlocked, so a successor may have
+		// claimed the slot in between, and deleting a live poller's registration
+		// is the untracked-poller hole the index exists to close. StartPoller
+		// calls this before spawning, so an unconditional unlink here is one of
+		// its writes too. (gastown-cb2)
+		if err := ReleasePollerPidFile(townRoot, session, pid); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to clear stale poller PID file: %v\n", err)
+		}
 		return 0, false
 	}
 
