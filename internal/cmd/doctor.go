@@ -58,6 +58,7 @@ Cleanup checks (fixable):
   - misclassified-wisps      Detect issues that should be wisps (purges to wisps table, fixable)
   - jsonl-bloat              Detect stale/bloated issues.jsonl vs live database
   - stale-beads-redirect     Detect stale files in .beads directories with redirects
+  - beads-redirect-conflict  Detect .beads holding a redirect AND its own database identity files
 
 Clone divergence checks:
   - persistent-role-branches Detect witness/refinery not on main (excludes crew)
