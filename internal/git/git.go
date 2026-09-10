@@ -94,12 +94,55 @@ func (g *Git) IsRepo() bool {
 	return err == nil
 }
 
+// preExec is the single place the invariants that must hold before ANY git
+// subprocess in this package are enforced. Every exec path that takes
+// caller-supplied args calls it, and TestEveryGitExecPathCallsPreExec asserts
+// that -- so a seventh exec path added later cannot quietly skip one of them.
+//
+// It exists because they did. Both invariants were originally written as a
+// two-line preamble copied into each run function, and gastown-vvq is what that
+// costs: guardUnsafeTownRootMutation reached all six paths and
+// maybeInvalidateRemoteRefCache reached two, so PushWithEnv could push through
+// runWithEnvAndTimeout inside an open memo window and leave RemoteBranchTip
+// serving the pre-push answer. A caller grep could not find that, because a
+// bypass is by definition not a caller; the gap is only visible by enumerating
+// the exec paths themselves.
+//
+// IT RETURNS A COMPLETION HOOK THE CALLER MUST DEFER, because dropping the memo
+// only BEFORE the subprocess is not enough once the capacity walk is parallel
+// (gastown-o8q made it so). A read that starts after the drop and finishes
+// before the push does re-memoizes the PRE-push answer into the freshly emptied
+// map, and that answer then outlives the push -- the same stale read the guard
+// exists to prevent, arriving through a window three lines wide instead of
+// through a missing call. Dropping again on the way out closes it.
+//
+// The hook is a no-op for everything that cannot change the remote, so the
+// common path costs one comparison. It fires whether the command SUCCEEDED or
+// FAILED: a push that reports an error may still have moved some refs, and
+// serving a memo across that is the failure mode, not the cost of one extra
+// round-trip.
+//
+// TestEveryGitExecPathCallsPreExec asserts both halves -- that every exec path
+// calls preExec AND defers what it returns -- so a path cannot take the guard
+// and drop the hook.
+func (g *Git) preExec(args []string) (func(), error) {
+	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+		return nil, err
+	}
+	if !remoteMutatingArgs(args) {
+		return func() {}, nil
+	}
+	invalidateRemoteRefCache()
+	return invalidateRemoteRefCache, nil
+}
+
 // run executes a git command and returns stdout.
 func (g *Git) run(args ...string) (string, error) {
-	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+	done, err := g.preExec(args)
+	if err != nil {
 		return "", err
 	}
-	maybeInvalidateRemoteRefCache(args)
+	defer done()
 
 	// If gitDir is set (bare repo), prepend --git-dir flag
 	if g.gitDir != "" {
@@ -116,7 +159,7 @@ func (g *Git) run(args ...string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
@@ -145,10 +188,11 @@ const remoteReadTimeout = 60 * time.Second
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
-	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+	done, err := g.preExec(args)
+	if err != nil {
 		return "", err
 	}
-	maybeInvalidateRemoteRefCache(args)
+	defer done()
 
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
@@ -167,7 +211,7 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
@@ -186,9 +230,11 @@ func (g *Git) runWithEnv(args []string, extraEnv []string) (_ string, _ error) {
 // runWithEnvAndTimeout executes a git command with extra env vars and an
 // optional timeout. Pass 0 for no timeout.
 func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout time.Duration) (_ string, _ error) {
-	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+	done, err := g.preExec(args)
+	if err != nil {
 		return "", err
 	}
+	defer done()
 
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
@@ -217,7 +263,7 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		if timeout > 0 {
 			// Check if the context's deadline was exceeded
@@ -1922,9 +1968,11 @@ func (g *Git) CheckConflicts(source, target string) ([]string, error) {
 // runMergeCheck runs a git merge command and returns error info from both stdout and stderr.
 // ZFC: Returns GitError with raw output for agent observation.
 func (g *Git) runMergeCheck(args ...string) (string, error) {
-	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+	done, err := g.preExec(args)
+	if err != nil {
 		return "", err
 	}
+	defer done()
 
 	cmd := exec.Command("git", args...)
 	util.SetDetachedProcessGroup(cmd)
@@ -1934,7 +1982,7 @@ func (g *Git) runMergeCheck(args ...string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		// ZFC: Return raw output for observation, don't interpret CONFLICT
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)

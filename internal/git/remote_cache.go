@@ -27,10 +27,19 @@ import (
 // Requiring a caller to open the window makes the staleness boundary a written
 // decision at one call site instead of an emergent property of the process.
 //
-// THE WINDOW MUST NOT SPAN AN OPERATION THAT CHANGES THE REMOTE. `run` and
-// `runWithTimeout` drop the memo when they see a `push`, `fetch` or `remote`
-// subcommand, so this is enforced rather than merely documented -- a guard that
-// only lives in a comment is one refactor away from not existing.
+// THE WINDOW MUST NOT SPAN AN OPERATION THAT CHANGES THE REMOTE. Every exec
+// path in this package routes through `preExec`, which drops the memo when it
+// sees a `push`, `fetch` or `remote` subcommand, so this is enforced rather than
+// merely documented -- a guard that only lives in a comment is one refactor away
+// from not existing.
+//
+// This sentence used to name `run` and `runWithTimeout` specifically, and that
+// was the defect (gastown-vvq): the package had six exec paths taking
+// caller-supplied args and the guard was copied into two of them, so
+// `PushWithEnv` -> `runWithEnvAndTimeout` pushed straight through an open
+// window. Naming the paths that pass is what let four that did not go unnoticed,
+// which is why the guarantee is now stated over the chokepoint and pinned by
+// TestEveryGitExecPathCallsPreExec rather than by a list of function names.
 
 // remoteRefEntry is one memoized answer. The sync.Once collapses concurrent
 // callers asking the same question onto a single round-trip, which is what the
@@ -92,20 +101,33 @@ func invalidateRemoteRefCache() {
 	}
 }
 
-// maybeInvalidateRemoteRefCache drops the memo when args carry a git subcommand
-// that can change what the remote holds. The subcommand is the first non-flag
-// token; anything else leaves the memo alone.
-func maybeInvalidateRemoteRefCache(args []string) {
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		switch arg {
-		case "push", "fetch", "remote":
-			invalidateRemoteRefCache()
-		}
-		return
+// remoteMutatingArgs reports whether args carry a git subcommand that can change
+// what the remote holds. Anything else leaves the memo alone.
+//
+// The subcommand is resolved with gitSubcommand, the same parser
+// guardUnsafeTownRootMutation uses, rather than by taking the first non-flag
+// token. Those two rules disagree on every argument that CARRIES A VALUE:
+// `git -C /repo push origin main` has "/repo" as its first non-flag token, so
+// the first-token rule reads the subcommand as "/repo" and leaves a stale memo
+// standing across a real push. Same for `-c`, `--git-dir`, `--work-tree`,
+// `--namespace`, `--config-env` and `--exec-path`.
+//
+// Latent today -- measured, not assumed: no production caller passes a
+// value-carrying global flag to one of this package's run methods alongside a
+// push, fetch or remote. It is fixed here anyway because the two guards behind
+// preExec must agree on what subcommand they were handed; a chokepoint whose
+// two halves parse their input differently is a chokepoint in name only.
+//
+// This is a PREDICATE rather than an action so preExec can ask the question once
+// and act on the answer twice -- dropping the memo before the subprocess and
+// again after it, which is what closes the concurrent-read window a
+// before-only drop leaves open.
+func remoteMutatingArgs(args []string) bool {
+	switch cmd, _ := gitSubcommand(args); cmd {
+	case "push", "fetch", "remote":
+		return true
 	}
+	return false
 }
 
 // lsRemote is the single path every read-only ls-remote query in this package
