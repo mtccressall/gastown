@@ -7,12 +7,28 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/procsig"
 )
 
+// killProcessGroup terminates every member of the process group pgid.
+//
+// The signal goes through procsig, which refuses a pgid of 0, 1 or a negative,
+// because the kill(-pgid, sig) idiom this function used to write inline turns
+// those into wildcards: kill(-1, sig) signals every process the user owns.
+// A pgid of 1 is not exotic here -- it is what a process reparented to init can
+// end up reporting, and it is what an empty or malformed `ps -o pgid=` parses
+// to. Callers elsewhere in this package already refuse "0" and "1" as strings
+// before getting this far (see collectReparentedGroupMembers); this closes the
+// same hole at the site that actually signals.
 func killProcessGroup(pgid int) {
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	if err := procsig.SignalGroup(pgid, syscall.SIGTERM); err != nil {
+		// Either the group is gone or the target was a wildcard. Neither is
+		// worth escalating to SIGKILL.
+		return
+	}
 	time.Sleep(100 * time.Millisecond)
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	_ = procsig.SignalGroup(pgid, syscall.SIGKILL)
 }
 
 // getParentPID returns the parent process ID (PPID) for a given PID.
