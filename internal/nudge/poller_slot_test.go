@@ -9,11 +9,73 @@ import (
 	"time"
 )
 
+// reapTestChild kills and reaps a test child, addressed by a pid captured while
+// it was still valid.
+//
+// It refuses any pid that does not name a real process, and that refusal is the
+// entire point of the helper rather than defensive habit. kill(2) gives 0, -1
+// and negative pids a COMPLETELY DIFFERENT MEANING from "this process": -1 is
+// "every process this uid may signal", and 0 is "my own process group". So a
+// cleanup that forwards a stale Process.Pid does not fail, and does not signal
+// the wrong process — it takes the whole login session down.
+//
+// That is not hypothetical here. StartPoller calls cmd.Process.Release() on its
+// success path to detach the poller, and Go's Release sets Process.Pid to -1
+// ("Unfortunately, for historical reasons, on systems other than Windows,
+// Release sets the Pid field to -1" — os/exec.go). A t.Cleanup registered
+// around StartPoller therefore reads -1, not a pid. On 2026-09-11 that reached
+// kill(-1, SIGKILL) from this test binary four times and destroyed every
+// process the user owned — all tmux sessions and agents, the Dolt server, two
+// VMs, and both the SSH and RDP login sessions — while the test itself
+// reported PASS. Audit record: syscall=kill a0=0xffffffffffffffff a1=9
+// success=yes comm="nudge.test".
+//
+// Capture the pid at a moment it is known good and pass it here; never read
+// Process.Pid after the code under test may have released it.
+func reapTestChild(t *testing.T, c *exec.Cmd, pid int) {
+	t.Helper()
+
+	// Already waited for by the code under test. The pid has been reaped and
+	// the kernel is free to hand that number to somebody else, so signalling
+	// it now is a coin flip on an unrelated process.
+	if c != nil && c.ProcessState != nil {
+		return
+	}
+	if pid <= 1 {
+		// Nothing addressable. A child that was released is detached by
+		// design; leaking a short-lived `sleep` is the correct trade against
+		// handing kill(2) a wildcard.
+		t.Logf("reapTestChild: no addressable pid (%d); leaving the child to exit on its own", pid)
+		return
+	}
+
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	var ws syscall.WaitStatus
+	_, _ = syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+}
+
+// livePID returns c's pid, or 0 when c has no process that can be addressed.
+// It collapses "never started", "already released" (-1) and the reserved pids
+// into one unusable value so callers cannot accidentally forward them.
+func livePID(c *exec.Cmd) int {
+	if c == nil || c.Process == nil || c.Process.Pid <= 1 {
+		return 0
+	}
+	return c.Process.Pid
+}
+
 // waitUntilDead blocks until pid stops reading as alive. A duplicate poller that
 // is merely "being stopped" is still draining the queue, so the assertion has to
 // be that it is gone, not that a kill was issued.
+//
+// It fails on a pid that names no process rather than returning: pollerProcessAlive
+// answers false for anything <= 0, so a released or unset pid would satisfy this
+// loop on the first iteration and the test would pass having proved nothing.
 func waitUntilDead(t *testing.T, pid int) {
 	t.Helper()
+	if pid <= 1 {
+		t.Fatalf("waitUntilDead got pid %d, which names no process; the assertion would have passed vacuously", pid)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for pollerProcessAlive(pid) {
 		if time.Now().After(deadline) {
@@ -31,6 +93,10 @@ func TestStartPollerRegistersItsChildInTheIndex(t *testing.T) {
 	const session = "gastown-emerald-register"
 
 	var child *exec.Cmd
+	// Set from StartPoller's return value, which is the pid it captured before
+	// releasing the process — the last moment the child is addressable.
+	spawnedPid := 0
+
 	original := spawnPollerCommand
 	spawnPollerCommand = func(_, _, _ string) *exec.Cmd {
 		child = exec.Command("/bin/sh", "-c", "sleep 30")
@@ -38,14 +104,11 @@ func TestStartPollerRegistersItsChildInTheIndex(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		spawnPollerCommand = original
-		if child != nil && child.Process != nil {
-			_ = syscall.Kill(child.Process.Pid, syscall.SIGKILL)
-			var ws syscall.WaitStatus
-			_, _ = syscall.Wait4(child.Process.Pid, &ws, syscall.WNOHANG, nil)
-		}
+		reapTestChild(t, child, spawnedPid)
 	})
 
 	pid, err := StartPoller(townRoot, session)
+	spawnedPid = pid
 	if err != nil {
 		t.Fatalf("StartPoller() error = %v, want nil", err)
 	}
@@ -99,6 +162,8 @@ func TestStartPollerDoesNotDisplaceAPollerThatClaimedDuringTheWindow(t *testing.
 	incumbentPid := incumbent.Process.Pid
 
 	var child *exec.Cmd
+	childPid := 0
+
 	original := spawnPollerCommand
 	spawnPollerCommand = func(_, _, _ string) *exec.Cmd {
 		// The window: after StartPoller found the slot empty, before it records
@@ -111,16 +176,19 @@ func TestStartPollerDoesNotDisplaceAPollerThatClaimedDuringTheWindow(t *testing.
 	}
 	t.Cleanup(func() {
 		spawnPollerCommand = original
-		if child != nil && child.Process != nil {
-			_ = syscall.Kill(child.Process.Pid, syscall.SIGKILL)
-			var ws syscall.WaitStatus
-			_, _ = syscall.Wait4(child.Process.Pid, &ws, syscall.WNOHANG, nil)
-		}
+		reapTestChild(t, child, childPid)
 	})
 
 	if _, err := StartPoller(townRoot, session); err != nil {
 		t.Fatalf("StartPoller() error = %v, want nil (losing the slot is not a failure)", err)
 	}
+
+	// Snapshot the pid immediately, before anything else can release it. On
+	// this path StartPoller stops the duplicate with Kill+Wait rather than
+	// Release, so the pid is still readable here — but reading it once, now,
+	// is what keeps that a property of this line instead of a property of
+	// StartPoller's internals.
+	childPid = livePID(child)
 
 	// The index must still name the poller that actually holds the slot.
 	data, err := os.ReadFile(pollerPidFile(townRoot, session))
@@ -135,7 +203,7 @@ func TestStartPollerDoesNotDisplaceAPollerThatClaimedDuringTheWindow(t *testing.
 	if child == nil || child.Process == nil {
 		t.Fatal("no child was spawned; the seam did not run")
 	}
-	waitUntilDead(t, child.Process.Pid)
+	waitUntilDead(t, childPid)
 }
 
 // StopPoller used to unlink the slot with a bare os.Remove, outside the lock and
