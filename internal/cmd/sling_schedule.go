@@ -140,6 +140,19 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		if !opts.NoConvoy {
 			fmt.Printf("  Would create auto-convoy\n")
 		}
+		// Render the rig command vars the eventual dispatch WOULD inject (gt-kogm).
+		// This is the dry run an operator reaches for a rig target while the
+		// capacity scheduler is active, and without this it reports nothing about
+		// the qualification gate at all -- which reads as "no gate commands are
+		// configured". That is the same wrong conclusion `gt rig config show`
+		// produces by a different route, and it already cost one false P1
+		// (gt-2ezz). The values are resolved for real later, at the same call in
+		// dispatchToPolecat; loadRigCommandVars is a pure read of the rig config
+		// plus the repo and local settings files, so calling it here is safe in a
+		// dry run.
+		if opts.Formula != "" {
+			printRigCommandVarsDryRun(townRoot, rigName)
+		}
 		return nil
 	}
 

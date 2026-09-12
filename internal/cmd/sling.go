@@ -972,6 +972,16 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("  1. bd cook %s\n", formulaName)
 			fmt.Printf("  2. bd mol bond %s %s --json --ephemeral --var feature=\"%s\" --var issue=\"%s\"\n", formulaName, beadID, info.Title, beadID)
 			fmt.Printf("  3. bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
+			// Render the rig command vars this sling WOULD inject (gt-kogm).
+			// Without this the dry run prints only feature and issue, which reads
+			// as though the rig had no gate commands configured. That is the same
+			// wrong conclusion `gt rig config show` produces by a different route,
+			// and it already cost one false P1 (gt-2ezz). loadRigCommandVars is a
+			// pure read of the rig config plus the repo and local settings files,
+			// so calling it here adds no side effect to a dry run.
+			if parts := strings.SplitN(targetAgent, "/", 2); len(parts) >= 1 && parts[0] != "" {
+				printRigCommandVarsDryRun(townRoot, parts[0])
+			}
 		} else {
 			fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
 		}
