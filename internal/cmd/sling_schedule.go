@@ -151,15 +151,7 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		// plus the repo and local settings files, so calling it here is safe in a
 		// dry run.
 		if opts.Formula != "" {
-			rigCmdVars := loadRigCommandVars(townRoot, rigName)
-			if len(rigCmdVars) == 0 {
-				fmt.Printf("  rig command vars (%s): NONE resolved\n", rigName)
-			} else {
-				fmt.Printf("  rig command vars (%s), injected at dispatch as formula defaults:\n", rigName)
-				for _, v := range rigCmdVars {
-					fmt.Printf("      --var %s\n", v)
-				}
-			}
+			printRigCommandVarsDryRun(townRoot, rigName)
 		}
 		return nil
 	}

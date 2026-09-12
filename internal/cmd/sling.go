@@ -980,15 +980,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			// pure read of the rig config plus the repo and local settings files,
 			// so calling it here adds no side effect to a dry run.
 			if parts := strings.SplitN(targetAgent, "/", 2); len(parts) >= 1 && parts[0] != "" {
-				rigCmdVars := loadRigCommandVars(townRoot, parts[0])
-				if len(rigCmdVars) == 0 {
-					fmt.Printf("  rig command vars (%s): NONE resolved\n", parts[0])
-				} else {
-					fmt.Printf("  rig command vars (%s), injected as formula defaults:\n", parts[0])
-					for _, v := range rigCmdVars {
-						fmt.Printf("      --var %s\n", v)
-					}
-				}
+				printRigCommandVarsDryRun(townRoot, parts[0])
 			}
 		} else {
 			fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
