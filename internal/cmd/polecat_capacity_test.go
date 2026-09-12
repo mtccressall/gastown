@@ -287,6 +287,10 @@ func TestConcurrentPolecatAdmissionReservationsDoNotExceedCap(t *testing.T) {
 }
 
 func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
+	// "gt-mr-open" is a fixture id, so whether it blocks is decided by the
+	// open-MR set this walk resolves. Unpinned, that set is the REAL queue of
+	// whatever town the test happens to run in. (gastown-8mm)
+	pinOpenMRs(t, "gt-mr-open")
 	tests := []struct {
 		name       string
 		fields     *beads.AgentFields
