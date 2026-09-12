@@ -163,6 +163,39 @@ var openMRCache = struct {
 	byRig map[string]openMRSet
 }{byRig: map[string]openMRSet{}}
 
+// resolveOpenMRsForRig performs the live queue lookup. It is a variable so a
+// test can PIN THE STORE THE RESOLVER READS, and that seam is the whole point
+// of gastown-8mm rather than a convenience.
+//
+// Without it this function reaches the real rig and the real merge queue from
+// inside a unit test, so the verdict for a FIXTURE MR id is decided by whatever
+// the surrounding town happens to hold. Measured 2026-09-12 from a polecat
+// worktree: the set came back loaded=true with SEVEN real open MRs, none of them
+// the fixture's "gt-mr", so the fixture resolved CLOSED and a polecat with a
+// recorded MR read SAFE_TO_NUKE. The same source in a checkout outside any town
+// passed, because getRig failed there and the set stayed unloaded.
+//
+// That is why the regression cannot be expressed by asserting a verdict alone:
+// a test that does not control this set is measuring the ambient town, and it
+// would go green in CI — which has no town — while saying nothing at all.
+var resolveOpenMRsForRig = func(rigName string) openMRSet {
+	_, r, err := getRig(rigName)
+	if err != nil || r == nil {
+		return openMRSet{}
+	}
+	mrs, mrErr := refinery.NewEngineer(r).ListAllOpenMRs()
+	if mrErr != nil {
+		return openMRSet{}
+	}
+	ids := make(map[string]bool, len(mrs))
+	for _, mr := range mrs {
+		if mr != nil {
+			ids[strings.TrimSpace(mr.ID)] = true
+		}
+	}
+	return openMRSet{ids: ids, loaded: true}
+}
+
 // openMRsForRig returns the open-MR set for a rig, querying at most once per
 // process. A failed query is cached as UNLOADED, so callers keep the safe
 // blocking behaviour rather than retrying per polecat.
@@ -172,18 +205,7 @@ func openMRsForRig(rigName string) openMRSet {
 	if got, ok := openMRCache.byRig[rigName]; ok {
 		return got
 	}
-	set := openMRSet{}
-	if _, r, err := getRig(rigName); err == nil && r != nil {
-		if mrs, mrErr := refinery.NewEngineer(r).ListAllOpenMRs(); mrErr == nil {
-			ids := make(map[string]bool, len(mrs))
-			for _, mr := range mrs {
-				if mr != nil {
-					ids[strings.TrimSpace(mr.ID)] = true
-				}
-			}
-			set = openMRSet{ids: ids, loaded: true}
-		}
-	}
+	set := resolveOpenMRsForRig(rigName)
 	openMRCache.byRig[rigName] = set
 	return set
 }
