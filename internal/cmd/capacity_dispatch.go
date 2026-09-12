@@ -1013,7 +1013,10 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 		b := beads.NewWithBeadsDir(dir, beadsDir)
 		contexts, err := b.ListOpenSlingContexts()
 		if err != nil {
-			return nil, fmt.Errorf("listing sling contexts in %s: %w", beadsDir, err)
+			// Skip unreadable stores and continue with others. Allows per-rig
+			// isolation rather than aborting town-wide dispatch on one error.
+			// Silently skip to avoid alert spam from transient server issues (gt-flrz).
+			continue
 		}
 		for _, ctx := range contexts {
 			key := beadsDir + "\x00" + ctx.ID
