@@ -1816,7 +1816,15 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	}
 	reminder := nudge.QueuedNudge{
 		Sender:       "system",
-		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
+		// gt-mnnx: this reminder used to prescribe `gt mail send`, which OPENS A NEW
+		// THREAD and therefore can never satisfy the reminder that prescribed it.
+		// Measured 30 for 30 across two agents: 8 sends by gastown/refinery and 22 by
+		// gastown/witness all created a distinct thread, none matching the inbound one.
+		// The reminder fires on the INBOUND message's thread, so following it exactly
+		// guaranteed it would fire again — an instruction that causes the condition it
+		// warns about, aimed hardest at the agents who follow instructions carefully.
+		// `gt mail reply <id>` sets reply-to, prefixes "Re: " and threads correctly.
+		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail reply %s` — not in chat. Use `gt mail reply`, NOT `gt mail send`: send opens a new thread and cannot clear this reminder.", msg.From, msg.Subject, msg.ID),
 		Priority:     nudge.PriorityNormal,
 		Kind:         "reply-reminder",
 		ThreadID:     msg.ThreadID,
