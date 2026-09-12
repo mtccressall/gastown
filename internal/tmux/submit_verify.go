@@ -250,6 +250,32 @@ func analyzeSubmission(escContent, needle, promptPrefix string) submitProbe {
 	return probeUnknown
 }
 
+// composerLineFrom returns the plain text of the composer line, or "" if none is
+// found. It reuses the same stripping and prompt-matching that analyzeSubmission
+// does, so it sees exactly the line the probe classified.
+//
+// gt-rd87: when the probe reports probeComposerDirty the nudge's typed payload has
+// been left APPENDED to whatever was already in the composer, and on this town's
+// rules that may be a human's unsent instruction (gt-sglq). We deliberately do NOT
+// clear it — the cost of destroying unsent text is unknown and clearing is exactly
+// what CLAUDE.md forbids doing blind. What we can do is WRITE THE TEXT OUT, which
+// converts a silent ambiguity into a recorded one: the concatenated line reaches the
+// caller in the error, so it is recoverable from the nudge's output instead of
+// existing only in a pane nobody will attribute later.
+func composerLineFrom(escContent, promptPrefix string) string {
+	if promptPrefix == "" {
+		return ""
+	}
+	plain, dim := stripAnsiTrackDim(escContent)
+	lines, _ := splitRunesAndDim(plain, dim)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if matchesPromptPrefix(string(lines[i]), promptPrefix) {
+			return strings.TrimSpace(string(lines[i]))
+		}
+	}
+	return ""
+}
+
 func (t *Tmux) probeSubmission(target, needle, promptPrefix string) submitProbe {
 	content, err := t.run("capture-pane", "-p", "-e", "-t", target, "-S", "-25")
 	if err != nil {
@@ -295,7 +321,17 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeUnknown:
 		return enterErr
 	case probeComposerDirty:
-		return fmt.Errorf("%w (composer contains other text after Enter)", ErrSubmitNotVerified)
+		// gt-rd87: capture what is actually in the composer before returning. The
+		// nudge payload is now concatenated with pre-existing text and nothing
+		// distinguishes the two halves in the pane, so this error is the only
+		// record of what was there.
+		detail := ""
+		if content, err := t.run("capture-pane", "-p", "-e", "-t", target, "-S", "-25"); err == nil {
+			if line := composerLineFrom(content, promptPrefix); line != "" {
+				detail = fmt.Sprintf(" [composer now reads: %q]", line)
+			}
+		}
+		return fmt.Errorf("%w (composer contains other text after Enter; nudge payload was NOT cleared and is appended to it)%s", ErrSubmitNotVerified, detail)
 	case probeStranded:
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
