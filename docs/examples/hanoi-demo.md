@@ -39,11 +39,15 @@ Located in `.beads/formulas/`:
 bd mol wisp towers-of-hanoi-7 --json | jq -r '.new_epic_id'
 # Returns: gt-eph-xxx
 
-# Get all child IDs
-bd list --parent=gt-eph-xxx --limit=200 --json | jq -r '.[].id' > /tmp/ids.txt
+# Get all child IDs into a private scratch file. Never a fixed /tmp name:
+# several agents share this host, and the loser of that race closes beads it
+# never listed.
+IDS=$(mktemp)
+bd list --parent=gt-eph-xxx --limit=200 --json | jq -r '.[].id' > "$IDS"
 
 # Close all issues (serial)
-while read id; do bd close "$id" >/dev/null; done < /tmp/ids.txt
+while read id; do bd close "$id" >/dev/null; done < "$IDS"
+rm -f "$IDS"
 
 # Burn the wisp (cleanup)
 bd mol burn gt-eph-xxx --force
@@ -57,12 +61,13 @@ WISP=$(bd mol wisp towers-of-hanoi-10 --json | jq -r '.new_epic_id')
 echo "Created wisp: $WISP"
 
 # Get all 1025 child IDs (1023 moves + setup + verify)
-bd list --parent=$WISP --limit=2000 --json | jq -r '.[].id' > /tmp/ids.txt
-wc -l /tmp/ids.txt  # Should show 1025
+IDS=$(mktemp)
+bd list --parent=$WISP --limit=2000 --json | jq -r '.[].id' > "$IDS"
+wc -l "$IDS"  # Should show 1025
 
 # Time the execution
 START=$(date +%s)
-while read id; do bd close "$id" >/dev/null 2>&1; done < /tmp/ids.txt
+while read id; do bd close "$id" >/dev/null 2>&1; done < "$IDS"
 END=$(date +%s)
 echo "Completed in $((END - START)) seconds"
 
@@ -162,7 +167,8 @@ gt handoff -s "Hanoi demo" -m "Wisp: $WISP, progress: 400/1025"
 ```bash
 # Session 2: Resume where you left off
 # (Read handoff mail for wisp ID)
-bd list --parent=$WISP --status=open --limit=2000 --json | jq -r '.[].id' > /tmp/ids.txt
+IDS=$(mktemp)
+bd list --parent=$WISP --status=open --limit=2000 --json | jq -r '.[].id' > "$IDS"
 # ... continue closing ...
 ```
 
