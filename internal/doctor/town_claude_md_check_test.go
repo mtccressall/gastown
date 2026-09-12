@@ -65,8 +65,12 @@ Run ` + "`gt prime`" + ` for full context after compaction, clear, or new sessio
 	if result.Status != StatusWarning {
 		t.Errorf("expected StatusWarning for missing sections, got %v", result.Status)
 	}
-	if len(check.missingSections) != 2 {
-		t.Errorf("expected 2 missing sections, got %d", len(check.missingSections))
+	// Derive the expectation from the required set rather than hard-coding a
+	// count: a hard-coded 2 fails the day a section is added, which reads as a
+	// broken check rather than as a new requirement.
+	if len(check.missingSections) != len(templates.TownRootRequiredSections()) {
+		t.Errorf("expected all %d required sections missing, got %d",
+			len(templates.TownRootRequiredSections()), len(check.missingSections))
 	}
 }
 
@@ -94,11 +98,23 @@ Dolt is the data plane for beads.
 	if result.Status != StatusWarning {
 		t.Errorf("expected StatusWarning, got %v", result.Status)
 	}
-	if len(check.missingSections) != 1 {
-		t.Errorf("expected 1 missing section, got %d", len(check.missingSections))
+	// The fixture carries the Dolt section and nothing else, so the report must
+	// name every OTHER required section and must not name that one. Asserting
+	// the set rather than a count keeps this meaningful as sections are added.
+	missing := make(map[string]bool, len(check.missingSections))
+	for _, section := range check.missingSections {
+		missing[section.Name] = true
 	}
-	if check.missingSections[0].Name != "Communication hygiene" {
-		t.Errorf("expected 'Communication hygiene' missing, got %q", check.missingSections[0].Name)
+	if missing["Dolt awareness"] {
+		t.Error("Dolt section is present in the fixture but was reported missing")
+	}
+	for _, section := range templates.TownRootRequiredSections() {
+		if section.Name == "Dolt awareness" {
+			continue
+		}
+		if !missing[section.Name] {
+			t.Errorf("section %q is absent from the fixture but was not reported missing", section.Name)
+		}
 	}
 }
 
