@@ -228,10 +228,36 @@ type MRInfo struct {
 	PreVerifiedBase string    // Target branch SHA at verification time
 
 	// Raw data for agent-side queue health analysis (ZFC: agent decides, Go transports)
-	UpdatedAt          time.Time // When the MR was last updated
-	Assignee           string    // Who claimed this MR (empty = unclaimed)
-	BranchExistsLocal  bool      // Whether the MR branch exists locally
-	BranchExistsRemote bool      // Whether the MR branch exists in remote tracking refs
+	UpdatedAt time.Time // When the MR was last updated
+	Assignee  string    // Who claimed this MR (empty = unclaimed)
+
+	// Branch existence is only measured by the paths that actually run git
+	// (ListAllOpenMRs). These are pointers with omitempty so an UNMEASURED
+	// value is ABSENT from JSON rather than serialised as a measured `false`
+	// (gastown-697). A bare bool made every MR on the `gt refinery ready
+	// --json` path look like an orphaned branch, and mol-witness-patrol reads
+	// false/false as licence to close the MR.
+	//
+	// Consumers: nil means "not measured — ask the --all path or read the
+	// anomalies list"; non-nil false means "measured, and the branch is gone".
+	BranchExistsLocal  *bool `json:",omitempty"` // Whether the MR branch exists locally
+	BranchExistsRemote *bool `json:",omitempty"` // Whether the MR branch exists in remote tracking refs
+}
+
+// boolPtr returns a pointer to v, marking a branch-existence field as measured.
+func boolPtr(v bool) *bool { return &v }
+
+// BranchMeasured reports whether branch existence was populated for this MR.
+// Only the paths that run git (ListAllOpenMRs) measure it.
+func (m *MRInfo) BranchMeasured() bool {
+	return m.BranchExistsLocal != nil && m.BranchExistsRemote != nil
+}
+
+// BranchOrphaned reports whether the MR branch was MEASURED and found missing
+// both locally and in origin/* tracking refs. It is false when the fields were
+// never populated, so an unmeasured MR can never be mistaken for an orphan.
+func (m *MRInfo) BranchOrphaned() bool {
+	return m.BranchMeasured() && !*m.BranchExistsLocal && !*m.BranchExistsRemote
 }
 
 // MRAnomaly represents an MR queue health problem that can stall processing.
@@ -2210,9 +2236,14 @@ func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
 
 		mr := issueToMRInfo(issue, fields)
 
-		// Check branch existence (local + remote tracking refs)
-		mr.BranchExistsLocal, _ = e.git.BranchExists(fields.Branch)
-		mr.BranchExistsRemote, _ = e.git.RemoteTrackingBranchExists("origin", fields.Branch)
+		// Check branch existence (local + remote tracking refs).
+		// Always set both pointers on this path, including on error: a failed
+		// check is a measured "not found" here, and leaving one nil would make
+		// BranchMeasured report unmeasured for a row this path did measure.
+		localExists, _ := e.git.BranchExists(fields.Branch)
+		remoteExists, _ := e.git.RemoteTrackingBranchExists("origin", fields.Branch)
+		mr.BranchExistsLocal = boolPtr(localExists)
+		mr.BranchExistsRemote = boolPtr(remoteExists)
 		mr.BlockedBy = e.firstOpenBlocker(issue)
 
 		mrs = append(mrs, mr)

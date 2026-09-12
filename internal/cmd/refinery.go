@@ -858,7 +858,7 @@ func runRefineryReadyAll(eng *refinery.Engineer, rigName string) error {
 		if mr.BlockedBy != "" {
 			flags = append(flags, fmt.Sprintf("blocked-by:%s", mr.BlockedBy))
 		}
-		if !mr.BranchExistsLocal && !mr.BranchExistsRemote {
+		if mr.BranchOrphaned() {
 			flags = append(flags, "no-branch")
 		}
 		if len(flags) > 0 {
