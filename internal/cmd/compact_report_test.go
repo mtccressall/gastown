@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
@@ -581,6 +583,53 @@ func TestRunWeeklyRollupStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "auto-closing rollup bead h25-mrd") {
 		t.Fatalf("error = %v, want auto-close failure", err)
+	}
+	assertNoMailSent(t, mailLog)
+}
+
+// TestRunWeeklyRollupSkipsWhenClosedRollupExists pins gt-sau5d. Weekly audit
+// beads are auto-closed, and bd list hides closed beads unless --status says
+// otherwise. The existence check omitted --status, so it could never see the
+// rollup it had already sent and every Monday patrol cycle re-mailed mayor/
+// (three sends on 2026-09-07). The stub models bd's default open-only filter
+// rather than asserting on argv, so any query that can see a closed bead passes.
+func TestRunWeeklyRollupSkipsWhenClosedRollupExists(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	mailLog := setupCompactReportCommandStubs(t)
+	resetCompactReportFlags(t)
+
+	now := time.Now().UTC()
+	title := fmt.Sprintf("Weekly Compaction Rollup %s to %s",
+		now.AddDate(0, 0, -7).Format("2006-01-02"), now.Format("2006-01-02"))
+	binDir := t.TempDir()
+	bdScript := `#!/bin/sh
+case "$1" in
+  list)
+    case " $* " in
+      *" --status=all "*|*" --status=closed "*)
+        printf '[{"id":"hq-weekly","title":"%s","status":"closed"}]\n' "$ROLLUP_TITLE"
+        ;;
+      *)
+        printf '[]\n'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected bd command: $*" >&2
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ROLLUP_TITLE", title)
+
+	if err := runWeeklyRollup(); err != nil {
+		t.Fatalf("runWeeklyRollup: %v, want a skip because the rollup already exists", err)
 	}
 	assertNoMailSent(t, mailLog)
 }
