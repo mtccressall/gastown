@@ -1258,6 +1258,9 @@ func (m *Mailbox) AcknowledgeDeliveries(recipientAddress string, messages []*Mes
 		if msg.DeliveryState == "" {
 			continue
 		}
+		if deliveryAlreadyAckedBy(msg, recipientIdentity) {
+			continue
+		}
 		toAck = append(toAck, msg)
 	}
 	if len(toAck) == 0 {
@@ -1290,6 +1293,20 @@ func (m *Mailbox) AcknowledgeDeliveries(recipientAddress string, messages []*Mes
 		return fmt.Errorf("acknowledging deliveries failed: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// deliveryAlreadyAckedBy reports whether msg, as listed, already carries a
+// complete ack by recipientIdentity and no leftover delivery:pending. For such
+// a message AcknowledgeDeliveryBead would re-read the bead only to write
+// nothing. Unread messages stay unread after an ack, so without this skip every
+// `gt mail check --inject` re-reads the whole unread backlog; with a few hundred
+// messages that exceeds the 30s UserPromptSubmit hook budget on every prompt,
+// and the killed hook's output and nudge drain are discarded (gt-31i2t).
+func deliveryAlreadyAckedBy(msg *Message, recipientIdentity string) bool {
+	return msg.DeliveryState == DeliveryStateAcked &&
+		msg.DeliveryAckedBy == recipientIdentity &&
+		msg.DeliveryAckedAt != nil &&
+		!msg.deliveryPendingLeft
 }
 
 // Append adds a message to the mailbox (legacy mode only).

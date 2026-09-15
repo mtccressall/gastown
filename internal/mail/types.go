@@ -132,6 +132,11 @@ type Message struct {
 	DeliveryAckedBy string `json:"delivery_acked_by,omitempty"`
 	// DeliveryAckedAt is when receipt was acknowledged.
 	DeliveryAckedAt *time.Time `json:"delivery_acked_at,omitempty"`
+	// deliveryPendingLeft records that delivery:pending was still present when
+	// the message was listed, even if delivery:acked was too (a crash between
+	// the ack write and the pending removal). Such a message still needs
+	// AcknowledgeDeliveryBead to converge it. In-memory only.
+	deliveryPendingLeft bool
 
 	// SuppressNotify tells the router to skip all recipient notification
 	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
@@ -319,9 +324,10 @@ type BeadsMessage struct {
 	claimedBy string     // Who claimed the queue message
 	claimedAt *time.Time // When the queue message was claimed
 	// Two-phase delivery metadata
-	deliveryState   string
-	deliveryAckedBy string
-	deliveryAckedAt *time.Time
+	deliveryState       string
+	deliveryAckedBy     string
+	deliveryAckedAt     *time.Time
+	deliveryPendingLeft bool
 }
 
 // ParseLabels extracts metadata from the labels array.
@@ -366,6 +372,7 @@ func (bm *BeadsMessage) ParseLabels() {
 	}
 
 	bm.deliveryState, bm.deliveryAckedBy, bm.deliveryAckedAt = ParseDeliveryLabels(bm.Labels)
+	bm.deliveryPendingLeft = bm.HasLabel(DeliveryLabelPending)
 }
 
 // GetCC returns the parsed CC recipients.
@@ -435,6 +442,8 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		DeliveryState:   bm.deliveryState,
 		DeliveryAckedBy: bm.deliveryAckedBy,
 		DeliveryAckedAt: bm.deliveryAckedAt,
+
+		deliveryPendingLeft: bm.deliveryPendingLeft,
 	}
 }
 
