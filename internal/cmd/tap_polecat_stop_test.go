@@ -12,6 +12,10 @@ import (
 
 const polecatStopTestBranch = "polecat/test/gt-ksnv@abc123"
 
+// polecatStopDoneSentinelEnv names a file this test binary touches when it is
+// re-invoked with "done", so a hook that shells out to gt done is visible.
+const polecatStopDoneSentinelEnv = "GT_TEST_POLECAT_STOP_DONE_SENTINEL"
+
 func TestPolecatStopPendingWork(t *testing.T) {
 	t.Run("clean feature branch has no pending work", func(t *testing.T) {
 		repo := initPolecatStopTestRepo(t)
@@ -163,9 +167,17 @@ func TestPolecatStopShouldBlock(t *testing.T) {
 func TestRunTapPolecatStopRemindsInsteadOfRunningDone(t *testing.T) {
 	// The old auto-done path ran os.Executable() with "done". Under go test that
 	// is this test binary, so a regression would re-run this test recursively.
+	// Record that it happened before skipping: without the sentinel the skip
+	// hides the very regression this test exists for, because "the commit is
+	// still unsubmitted" holds whether or not the hook shelled out.
 	if len(os.Args) > 1 && os.Args[1] == "done" {
+		if sentinel := os.Getenv(polecatStopDoneSentinelEnv); sentinel != "" {
+			_ = os.WriteFile(sentinel, []byte(strings.Join(os.Args, " ")), 0644)
+		}
 		t.Skip("invoked as gt done by a regressed stop hook")
 	}
+	sentinel := filepath.Join(t.TempDir(), "gt-done-was-run")
+	t.Setenv(polecatStopDoneSentinelEnv, sentinel)
 	town := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0755); err != nil {
 		t.Fatalf("mkdir mayor: %v", err)
@@ -246,6 +258,11 @@ func TestRunTapPolecatStopRemindsInsteadOfRunningDone(t *testing.T) {
 	})
 
 	t.Run("gt done was not run", func(t *testing.T) {
+		// The sentinel is written by this test binary when it is re-invoked as
+		// "done", which is exactly what the old auto-done path did.
+		if data, err := os.ReadFile(sentinel); err == nil {
+			t.Fatalf("the stop hook shelled out to done: %s", data)
+		}
 		// gt done submits the branch; the pending commit must still be unsubmitted.
 		pending, reason, err := polecatStopPendingWork(repo, polecatStopTestBranch)
 		if err != nil {
