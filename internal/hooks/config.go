@@ -325,11 +325,11 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 // The successor picks up hooked work via SessionStart hook (gt prime --hook).
 func DefaultOverrides() map[string]*HooksConfig {
 	return map[string]*HooksConfig{
-		// Polecats: auto-run gt done on session Stop (gas-lob).
+		// Polecats: remind to run gt done on Stop (gas-lob).
 		// Catches the "idle polecat" problem: polecats that finish work but
-		// forget to call gt done before the session ends. The polecat-stop-check
-		// command is idempotent — it checks heartbeat state and branch commits
-		// before deciding whether to run gt done.
+		// forget to call gt done. Stop fires at every turn end, so the
+		// polecat-stop-check command blocks the stop once with a reminder when
+		// work is pending and never runs gt done itself (gt-e3upy).
 		"polecats": {
 			Stop: []HookEntry{
 				{
