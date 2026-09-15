@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,22 +17,29 @@ import (
 
 var tapPolecatStopCmd = &cobra.Command{
 	Use:   "polecat-stop-check",
-	Short: "Auto-run gt done on session Stop if polecat has pending work",
+	Short: "Remind a polecat to run gt done when it stops with pending work",
 	Long: `Safety net for the "idle polecat" problem: polecats that finish work
-but forget to call gt done before the session ends.
+but forget to call gt done.
 
 This command is designed to run from a Claude Code Stop hook. It checks:
 1. Whether this is a polecat session (GT_POLECAT env var)
 2. Whether gt done has already run (heartbeat state is "exiting" or "idle")
 3. Whether the polecat has commits, stashes, or non-runtime dirty work
 
-If the polecat has pending work that wasn't submitted, this command
-runs gt done to submit it. If gt done already ran or there's nothing
-to submit, it exits silently.
+If the polecat has pending work that wasn't submitted, this command blocks
+the stop once and tells the polecat to run gt done if its work is finished.
+It never runs gt done itself: Claude Code fires Stop at the end of every
+turn, not only when a session ends, so a polecat that ends a turn to wait
+for background tests or gates also has "pending work". Running gt done for
+it closed the bead and tore the session down mid-gates (gt-e3upy).
 
-Exit codes:
-  0 - No action needed (not a polecat, already done, or gt done succeeded)
-  1 - gt done was attempted but failed`,
+When the stop was already blocked once (stop_hook_active in the hook
+input), the stop is allowed, so a polecat that is waiting is not looped.
+
+Output: nothing when the stop is allowed (not a polecat, already done, nothing
+pending, or already reminded). When blocked, a Stop hook decision on stdout:
+  {"decision":"block","reason":"<reminder for the polecat>"}
+Always exits 0.`,
 	RunE:         runTapPolecatStop,
 	SilenceUsage: true,
 }
@@ -103,34 +112,47 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 		return nil // Can't check, or no work to submit — don't block session stop
 	}
 
-	// Polecat has pending work! Run gt done as a safety net.
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "⚠️  Polecat %s has pending work on branch %s (%s)\n", polecatName, branch, reason)
-	fmt.Fprintf(os.Stderr, "   Auto-running gt done as safety net...\n")
-	fmt.Fprintf(os.Stderr, "\n")
-
-	// Find gt binary path
-	gtBin, err := os.Executable()
-	if err != nil {
-		gtBin = "gt"
+	input, _ := io.ReadAll(os.Stdin)
+	if !polecatStopShouldBlock(pending, stopHookActive(input)) {
+		return nil // Already reminded this stop — let the polecat wait
 	}
 
-	// Run gt done in the polecat's worktree context
-	doneCmd := exec.Command(gtBin, "done")
-	doneCmd.Dir = cloneDir
-	doneCmd.Stdout = os.Stdout
-	doneCmd.Stderr = os.Stderr
-	// Inherit environment (GT_POLECAT, GT_RIG, etc. are already set)
-	doneCmd.Env = os.Environ()
-
-	if err := doneCmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  Auto gt done failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "   Witness will handle cleanup.\n")
-		// Don't return error — don't block session stop
+	out, err := json.Marshal(map[string]string{
+		"decision": "block",
+		"reason":   polecatStopReminder(polecatName, branch, reason),
+	})
+	if err != nil {
 		return nil
 	}
-
+	fmt.Println(string(out))
 	return nil
+}
+
+// stopHookActive reports whether Claude Code is already continuing because a
+// Stop hook blocked the previous stop. Unparseable input reads as false.
+func stopHookActive(input []byte) bool {
+	var payload struct {
+		StopHookActive bool `json:"stop_hook_active"`
+	}
+	if err := json.Unmarshal(input, &payload); err != nil {
+		return false
+	}
+	return payload.StopHookActive
+}
+
+// polecatStopShouldBlock decides whether a stop with pending work is blocked
+// with a reminder. There is deliberately no outcome that runs gt done: a stop
+// is a turn end, not proof the polecat is finished (gt-e3upy).
+func polecatStopShouldBlock(pending, alreadyReminded bool) bool {
+	return pending && !alreadyReminded
+}
+
+func polecatStopReminder(polecatName, branch, reason string) string {
+	return fmt.Sprintf(`Polecat %s has pending work on branch %s (%s) and gt done has not run.
+If your work is finished and its gates have passed, run gt done now.
+If you are waiting on background tests, gates or reviews, keep waiting and do not run gt done yet; you may end your turn.
+gt done will not be run for you.
+`, polecatName, branch, reason)
 }
 
 func polecatStopPendingWork(cloneDir, branch string) (bool, string, error) {
