@@ -1815,7 +1815,7 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 		return // Disabled by config
 	}
 	reminder := nudge.QueuedNudge{
-		Sender:       "system",
+		Sender: "system",
 		// gt-mnnx: this reminder used to prescribe `gt mail send`, which OPENS A NEW
 		// THREAD and therefore can never satisfy the reminder that prescribed it.
 		// Measured 30 for 30 across two agents: 8 sends by gastown/refinery and 22 by
