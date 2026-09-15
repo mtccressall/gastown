@@ -77,9 +77,11 @@ func (g *Git) RangePatchID(base, head string) (string, error) {
 // runRaw executes a git command and returns raw stdout bytes. Diff output is
 // binary-ish and must not go through the trimming that run() applies.
 func (g *Git) runRaw(args ...string) ([]byte, error) {
-	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+	done, err := g.preExec(args)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}
@@ -99,9 +101,11 @@ func (g *Git) runRaw(args ...string) ([]byte, error) {
 
 // runWithStdin executes a git command feeding input on stdin.
 func (g *Git) runWithStdin(input []byte, args ...string) ([]byte, error) {
-	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+	done, err := g.preExec(args)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	if g.gitDir != "" {
 		args = append([]string{"--git-dir=" + g.gitDir}, args...)
 	}

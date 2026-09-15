@@ -250,3 +250,216 @@ func TestRemoteRefCacheCollapsesConcurrentReads(t *testing.T) {
 			readers, entries)
 	}
 }
+
+// TestRemoteRefCacheDroppedByPushWithEnv is gastown-vvq's behavioural half, and
+// it drives the PRODUCTION entry point rather than the exec path underneath it.
+//
+// That distinction is the whole test. Calling runWithEnvAndTimeout directly with
+// a hand-built {"push", ...} would exercise the guard and prove nothing about
+// whether any real caller reaches it -- a fixture constructed by the test tells
+// you about the fixture. PushWithEnv is the method integration land actually
+// calls (internal/cmd/mq_integration.go), and it is the reason the gap was
+// reachable at all.
+//
+// The assertion is that a push through PushWithEnv inside an open memo window
+// makes the next RemoteBranchTip live. Before the fix it served the pre-push
+// sha, with no error anywhere: the push succeeded, the read succeeded, and the
+// answer was silently one commit behind -- a failure that reads as a stale
+// remote rather than as a cache bug.
+func TestRemoteRefCacheDroppedByPushWithEnv(t *testing.T) {
+	clone, _ := newRemoteFixture(t)
+	g := NewGit(clone)
+
+	// The bare repo, asked for by git rather than rebuilt from path arithmetic.
+	// It is the independent witness that the push actually landed, so a push
+	// that silently did nothing cannot masquerade as a memo that was dropped.
+	bare := runIn(t, clone, "config", "--get", "remote.origin.url")
+
+	BeginRemoteRefCache()
+	defer EndRemoteRefCache()
+
+	before, err := g.RemoteBranchTip("origin", "feature")
+	if err != nil {
+		t.Fatalf("RemoteBranchTip: %v", err)
+	}
+
+	// Build the new commit with raw git so the setup itself cannot drop the memo
+	// -- otherwise the test passes for a reason that has nothing to do with the
+	// push under test.
+	runIn(t, clone, "checkout", "feature")
+	if err := os.WriteFile(filepath.Join(clone, "f.txt"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, clone, "add", "f.txt")
+	runIn(t, clone, "commit", "-m", "two")
+	want := runIn(t, clone, "rev-parse", "feature")
+	if want == before {
+		t.Fatal("fixture did not create a new commit")
+	}
+
+	if err := g.PushWithEnv("origin", "feature", false, []string{"GIT_TERMINAL_PROMPT=0"}); err != nil {
+		t.Fatalf("PushWithEnv: %v", err)
+	}
+	if landed := runIn(t, bare, "rev-parse", "refs/heads/feature"); landed != want {
+		t.Fatalf("push did not land on the remote: remote at %s, want %s", landed, want)
+	}
+
+	after, err := g.RemoteBranchTip("origin", "feature")
+	if err != nil {
+		t.Fatalf("RemoteBranchTip after push: %v", err)
+	}
+	if after == before {
+		t.Fatalf("PushWithEnv did not drop the memo: still serving the pre-push sha %s "+
+			"while the remote is at %s (gastown-vvq)", before, want)
+	}
+	if after != want {
+		t.Fatalf("post-push read wrong: got %s want %s", after, want)
+	}
+}
+
+// TestRemoteRefCacheGuardSeesSubcommandBehindGlobalFlags pins the parser the
+// guard uses. It drives preExec rather than the predicate underneath it, so it
+// also covers the wiring: a correct predicate that preExec did not consult would
+// pass a direct test of the predicate and fail this one. `git -C /repo push origin main` has "/repo" as its first non-flag
+// token, so a first-non-flag-token rule reads the subcommand as "/repo" and
+// leaves a stale memo standing across a real push; the same holds for every
+// value-carrying global flag. gitSubcommand -- the parser
+// guardUnsafeTownRootMutation already used -- skips the value.
+//
+// Both directions are covered deliberately. The "-C push" row is the one a
+// first-token parser gets wrong the OTHER way: a directory that happens to be
+// named "push" is not a push, and dropping the memo there is a silent
+// performance regression with no failing symptom.
+func TestRemoteRefCacheGuardSeesSubcommandBehindGlobalFlags(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		drop bool
+	}{
+		{"bare push", []string{"push", "origin", "main"}, true},
+		{"bare fetch", []string{"fetch", "origin"}, true},
+		{"-C then push", []string{"-C", "/repo", "push", "origin", "main"}, true},
+		{"-c then push", []string{"-c", "user.name=t", "push", "origin", "main"}, true},
+		{"--git-dir= then fetch", []string{"--git-dir=/r/.git", "fetch", "origin"}, true},
+		{"--work-tree then remote", []string{"--work-tree", "/r", "remote", "prune", "origin"}, true},
+		{"read-only rev-parse", []string{"rev-parse", "HEAD"}, false},
+		{"-C then status", []string{"-C", "/repo", "status"}, false},
+		{"a directory named push", []string{"-C", "push", "status"}, false},
+		{"no subcommand at all", []string{"--version"}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			BeginRemoteRefCache()
+			defer EndRemoteRefCache()
+
+			remoteRefCacheMu.Lock()
+			remoteRefCacheEntries["seed"] = &remoteRefEntry{}
+			remoteRefCacheMu.Unlock()
+
+			g := NewGit(t.TempDir())
+			done, err := g.preExec(tc.args)
+			if err != nil {
+				t.Fatalf("preExec: %v", err)
+			}
+			defer done()
+
+			remoteRefCacheMu.Lock()
+			dropped := len(remoteRefCacheEntries) == 0
+			remoteRefCacheMu.Unlock()
+
+			if dropped != tc.drop {
+				verb := map[bool]string{true: "dropped", false: "kept"}
+				t.Fatalf("git %s: memo %s, want %s", strings.Join(tc.args, " "),
+					verb[dropped], verb[tc.drop])
+			}
+		})
+	}
+}
+
+// TestRemoteRefCacheDropIsClosedOnBothSidesOfAMutation is the regression test
+// for the race codex found in the first cut of gastown-vvq's fix: dropping the
+// memo only BEFORE the subprocess is not enough.
+//
+// Once the capacity walk runs in parallel (gastown-o8q), a read can start after
+// the pre-drop and finish before the push does. It writes the PRE-push answer
+// into the freshly emptied map, and that answer survives the push -- the exact
+// stale read the guard exists to prevent, arriving through a three-line window
+// instead of through a missing call.
+//
+// IT IS DELIBERATELY NOT A RACING TEST. A version that spawns a reader against a
+// real push discriminates only when the goroutines interleave the wrong way, and
+// a test that fails one run in five is not evidence when it passes -- the same
+// reason the concurrent-read test above asserts memo CARDINALITY rather than
+// racing a moving ref. What the race needs is an entry that appears BETWEEN the
+// two drops, so this places one there directly and asserts it does not survive.
+// The ordering is the property; the concurrency is only how it is reached.
+func TestRemoteRefCacheDropIsClosedOnBothSidesOfAMutation(t *testing.T) {
+	g := NewGit(t.TempDir())
+
+	BeginRemoteRefCache()
+	defer EndRemoteRefCache()
+
+	// An answer memoized before the push, as a real pass would have.
+	remoteRefCacheMu.Lock()
+	remoteRefCacheEntries["pre"] = &remoteRefEntry{}
+	remoteRefCacheMu.Unlock()
+
+	done, err := g.preExec([]string{"push", "origin", "main"})
+	if err != nil {
+		t.Fatalf("preExec: %v", err)
+	}
+
+	remoteRefCacheMu.Lock()
+	clearedUpFront := len(remoteRefCacheEntries) == 0
+	// The racing read: it lands while the subprocess is still in flight, so the
+	// value it stores describes the remote as it was BEFORE the push.
+	remoteRefCacheEntries["raced"] = &remoteRefEntry{}
+	remoteRefCacheMu.Unlock()
+
+	if !clearedUpFront {
+		t.Fatal("preExec did not drop the memo before the subprocess")
+	}
+
+	done()
+
+	remoteRefCacheMu.Lock()
+	left := len(remoteRefCacheEntries)
+	remoteRefCacheMu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d memo entry(ies) survived the push: an answer cached while the "+
+			"push was in flight describes the pre-push remote and must not outlive it",
+			left)
+	}
+}
+
+// TestRemoteRefCacheSurvivesAReadOnlyCommand is the negative control for the
+// test above, and without it that one proves nothing useful: a preExec hook that
+// emptied the memo after EVERY command would pass it and would also make the
+// memo worthless, since a dispatch pass runs many read-only git commands between
+// its remote lookups. That regression has no failing symptom -- only a slower
+// pass, which is the condition gastown-o8q exists to fix.
+func TestRemoteRefCacheSurvivesAReadOnlyCommand(t *testing.T) {
+	g := NewGit(t.TempDir())
+
+	BeginRemoteRefCache()
+	defer EndRemoteRefCache()
+
+	remoteRefCacheMu.Lock()
+	remoteRefCacheEntries["kept"] = &remoteRefEntry{}
+	remoteRefCacheMu.Unlock()
+
+	done, err := g.preExec([]string{"rev-parse", "HEAD"})
+	if err != nil {
+		t.Fatalf("preExec: %v", err)
+	}
+	done()
+
+	remoteRefCacheMu.Lock()
+	left := len(remoteRefCacheEntries)
+	remoteRefCacheMu.Unlock()
+	if left != 1 {
+		t.Fatalf("a read-only command left %d memo entries, want 1: dropping the memo "+
+			"on every command makes it worthless, and nothing fails when it does", left)
+	}
+}
