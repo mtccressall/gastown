@@ -1445,6 +1445,42 @@ func loadRigCommandVars(townRoot, rig string) []string {
 	return vars
 }
 
+// printRigCommandVarsDryRun renders, for a dry run, the rig command vars a real
+// dispatch would inject. Both dry-run exit points call this so their output cannot
+// drift apart.
+//
+// THE EMPTINESS TEST IS NOT len(vars)==0, AND THAT IS THE WHOLE REASON THIS IS A
+// FUNCTION. base_branch comes from LoadRigConfig -- a DIFFERENT source from
+// .merge_queue -- and is appended BEFORE the mq==nil early return below, so a rig
+// with no qualification gate at all still returns a length-1 slice. Keying on the
+// slice length therefore flatters exactly the rig that has no gate: steward renders
+// one var and zero gate commands. Count the five qualification commands instead.
+// Caught by gastown/refinery reviewing the first version of this, which shipped the
+// length test (gt-kogm).
+func printRigCommandVarsDryRun(townRoot, rigName string) {
+	vars := loadRigCommandVars(townRoot, rigName)
+	gate := 0
+	for _, v := range vars {
+		switch {
+		case strings.HasPrefix(v, "setup_command="),
+			strings.HasPrefix(v, "typecheck_command="),
+			strings.HasPrefix(v, "lint_command="),
+			strings.HasPrefix(v, "test_command="),
+			strings.HasPrefix(v, "build_command="):
+			gate++
+		}
+	}
+	if gate == 0 {
+		fmt.Printf("  rig command vars (%s): NO QUALIFICATION GATE COMMANDS -- gate is vacuous for this rig\n", rigName)
+	} else {
+		fmt.Printf("  rig command vars (%s), injected at dispatch as formula defaults:\n", rigName)
+	}
+	// List whatever did resolve either way, so the vacuous case hides nothing.
+	for _, v := range vars {
+		fmt.Printf("      --var %s\n", v)
+	}
+}
+
 // shouldAcceptPermissionWarning checks if the agent emits a bypass-permissions
 // warning on startup that needs to be acknowledged via tmux.
 func shouldAcceptPermissionWarning(agentName string) bool {
