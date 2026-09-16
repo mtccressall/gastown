@@ -92,3 +92,40 @@ func TestDigestMissingCyclesFailsTowardKeeping(t *testing.T) {
 		})
 	}
 }
+
+// codex P1: a patrol-shaped title is not evidence of a REPORTED cycle. Roots are
+// also closed by cleanup and rollback paths that leave no summary, and this
+// command counts, archives and permanently deletes what it selects.
+func TestHasPatrolReportBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"a reported cycle", "Patrol report: ABBREVIATED 23:54Z. Inbox clear.", true},
+		{"leading whitespace is fine", "\n  Patrol report: FULL 02:31-02:37Z", true},
+		{"burned root", "burned: replaced by new patrol cycle", false},
+		{"empty", "", false},
+		{"the formula preamble, not a report", "Per-rig worker monitor patrol loop.\n\nThe Witness is…", false},
+		{"mentions the phrase later, but did not report", "cleanup: no Patrol report: here", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasPatrolReportBody(tc.body); got != tc.want {
+				t.Fatalf("hasPatrolReportBody(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// The delete path takes verified ids and must be inert on an empty set, since
+// "nothing to delete" and "delete everything matching a re-query" are the two
+// outcomes that differ here (gt-fwzgp).
+func TestCycleIDsAndEmptyDeleteIsInert(t *testing.T) {
+	ids := cycleIDs([]PatrolCycleEntry{{ID: "gt-wisp-a"}, {ID: "gt-wisp-b"}})
+	if len(ids) != 2 || ids[0] != "gt-wisp-a" || ids[1] != "gt-wisp-b" {
+		t.Fatalf("cycleIDs = %v", ids)
+	}
+	if n, err := deletePatrolDigestsByID(nil); n != 0 || err != nil {
+		t.Fatalf("deletePatrolDigestsByID(nil) = %d, %v; want 0, nil", n, err)
+	}
+}

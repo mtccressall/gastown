@@ -176,8 +176,12 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: digest %s is missing %d of %d cycles (first: %s); sources KEPT\n",
 			digestID, len(missing), len(digest.Cycles), missing[0])
 	} else {
+		// Delete EXACTLY the ids that were verified present, never a fresh date
+		// query: a cycle that closes between the query above and this point would
+		// match the date but is absent from the aggregate, and these sources are
+		// unrecoverable (codex P1).
 		var deleteErr error
-		deletedCount, deleteErr = deletePatrolDigests(targetDate)
+		deletedCount, deleteErr = deletePatrolDigestsByID(cycleIDs(digest.Cycles))
 		if deleteErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to delete some source digests: %v\n", deleteErr)
 		}
@@ -252,6 +256,18 @@ func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
 			continue
 		}
 
+		// A patrol-shaped title is not evidence of a REPORTED cycle. Roots are
+		// also closed by cleanup and rollback paths (burnPreviousPatrolWisps,
+		// rollbackSuccessorPatrol), which leave no summary; counting those
+		// inflates the day and deleting them destroys nothing useful but is still
+		// a delete of something this command did not aggregate (codex P1).
+		// `gt patrol report` writes "Patrol report: ..." into the description, so
+		// that prefix is the evidence. Legacy squash digests are exempt: they
+		// carry a "Digest: " title and their own body format.
+		if !isLegacyDigestTitle(issue.Title) && !hasPatrolReportBody(issue.Description) {
+			continue
+		}
+
 		// A cycle belongs to the day it ENDED, not the day it began. Patrol wisps
 		// routinely span midnight — and a role with a quiet rig can hold one open
 		// for days — so anchoring on CreatedAt files those cycles under a day
@@ -280,6 +296,19 @@ func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
 	}
 
 	return patrolDigests, nil
+}
+
+// isLegacyDigestTitle marks the squash-era digest, which has its own body shape
+// and predates the "Patrol report:" convention.
+func isLegacyDigestTitle(title string) bool {
+	return strings.HasPrefix(title, "Digest: ")
+}
+
+// hasPatrolReportBody reports whether a wisp carries a summary written by
+// `gt patrol report`, as opposed to having been closed by a cleanup or rollback
+// path that leaves the body empty.
+func hasPatrolReportBody(description string) bool {
+	return strings.HasPrefix(strings.TrimSpace(description), "Patrol report:")
 }
 
 // isPatrolCycleTitle reports whether a bead title names a patrol cycle record.
@@ -483,21 +512,24 @@ func findExistingPatrolDigest(dateStr string) (string, error) {
 }
 
 // deletePatrolDigests deletes ephemeral patrol digest beads for a target date.
-func deletePatrolDigests(targetDate time.Time) (int, error) {
-	// Query patrol digests for the target date
-	cycles, err := queryPatrolDigests(targetDate)
-	if err != nil {
-		return 0, err
+// cycleIDs returns the ids of the cycles that were aggregated and verified.
+func cycleIDs(cycles []PatrolCycleEntry) []string {
+	ids := make([]string, 0, len(cycles))
+	for _, c := range cycles {
+		ids = append(ids, c.ID)
 	}
+	return ids
+}
 
-	if len(cycles) == 0 {
+// deletePatrolDigestsByID removes exactly the ids handed to it.
+//
+// It takes ids rather than a date on purpose. Re-running the date query here
+// would pick up any cycle that closed since the aggregate was built, and that
+// cycle's body is NOT in the digest that was just verified — a permanent loss of
+// a record nothing else holds (gt-fwzgp, codex P1).
+func deletePatrolDigestsByID(idsToDelete []string) (int, error) {
+	if len(idsToDelete) == 0 {
 		return 0, nil
-	}
-
-	// Collect IDs to delete
-	var idsToDelete []string
-	for _, cycle := range cycles {
-		idsToDelete = append(idsToDelete, cycle.ID)
 	}
 
 	// Delete in batch
