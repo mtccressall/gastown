@@ -616,18 +616,25 @@ func (m *Mailbox) markReadBeads(id string) error {
 
 	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
+	closedIn := primary
 	err := m.closeInDir(id, primary)
 	if errors.Is(err, ErrMessageNotFound) && primary != m.beadsDir {
 		// Cross-rig bead IDs (e.g. ne-*) may live in the home DB when created
 		// via the mail router (which always uses town beads). Fall back to
 		// m.beadsDir before giving up. See ne-bgr.
-		err = m.closeInDir(id, m.beadsDir)
+		closedIn = m.beadsDir
+		err = m.closeInDir(id, closedIn)
 	}
 	if err == nil {
-		// Only after the close succeeds. A label written on a failed attempt
-		// would record the time of that failure, and recordHandledAt treats the
-		// label as permanent, so a later successful retry would keep it.
-		m.recordHandledAt(id, time.Now().UTC())
+		// Label the database the close ACTUALLY used. Recomputing the prefix
+		// route here would send both label operations to the database where the
+		// bead was not found, and since the write is best-effort the symptom is
+		// a cross-rig message silently missing its audit label (codex).
+		//
+		// And only after the close succeeds: a label written on a failed attempt
+		// records the time of that failure, and recordHandledAt treats it as
+		// permanent, so a later successful retry would keep the wrong timestamp.
+		m.recordHandledAt(id, closedIn, time.Now().UTC())
 	}
 	return err
 }
@@ -940,7 +947,7 @@ func (m *Mailbox) deleteLegacy(id string) error {
 // Errors are reported and swallowed. By this point the archive copy is already
 // durable, and failing an archive because an audit label could not be written
 // would trade the thing that matters for the thing that merely helps.
-func (m *Mailbox) recordHandledAt(id string, at time.Time) {
+func (m *Mailbox) recordHandledAt(id, beadsDir string, at time.Time) {
 	if m.legacy {
 		return
 	}
@@ -962,7 +969,7 @@ func (m *Mailbox) recordHandledAt(id string, at time.Time) {
 	}
 
 	workDir := m.workDir
-	routed := routedBeadsDirForID(m.beadsDir, id)
+	routed := routedBeadsDirForID(beadsDir, id)
 	if existing, err := readBeadLabelsShared(workDir, routed, id); err == nil {
 		for _, label := range existing {
 			if strings.HasPrefix(label, HandledAtPrefix) {
