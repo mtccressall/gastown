@@ -265,11 +265,17 @@ func (m *Mailbox) storeRecordHandledAt(id, label string) {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
 
-	if si, err := m.store.GetIssue(ctx, id); err == nil && si != nil {
-		for _, existing := range si.Labels {
-			if strings.HasPrefix(existing, HandledAtPrefix) {
-				return // already recorded
-			}
+	si, err := m.store.GetIssue(ctx, id)
+	if err != nil || si == nil {
+		// Same rule as the bd path: without the current labels, adding one risks
+		// a second distinct timestamp on a later re-archive, so skip the write
+		// rather than break idempotency (codex).
+		fmt.Fprintf(os.Stderr, "Warning: could not read %s from the store (%v); not recording %s\n", id, err, label)
+		return
+	}
+	for _, existing := range si.Labels {
+		if strings.HasPrefix(existing, HandledAtPrefix) {
+			return // already recorded
 		}
 	}
 	if err := m.store.AddLabel(ctx, id, label, ""); err != nil {

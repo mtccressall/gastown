@@ -974,11 +974,19 @@ func (m *Mailbox) recordHandledAt(id, beadsDir string, at time.Time) {
 	// database where the bead was NOT found — undoing the whole point of passing
 	// it in, for exactly the cross-rig messages this handles (codex).
 	routed := beadsDir
-	if existing, err := readBeadLabelsShared(workDir, routed, id); err == nil {
-		for _, label := range existing {
-			if strings.HasPrefix(label, HandledAtPrefix) {
-				return // already recorded
-			}
+	existing, err := readBeadLabelsShared(workDir, routed, id)
+	if err != nil {
+		// FAIL TOWARD NOT WRITING. Without the current labels there is no way to
+		// know whether handled-at is already there, and adding one anyway can
+		// append a SECOND distinct timestamp on a later re-archive — breaking the
+		// idempotency this function promises. A missing audit label is
+		// recoverable; two contradictory ones are not (codex).
+		fmt.Fprintf(os.Stderr, "Warning: could not read labels for %s (%v); not recording %s\n", id, err, label)
+		return
+	}
+	for _, l := range existing {
+		if strings.HasPrefix(l, HandledAtPrefix) {
+			return // already recorded
 		}
 	}
 	ctx, cancel := bdWriteCtx()
