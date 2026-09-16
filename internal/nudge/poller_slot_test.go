@@ -1,3 +1,13 @@
+//go:build !windows
+
+// This test drives real child processes and reaps them with syscall.Kill,
+// syscall.Wait4 and syscall.WNOHANG, none of which exist on Windows — and the
+// repo targets Windows (30 tracked *_windows.go files), so without this
+// constraint the whole package fails to vet there while passing on Linux.
+// Found by gastown/refinery against a control: GOOS=windows go vet
+// ./internal/nudge/ is clean on main and "undefined: syscall.Kill" with this
+// branch merged (gastown-cb2).
+
 package nudge
 
 import (
