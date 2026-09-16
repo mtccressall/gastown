@@ -887,8 +887,16 @@ func (m *Mailbox) Delete(id string) error {
 	//
 	// Before the close, and best-effort: an audit label must never cost the
 	// clearing operation itself.
+	if err := m.MarkRead(id); err != nil { // beads: just acknowledge/close
+		return err
+	}
+	// AFTER the close, not before. If the ack or the close fails, Delete returns
+	// an error and the message is still live — labelling it handled at that
+	// point records the time of a FAILED attempt, and recordHandledAt treats the
+	// label as permanent, so a later successful retry would keep the wrong
+	// timestamp (codex).
 	m.recordHandledAt(id, time.Now().UTC())
-	return m.MarkRead(id) // beads: just acknowledge/close
+	return nil
 }
 
 func (m *Mailbox) deleteLegacy(id string) error {
@@ -934,7 +942,12 @@ func (m *Mailbox) recordHandledAt(id string, at time.Time) {
 	if m.legacy {
 		return
 	}
-	workDir := filepath.Dir(m.beadsDir)
+	// m.workDir, NOT filepath.Dir(m.beadsDir): for mailboxes built by
+	// NewMailboxBeads the beadsDir is empty, so that expression yields "." and
+	// both bd calls run against the process's current directory. The error is
+	// swallowed by design, so the symptom would be a label that silently never
+	// appears — a fix that works only where it happens to be tested (codex).
+	workDir := m.workDir
 	routed := routedBeadsDirForID(m.beadsDir, id)
 	if existing, err := readBeadLabelsShared(workDir, routed, id); err == nil {
 		for _, label := range existing {
