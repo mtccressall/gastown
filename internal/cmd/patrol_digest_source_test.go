@@ -73,8 +73,8 @@ func TestDigestMissingCyclesFailsTowardKeeping(t *testing.T) {
 		body        string
 		wantMissing int
 	}{
-		{"carries both", "…gt-wisp-aaa… and …gt-wisp-bbb…", 0},
-		{"carries one", "…gt-wisp-aaa… only", 1},
+		{"carries both", "### 15:04Z — deacon (gt-wisp-aaa)\n\nbody\n\n### 15:20Z — witness (gt-wisp-bbb)\n\nbody\n", 0},
+		{"carries one", "### 15:04Z — deacon (gt-wisp-aaa)\n\nbody mentioning gt-wisp-bbb in prose\n", 1},
 		{"counts only, the destructive case", "Total Cycles: 2\nBy Role\n- deacon: 1", 2},
 		{"empty", "", 2},
 	} {
@@ -127,5 +127,40 @@ func TestCycleIDsAndEmptyDeleteIsInert(t *testing.T) {
 	}
 	if n, err := deletePatrolDigestsByID(nil); n != 0 || err != nil {
 		t.Fatalf("deletePatrolDigestsByID(nil) = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// codex: a bare substring test marks a cycle archived when its id merely appears
+// inside ANOTHER cycle's prose — and patrol summaries quote bead ids constantly,
+// this session's own cycles included. The caller then deletes a source whose
+// entry is absent, permanently. Coverage means the cycle has its OWN heading.
+func TestArchivedCycleIDsRequiresItsOwnEntry(t *testing.T) {
+	body := "## Cycles\n\n" +
+		"### 15:04Z — deacon (gt-wisp-aaa)\n\n" +
+		"Patrol report: cleared the queue and cited gt-wisp-bbb and gt-wisp-aaalong in passing.\n\n" +
+		"### 15:20Z — witness (gt-wisp-ccc)\n\n" +
+		"Patrol report: quiet.\n\n"
+
+	archived := archivedCycleIDs(body)
+
+	for _, id := range []string{"gt-wisp-aaa", "gt-wisp-ccc"} {
+		if !archived[id] {
+			t.Errorf("%s has its own heading but was not counted as archived", id)
+		}
+	}
+	// Mentioned inside another cycle's prose, with no entry of its own.
+	if archived["gt-wisp-bbb"] {
+		t.Error("gt-wisp-bbb was only QUOTED in prose; counting it archived would delete an unarchived source")
+	}
+	// A longer id that merely contains an archived one as a prefix.
+	if archived["gt-wisp-aaalong"] {
+		t.Error("gt-wisp-aaalong has no entry; a prefix match must not cover it")
+	}
+
+	missing := missingCycleIDs(body, []PatrolCycleEntry{
+		{ID: "gt-wisp-aaa"}, {ID: "gt-wisp-bbb"}, {ID: "gt-wisp-aaalong"},
+	})
+	if len(missing) != 2 {
+		t.Fatalf("missingCycleIDs = %v, want the two without their own entries", missing)
 	}
 }

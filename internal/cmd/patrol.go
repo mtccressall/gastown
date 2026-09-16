@@ -229,83 +229,80 @@ func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, date
 		return nil // nothing stranded
 	}
 
-	missing, checkErr := digestMissingCycles(existingID, cycles)
-	if checkErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s and %s could not be read (%v); sources KEPT\n",
-			len(cycles), dateStr, existingID, checkErr)
-		return nil
-	}
-
-	var covered []string
-	missingSet := make(map[string]bool, len(missing))
-	for _, id := range missing {
-		missingSet[id] = true
-	}
-	for _, c := range cycles {
-		if !missingSet[c.ID] {
-			covered = append(covered, c.ID)
+	// COVERAGE IS PER CYCLE, ACROSS EVERY REPORT FOR THE DAY. The primary and any
+	// supplements each archive part of the day, so asking one bead whether it
+	// holds everything would write a further supplement duplicating what is
+	// already archived (codex). Read the whole set once.
+	covered := supplementCoverage(dateStr)
+	if len(covered) == 0 {
+		// supplementCoverage failing and the day genuinely being empty look the
+		// same, so fall back to reading the primary directly rather than treating
+		// an unreadable set as "nothing archived" and deleting on that basis.
+		missing, checkErr := digestMissingCycles(existingID, cycles)
+		if checkErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s and %s could not be read (%v); sources KEPT\n",
+				len(cycles), dateStr, existingID, checkErr)
+			return nil
 		}
-	}
-
-	// WRITE A SUPPLEMENTAL REPORT FOR THE LATE ONES.
-	// A cycle closing after the report was built is missing from it, and the
-	// earlier version of this code kept it and told the operator to "re-run after
-	// adding them" — which nothing could do, so those cycles were unaggregated
-	// forever (codex P2). Appending makes the reconcile path converge.
-	if len(missing) > 0 {
-		byID := make(map[string]PatrolCycleEntry, len(cycles))
-		for _, c := range cycles {
-			byID[c.ID] = c
-		}
-		late := make([]PatrolCycleEntry, 0, len(missing))
+		covered = make(map[string]bool, len(cycles))
+		missingSet := make(map[string]bool, len(missing))
 		for _, id := range missing {
-			if c, ok := byID[id]; ok {
-				late = append(late, c)
+			missingSet[id] = true
+		}
+		for _, c := range cycles {
+			if !missingSet[c.ID] {
+				covered[c.ID] = true
 			}
 		}
+	}
+
+	var late []PatrolCycleEntry
+	for _, c := range cycles {
+		if !covered[c.ID] {
+			late = append(late, c)
+		}
+	}
+
+	if len(late) > 0 {
 		supplementID, err := createSupplementalPatrolDigest(dateStr, existingID, late)
-		if err != nil {
+		switch {
+		case err != nil:
 			fmt.Fprintf(os.Stderr, "warning: could not write a supplemental report for %d late cycles (%v); they are KEPT\n",
 				len(late), err)
-		} else {
+		case supplementID == "":
+			// Everything was archived elsewhere between the two reads; nothing
+			// written, nothing to verify.
+		default:
 			fmt.Printf("  Wrote supplemental report %s for %d late cycles\n", supplementID, len(late))
-			// Re-verify by reading back the SUPPLEMENT, never by assuming it landed.
-			if stillMissing, err := digestMissingCycles(supplementID, late); err == nil {
-				// A cycle is covered if the ORIGINAL report carries it or the
-				// supplement does. Recomputed from both, never assumed.
-				stillMissingSet := make(map[string]bool, len(stillMissing))
-				for _, id := range stillMissing {
-					stillMissingSet[id] = true
-				}
-				covered = covered[:0]
-				var remaining []string
-				for _, c := range cycles {
-					if !missingSet[c.ID] || !stillMissingSet[c.ID] {
-						covered = append(covered, c.ID)
-					} else {
-						remaining = append(remaining, c.ID)
-					}
-				}
-				missing = remaining
-			}
+		}
+		// Re-read coverage from the store either way: what gets deleted must rest
+		// on what the store SAYS, never on what this function believes it wrote.
+		covered = supplementCoverage(dateStr)
+	}
+
+	var toDelete, stillMissing []string
+	for _, c := range cycles {
+		if covered[c.ID] {
+			toDelete = append(toDelete, c.ID)
+		} else {
+			stillMissing = append(stillMissing, c.ID)
 		}
 	}
 
-	if len(covered) == 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s but %s carries none of them; sources KEPT\n",
-			len(cycles), dateStr, existingID)
+	if len(toDelete) == 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s but no report carries them; sources KEPT\n",
+			len(cycles), dateStr)
 		return nil
 	}
 
-	deleted, delErr := deletePatrolDigestsByID(covered)
+	deleted, delErr := deletePatrolDigestsByID(toDelete)
 	if delErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: retrying delete of covered sources failed: %v\n", delErr)
 		return nil
 	}
-	fmt.Printf("  Cleared %d stranded source cycles now present in %s\n", deleted, existingID)
-	if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d source cycles could not be added to %s and were KEPT\n",
-			len(missing), existingID)
+	fmt.Printf("  Cleared %d stranded source cycles now archived for %s\n", deleted, dateStr)
+	if len(stillMissing) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles are archived nowhere and were KEPT\n", len(stillMissing))
 	}
 	return nil
 }
@@ -328,6 +325,28 @@ func createSupplementalPatrolDigest(dateStr, primaryID string, late []PatrolCycl
 	if existing := findSupplementCarrying(dateStr, late); existing != "" {
 		fmt.Printf("  Supplement %s already carries these %d late cycles; not writing another\n", existing, len(late))
 		return existing, nil
+	}
+
+	// Coverage is PER CYCLE across every report for the day, not per supplement.
+	// Late cycles can be spread over several supplements — one archived earlier
+	// plus one that just closed — and requiring a single supplement to hold them
+	// all would write yet another record duplicating what is already archived
+	// (codex). Supplement only what nothing carries yet.
+	if covered := supplementCoverage(dateStr); len(covered) > 0 {
+		var uncovered []PatrolCycleEntry
+		for _, c := range late {
+			if !covered[c.ID] {
+				uncovered = append(uncovered, c)
+			}
+		}
+		if len(uncovered) == 0 {
+			fmt.Printf("  All %d late cycles are already archived across this date's reports; not writing another\n", len(late))
+			return "", nil
+		}
+		if len(uncovered) < len(late) {
+			fmt.Printf("  %d of %d late cycles are already archived; supplementing only the rest\n", len(late)-len(uncovered), len(late))
+		}
+		late = uncovered
 	}
 
 	digest := PatrolDigest{
@@ -408,6 +427,35 @@ func createSupplementalPatrolDigest(dateStr, primaryID string, late []PatrolCycl
 // SECOND permanent supplement holding the same cycles. A failure parsing bd's
 // output does the same. Searching first makes a transient verification failure
 // cost a retry rather than a duplicate archive record (codex P2).
+func supplementCoverage(dateStr string) map[string]bool {
+	covered := make(map[string]bool)
+	listCmd := exec.Command("bd", "list",
+		"--type=event",
+		"--status=open,in_progress,blocked,deferred,closed",
+		"--title", fmt.Sprintf("Patrol Report %s", dateStr),
+		"--json",
+		"--limit=0",
+	)
+	out, err := listCmd.Output()
+	if err != nil {
+		return covered
+	}
+	var events []struct {
+		ID          string `json:"id"`
+		Description string `json:"description"`
+		Notes       string `json:"notes"`
+	}
+	if err := json.Unmarshal(out, &events); err != nil {
+		return covered
+	}
+	for _, evt := range events {
+		for id := range archivedCycleIDs(evt.Description + "\n" + evt.Notes) {
+			covered[id] = true
+		}
+	}
+	return covered
+}
+
 func findSupplementCarrying(dateStr string, late []PatrolCycleEntry) string {
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
@@ -620,13 +668,43 @@ func digestMissingCycles(digestID string, cycles []PatrolCycleEntry) ([]string, 
 // defeating the production check entirely left the test green — on the path
 // that permanently deletes beads (found by gastown/refinery, by sabotage).
 func missingCycleIDs(body string, cycles []PatrolCycleEntry) []string {
+	archived := archivedCycleIDs(body)
 	var missing []string
 	for _, c := range cycles {
-		if !strings.Contains(body, c.ID) {
+		if !archived[c.ID] {
 			missing = append(missing, c.ID)
 		}
 	}
 	return missing
+}
+
+// archivedCycleIDs returns the ids that have their OWN entry in the body.
+//
+// A bare substring test is not good enough here and the failure direction is
+// deletion: patrol summaries routinely quote other beads' ids — this session's
+// own cycles cite wisp and report ids constantly — so a cycle mentioned inside
+// ANOTHER cycle's prose would read as archived and its source would be deleted
+// with its entry absent (codex). An id that is a prefix of another id has the
+// same effect.
+//
+// Entries are written as "### <time> — <role> (<id>)", so coverage means a
+// heading line that ENDS with exactly "(<id>)".
+func archivedCycleIDs(body string) map[string]bool {
+	archived := make(map[string]bool)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "###") || !strings.HasSuffix(line, ")") {
+			continue
+		}
+		open := strings.LastIndex(line, "(")
+		if open < 0 {
+			continue
+		}
+		if id := strings.TrimSpace(line[open+1 : len(line)-1]); id != "" {
+			archived[id] = true
+		}
+	}
+	return archived
 }
 
 // digestPayloadWithoutBodies returns the digest with each cycle's Description
