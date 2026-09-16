@@ -99,15 +99,46 @@ type errNotBd struct{}
 func (errNotBd) Error() string { return "some other error" }
 
 func TestWithoutJSONFlag(t *testing.T) {
-	in := []string{"create", "--labels", "a,b", "--json", "--", "subject --json"}
-	got := withoutJSONFlag(in)
-	want := []string{"create", "--labels", "a,b", "--", "subject --json"}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("got %v, want %v", got, want)
-		}
+	// The subject is positional, after "--", and sendToSingle uses that
+	// delimiter precisely so a flag-like subject survives. A subject that IS
+	// "--json" must therefore survive the fallback too; stripping it would send
+	// a different message than the caller wrote (codex P2 on this PR).
+	for _, tc := range []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			"removes the option",
+			[]string{"create", "--labels", "a,b", "--json", "--", "a subject"},
+			[]string{"create", "--labels", "a,b", "--", "a subject"},
+		},
+		{
+			"keeps a subject that is exactly --json",
+			[]string{"create", "--json", "--", "--json"},
+			[]string{"create", "--", "--json"},
+		},
+		{
+			"keeps a subject containing --json",
+			[]string{"create", "--json", "--", "subject --json"},
+			[]string{"create", "--", "subject --json"},
+		},
+		{
+			"no flag present",
+			[]string{"create", "--", "a subject"},
+			[]string{"create", "--", "a subject"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := withoutJSONFlag(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }

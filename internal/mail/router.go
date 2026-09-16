@@ -1868,10 +1868,18 @@ func bdRejectedJSONFlag(err error) bool {
 	return bdErr.ContainsError("unknown flag: --json") || bdErr.ContainsError("unknown shorthand flag") && bdErr.ContainsError("--json")
 }
 
-// withoutJSONFlag returns args with the --json flag removed.
+// withoutJSONFlag returns args with the --json OPTION removed. It stops at the
+// "--" delimiter: everything after it is the positional subject, which may
+// legitimately BE "--json" (sendToSingle uses the delimiter precisely so a
+// flag-like subject survives), and stripping it there would send a different
+// message than the caller wrote.
 func withoutJSONFlag(args []string) []string {
 	out := make([]string, 0, len(args))
-	for _, a := range args {
+	for i, a := range args {
+		if a == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
 		if a == "--json" {
 			continue
 		}
