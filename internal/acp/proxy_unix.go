@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/procsig"
+
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -40,17 +42,25 @@ func (p *Proxy) terminateProcess() {
 		debugLog(p.townRoot, "[Proxy] Shutdown: sending SIGTERM to agent process (pid=%d)", p.cmd.Process.Pid)
 		pgid, err := syscall.Getpgid(p.cmd.Process.Pid)
 		if err == nil {
-			// SAFETY: Never kill our own process group during tests/local runs
+			// SAFETY: Never kill our own process group during tests/local runs.
+			//
+			// That check is necessary and was never sufficient. It compares the
+			// target against OUR group and says nothing about whether the target
+			// is a group at all: a pgid of 1 passes it, and kill(-1, sig) is
+			// "every process this uid may signal". The SIGTERM branch below had
+			// no lower bound whatsoever, and the SIGKILL branch tested pgid > 0,
+			// which rejects 0 and the negatives and admits precisely the value
+			// that empties the machine. procsig supplies the missing half.
 			myPgid, _ := syscall.Getpgid(0)
 			if pgid != myPgid {
 				// Send SIGTERM to the entire process group
-				_ = syscall.Kill(-pgid, syscall.SIGTERM)
+				_ = procsig.SignalGroup(pgid, syscall.SIGTERM)
 			} else {
 				// Only kill the process itself if it shares our group
-				_ = syscall.Kill(p.cmd.Process.Pid, syscall.SIGTERM)
+				_ = procsig.SignalPID(p.cmd.Process.Pid, syscall.SIGTERM)
 			}
 		} else {
-			_ = syscall.Kill(p.cmd.Process.Pid, syscall.SIGTERM)
+			_ = procsig.SignalPID(p.cmd.Process.Pid, syscall.SIGTERM)
 		}
 
 		time.AfterFunc(2*time.Second, func() {
@@ -59,11 +69,15 @@ func (p *Proxy) terminateProcess() {
 					pgid, _ = syscall.Getpgid(p.cmd.Process.Pid)
 				}
 				myPgid, _ := syscall.Getpgid(0)
-				if pgid > 0 && pgid != myPgid {
-					_ = syscall.Kill(-pgid, syscall.SIGKILL)
-				} else {
-					_ = syscall.Kill(p.cmd.Process.Pid, syscall.SIGKILL)
+				if pgid != myPgid {
+					// A refusal here is not a reason to give up on the child:
+					// fall through to signalling the process itself, which is
+					// what the unguarded code did for pgid <= 0 anyway.
+					if procsig.SignalGroup(pgid, syscall.SIGKILL) == nil {
+						return
+					}
 				}
+				_ = procsig.SignalPID(p.cmd.Process.Pid, syscall.SIGKILL)
 			}
 		})
 	}

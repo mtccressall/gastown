@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/lock"
+	"github.com/steveyegge/gastown/internal/procsig"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -713,7 +714,7 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 		}
 
 		if s.Signal == "SIGTERM" && elapsed >= float64(sigkillGracePeriod) {
-			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			if err := procsig.SignalPID(pid, syscall.SIGKILL); err != nil {
 				if err != syscall.ESRCH {
 					lastErr = fmt.Errorf("SIGKILL PID %d: %w", pid, err)
 				}
@@ -746,7 +747,7 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 			continue
 		}
 
-		if err := syscall.Kill(zombie.PID, syscall.SIGTERM); err != nil {
+		if err := procsig.SignalPID(zombie.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
 				lastErr = fmt.Errorf("SIGTERM PID %d: %w", zombie.PID, err)
 			}
@@ -820,7 +821,7 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 
 		if s.Signal == "SIGTERM" && elapsed >= float64(sigkillGracePeriod) {
 			// Sent SIGTERM but still alive after grace period - escalate to SIGKILL
-			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			if err := procsig.SignalPID(pid, syscall.SIGKILL); err != nil {
 				if err != syscall.ESRCH {
 					lastErr = fmt.Errorf("SIGKILL PID %d: %w", pid, err)
 				}
@@ -855,7 +856,7 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
 		}
 
 		// New orphan - send SIGTERM
-		if err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {
+		if err := procsig.SignalPID(orphan.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
 				lastErr = fmt.Errorf("SIGTERM PID %d: %w", orphan.PID, err)
 			}

@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/procsig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -33,7 +34,7 @@ func cleanupOrphanedClaude(graceSecs int) {
 	// Send SIGTERM to all orphans
 	var termPIDs []int
 	for _, orphan := range orphans {
-		if err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {
+		if err := procsig.SignalPID(orphan.PID, syscall.SIGTERM); err != nil {
 			if err != syscall.ESRCH {
 				fmt.Printf("  %s PID %d: failed to send SIGTERM: %v\n",
 					style.Bold.Render("⚠"), orphan.PID, err)
@@ -65,7 +66,7 @@ func cleanupOrphanedClaude(graceSecs int) {
 		}
 
 		// Process still alive - send SIGKILL
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		if err := procsig.SignalPID(pid, syscall.SIGKILL); err != nil {
 			if err != syscall.ESRCH {
 				fmt.Printf("  %s PID %d: failed to send SIGKILL: %v\n",
 					style.Bold.Render("⚠"), pid, err)
@@ -115,12 +116,12 @@ func verifyNoOrphans() {
 	// Kill orphans (TTY-less)
 	for _, o := range orphans {
 		fmt.Printf("    PID %d (%s, age %ds) - sending SIGKILL\n", o.PID, o.Cmd, o.Age)
-		_ = syscall.Kill(o.PID, syscall.SIGKILL)
+		_ = procsig.SignalPID(o.PID, syscall.SIGKILL)
 	}
 
 	// Kill zombies (have TTY but no tmux session)
 	for _, z := range zombies {
 		fmt.Printf("    PID %d (%s, age %ds, tty %s) - sending SIGKILL\n", z.PID, z.Cmd, z.Age, z.TTY)
-		_ = syscall.Kill(z.PID, syscall.SIGKILL)
+		_ = procsig.SignalPID(z.PID, syscall.SIGKILL)
 	}
 }
