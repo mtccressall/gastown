@@ -27,11 +27,16 @@ func TestEnqueueReplyReminder_PrescribesReplyNotSend(t *testing.T) {
 	sessionID := "gt-crew-replyreminder"
 
 	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	// Realistic shape: ID is the in-memory msg- handle the router generates and
+	// never passes to bd create; PersistedID is what the store actually holds.
+	// The original fixture put a gt-wisp- id in ID, which made this test agree
+	// with a reminder that quoted an unresolvable id (gt-mnnx).
 	msg := &Message{
-		ID:      "gt-wisp-abc123",
-		From:    "gastown/witness",
-		To:      "deacon/",
-		Subject: "a question that wants an answer",
+		ID:          "msg-abc123",
+		PersistedID: "gt-wisp-abc123",
+		From:        "gastown/witness",
+		To:          "deacon/",
+		Subject:     "a question that wants an answer",
 	}
 
 	r.enqueueReplyReminder(msg, sessionID)
@@ -75,7 +80,10 @@ func TestEnqueueReplyReminder_PrescribesReplyNotSend(t *testing.T) {
 	if strings.Contains(body, "gt mail send "+msg.From) {
 		t.Errorf("reminder still prescribes `gt mail send <addr>`, which cannot thread and so cannot clear this reminder; got: %s", body)
 	}
-	if !strings.Contains(body, msg.ID) {
-		t.Errorf("reminder omits the message ID %q, which is the argument `gt mail reply` takes; got: %s", msg.ID, body)
+	if !strings.Contains(body, msg.PersistedID) {
+		t.Errorf("reminder omits the persisted bead id %q, which is the argument `gt mail reply` takes; got: %s", msg.PersistedID, body)
+	}
+	if strings.Contains(body, msg.ID) {
+		t.Errorf("reminder quotes the in-memory id %q, which no mailbox holds, so the prescribed command fails; got: %s", msg.ID, body)
 	}
 }

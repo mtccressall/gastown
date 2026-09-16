@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1166,6 +1167,9 @@ func (r *Router) sendToSingle(msg *Message) error {
 		args = append(args, "--ephemeral")
 	}
 
+	// --json so the assigned bead id can be read back; see parseCreatedBeadID.
+	args = append(args, "--json")
+
 	// End flag parsing with --, then add subject as positional argument.
 	// This prevents subjects like "--help" or "--json" from being parsed as flags.
 	args = append(args, "--", msg.Subject)
@@ -1176,7 +1180,22 @@ func (r *Router) sendToSingle(msg *Message) error {
 	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	createOut, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	if bdRejectedJSONFlag(err) {
+		// A bd that does not accept --json on create must not cost us the send:
+		// the flag only buys the assigned id, and the reminder has a fallback
+		// for not knowing it. Retry once without it (gt-mnnx).
+		cancel2 := func() {}
+		ctx, cancel2 = bdWriteCtx()
+		createOut, err = runBdCommand(ctx, withoutJSONFlag(args), filepath.Dir(beadsDir), beadsDir)
+		cancel2()
+	}
+	// Record the id bd actually assigned. Anything that tells the recipient to
+	// act on this message by id must use THIS one: msg.ID is an in-memory msg-
+	// handle that is never written to the store (gt-mnnx).
+	if err == nil {
+		msg.PersistedID = parseCreatedBeadID(createOut)
+	}
 	telemetry.RecordMailMessage(context.Background(), "send", telemetry.MailMessageInfo{
 		ID:       msg.ID,
 		From:     msg.From,
@@ -1824,7 +1843,7 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 		// guaranteed it would fire again — an instruction that causes the condition it
 		// warns about, aimed hardest at the agents who follow instructions carefully.
 		// `gt mail reply <id>` sets reply-to, prefixes "Re: " and threads correctly.
-		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail reply %s` — not in chat. Use `gt mail reply`, NOT `gt mail send`: send opens a new thread and cannot clear this reminder.", msg.From, msg.Subject, msg.ID),
+		Message:      replyReminderText(msg),
 		Priority:     nudge.PriorityNormal,
 		Kind:         "reply-reminder",
 		ThreadID:     msg.ThreadID,
@@ -1833,6 +1852,64 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
 	}
+}
+
+// bdRejectedJSONFlag reports whether a bd invocation failed specifically because
+// it does not know --json. Narrow on purpose: any other failure is a real send
+// failure and must surface.
+func bdRejectedJSONFlag(err error) bool {
+	if err == nil {
+		return false
+	}
+	bdErr, ok := err.(*bdError)
+	if !ok {
+		return false
+	}
+	return bdErr.ContainsError("unknown flag: --json") || bdErr.ContainsError("unknown shorthand flag") && bdErr.ContainsError("--json")
+}
+
+// withoutJSONFlag returns args with the --json flag removed.
+func withoutJSONFlag(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--json" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// parseCreatedBeadID reads the id bd assigned from `bd create --json` output.
+// Returns "" when the output cannot be parsed, so callers fall back rather than
+// quoting an id that resolves to nothing (gt-mnnx). Tolerates leading warning
+// lines on stdout by scanning for the first JSON object.
+func parseCreatedBeadID(out []byte) string {
+	start := bytes.IndexByte(out, '{')
+	if start < 0 {
+		return ""
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(out[start:], &created); err != nil {
+		return ""
+	}
+	return created.ID
+}
+
+// replyReminderText builds the reminder body. It names the PERSISTED bead id,
+// because msg.ID is an in-memory msg- handle that no mailbox holds: measured 0
+// of 25,532 rows carry a msg- prefix while 24,197 carry gt-wisp- (gt-mnnx). When
+// the persisted id is unknown the reminder says how to find the id instead of
+// quoting one that cannot resolve — a wrong id fails the same way the old
+// `gt mail send` advice did, by prescribing a command that cannot clear it.
+func replyReminderText(msg *Message) string {
+	const why = "Use `gt mail reply`, NOT `gt mail send`: send opens a new thread and cannot clear this reminder."
+	if msg.PersistedID != "" {
+		return fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail reply %s` — not in chat. %s", msg.From, msg.Subject, msg.PersistedID, why)
+	}
+	return fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail reply <id>`, taking the id from `gt mail inbox` — not in chat. %s", msg.From, msg.Subject, why)
 }
 
 func senderCanReceiveReply(from string) bool {
