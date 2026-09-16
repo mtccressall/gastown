@@ -353,7 +353,7 @@ func appendCyclesToDigest(digestID, dateStr string, late []PatrolCycleEntry) err
 
 	chunk.WriteString(fmt.Sprintf("LATE CYCLES appended for %s (closed after the report was built).\n"+
 		"THESE ARE ADDITIONAL TO THE TOTALS IN THE DESCRIPTION ABOVE, which were correct when written:\n"+
-		"  +%d cycles (%s)\n\n", len(late), strings.Join(roleParts, ", ")))
+		"  +%d cycles (%s)\n\n", dateStr, len(late), strings.Join(roleParts, ", ")))
 	for _, c := range late {
 		stamp := c.ClosedAt
 		if stamp.IsZero() {
