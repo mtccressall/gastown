@@ -138,6 +138,12 @@ type Message struct {
 	// AcknowledgeDeliveryBead to converge it. In-memory only.
 	deliveryPendingLeft bool
 
+	// PersistedID is the bead id bd assigned when the message was written, e.g.
+	// "gt-wisp-abc123". It differs from ID, which is an in-memory msg- handle
+	// that is deliberately never passed to bd create, so ONLY PersistedID names
+	// something a mailbox can resolve (gt-mnnx). In-memory only.
+	PersistedID string `json:"-"`
+
 	// SuppressNotify tells the router to skip all recipient notification
 	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
 	// In-memory only — not serialized.
