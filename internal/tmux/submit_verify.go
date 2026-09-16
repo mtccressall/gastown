@@ -250,6 +250,60 @@ func analyzeSubmission(escContent, needle, promptPrefix string) submitProbe {
 	return probeUnknown
 }
 
+// composerLineFrom returns the plain text of the composer line, or "" if none is
+// found. It reuses the same stripping and prompt-matching that analyzeSubmission
+// does, so it sees exactly the line the probe classified.
+//
+// gt-rd87: when the probe reports probeComposerDirty the nudge's typed payload has
+// been left APPENDED to whatever was already in the composer, and on this town's
+// rules that may be a human's unsent instruction (gt-sglq). We deliberately do NOT
+// clear it — the cost of destroying unsent text is unknown and clearing is exactly
+// what CLAUDE.md forbids doing blind. What we can do is WRITE THE TEXT OUT, which
+// converts a silent ambiguity into a recorded one: the concatenated line reaches the
+// caller in the error, so it is recoverable from the nudge's output instead of
+// existing only in a pane nobody will attribute later.
+// It returns the line and atCaptureEdge, which reports that the composer was the
+// FIRST line of the captured range. The capture starts a fixed number of lines
+// back, so a composer at index 0 may have had earlier content scrolled out of
+// range, and the text returned is then a floor rather than the whole composer.
+// The caller must say so: a short string that looks complete is the false-complete
+// shape this town keeps paying for, and here the captured text is what someone
+// later relies on to decide whether a human typed something.
+func composerLineFrom(escContent, promptPrefix string) (string, bool) {
+	if promptPrefix == "" {
+		return "", false
+	}
+	plain, dim := stripAnsiTrackDim(escContent)
+	lines, _ := splitRunesAndDim(plain, dim)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if matchesPromptPrefix(string(lines[i]), promptPrefix) {
+			return strings.TrimSpace(string(lines[i])), i == 0
+		}
+	}
+	return "", false
+}
+
+// composerDetail captures the target's composer as ONE logical line.
+//
+// The -J is load-bearing and is why this is a separate method from the probe
+// capture. Without it tmux emits a soft-wrapped composer as several PHYSICAL
+// lines, composerLineFrom returns only the one carrying the prompt, and the
+// recorded text is silently truncated at the pane width — in the code whose
+// reason for existing is preserving that text. Verified against a real tmux at
+// 30 columns: "-p -e" splits a 40-character composer mid-word, "-p -e -J"
+// returns it whole (gt-rd87, codex P2 on PR #50).
+//
+// The probe capture in probeSubmission deliberately does NOT take -J: it feeds
+// classification, not recovery, and joining lines there would change what
+// analyzeSubmission sees.
+func (t *Tmux) composerDetail(target, promptPrefix string) (string, bool) {
+	content, err := t.run("capture-pane", "-p", "-e", "-J", "-t", target, "-S", "-25")
+	if err != nil {
+		return "", false
+	}
+	return composerLineFrom(content, promptPrefix)
+}
+
 func (t *Tmux) probeSubmission(target, needle, promptPrefix string) submitProbe {
 	content, err := t.run("capture-pane", "-p", "-e", "-t", target, "-S", "-25")
 	if err != nil {
@@ -295,7 +349,18 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeUnknown:
 		return enterErr
 	case probeComposerDirty:
-		return fmt.Errorf("%w (composer contains other text after Enter)", ErrSubmitNotVerified)
+		// gt-rd87: capture what is actually in the composer before returning. The
+		// nudge payload is now concatenated with pre-existing text and nothing
+		// distinguishes the two halves in the pane, so this error is the only
+		// record of what was there.
+		detail := ""
+		if line, atEdge := t.composerDetail(target, promptPrefix); line != "" {
+			detail = fmt.Sprintf(" [composer now reads: %q]", line)
+			if atEdge {
+				detail += " [WARNING: the composer was the first captured line, so earlier text may have scrolled out of range and this reading may be incomplete]"
+			}
+		}
+		return fmt.Errorf("%w (composer contains other text after Enter; nudge payload was NOT cleared and is appended to it)%s", ErrSubmitNotVerified, detail)
 	case probeStranded:
 		return t.recoverStrandedComposer(target, message, needle, promptPrefix)
 	default:
