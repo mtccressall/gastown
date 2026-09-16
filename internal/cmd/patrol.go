@@ -422,7 +422,16 @@ func createPatrolDigestBead(digest PatrolDigest) (string, error) {
 	// summaries and replaced them with 137 bytes of totals (gt-fwzgp).
 	desc.WriteString("\n## Cycles\n\n")
 	for _, c := range digest.Cycles {
-		desc.WriteString(fmt.Sprintf("### %s — %s (%s)\n\n", c.CreatedAt.UTC().Format("15:04Z"), c.Role, c.ID))
+		// Label with the CLOSE time, matching the grouping above. A cycle created
+		// at 23:00 and closed at 02:00 belongs to the later day, and showing its
+		// creation time there reads as an entry from a day the report is not
+		// about (codex P2). The heading carries no date, so the time alone has to
+		// be consistent with the day it is filed under.
+		stamp := c.ClosedAt
+		if stamp.IsZero() {
+			stamp = c.CreatedAt
+		}
+		desc.WriteString(fmt.Sprintf("### %s — %s (%s)\n\n", stamp.UTC().Format("15:04Z"), c.Role, c.ID))
 		body := strings.TrimSpace(c.Description)
 		if body == "" {
 			body = "_(no summary recorded on this cycle)_"
