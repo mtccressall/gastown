@@ -647,27 +647,46 @@ func digestMissingCycles(digestID string, cycles []PatrolCycleEntry) ([]string, 
 		return nil, fmt.Errorf("reading back digest %s: %w", digestID, err)
 	}
 	// bd show --json returns an ARRAY (be-73x); accept either shape. Notes count
-	// as much as the description: a late cycle is APPENDED there by reconcile,
-	// and a check that ignored notes would call it missing forever.
+	// as much as the description for the legacy prose path.
 	var many []struct {
-		Description string `json:"description"`
-		Notes       string `json:"notes"`
+		Description string          `json:"description"`
+		Notes       string          `json:"notes"`
+		Payload     json.RawMessage `json:"payload"`
 	}
 	body := ""
+	payload := ""
 	if err := json.Unmarshal(out, &many); err == nil {
 		if len(many) == 0 {
 			return nil, fmt.Errorf("digest %s read back empty", digestID)
 		}
 		body = many[0].Description + "\n" + many[0].Notes
+		payload = string(many[0].Payload)
 	} else {
 		var one struct {
-			Description string `json:"description"`
-			Notes       string `json:"notes"`
+			Description string          `json:"description"`
+			Notes       string          `json:"notes"`
+			Payload     json.RawMessage `json:"payload"`
 		}
 		if err2 := json.Unmarshal(out, &one); err2 != nil {
 			return nil, fmt.Errorf("parsing digest %s: %w", digestID, err2)
 		}
 		body = one.Description + "\n" + one.Notes
+		payload = string(one.Payload)
+	}
+
+	// THE PAYLOAD IS AUTHORITATIVE HERE TOO. This function is the fallback used
+	// when supplementCoverage cannot be read, and it guards the same delete, so
+	// it must not fall back to a weaker guarantee: prose can quote a heading and
+	// name a cycle that was never archived (codex P1). Prose is consulted only
+	// when the payload yields nothing, which means a genuinely legacy report.
+	if fromPayload := payloadCycleIDs(payload); len(fromPayload) > 0 {
+		var missing []string
+		for _, c := range cycles {
+			if !fromPayload[c.ID] {
+				missing = append(missing, c.ID)
+			}
+		}
+		return missing, nil
 	}
 
 	return missingCycleIDs(body, cycles), nil
