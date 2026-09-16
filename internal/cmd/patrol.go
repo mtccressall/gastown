@@ -441,14 +441,26 @@ func supplementCoverage(dateStr string) map[string]bool {
 		return covered
 	}
 	var events []struct {
-		ID          string `json:"id"`
-		Description string `json:"description"`
-		Notes       string `json:"notes"`
+		ID          string          `json:"id"`
+		Description string          `json:"description"`
+		Notes       string          `json:"notes"`
+		Payload     json.RawMessage `json:"payload"`
 	}
 	if err := json.Unmarshal(out, &events); err != nil {
 		return covered
 	}
 	for _, evt := range events {
+		// The payload is authoritative. The heading parse is a FALLBACK for
+		// reports written before payloads carried the cycle list; it can be
+		// fooled by a summary that quotes a heading, so it is only consulted
+		// when the payload yields nothing.
+		fromPayload := payloadCycleIDs(string(evt.Payload))
+		if len(fromPayload) > 0 {
+			for id := range fromPayload {
+				covered[id] = true
+			}
+			continue
+		}
 		for id := range archivedCycleIDs(evt.Description + "\n" + evt.Notes) {
 			covered[id] = true
 		}
@@ -676,6 +688,47 @@ func missingCycleIDs(body string, cycles []PatrolCycleEntry) []string {
 		}
 	}
 	return missing
+}
+
+// payloadCycleIDs reads the archived cycle ids from a report's STRUCTURED
+// payload.
+//
+// This is the authoritative source and prose is not. A summary can itself
+// contain a line like "### 15:04Z — deacon (gt-wisp-bbb)" — agents quote digest
+// output at each other, and this PR's own cycles quote bead ids — so a heading
+// parser can read another cycle's entry out of copied text and mark an
+// unarchived source as covered, which deletes it permanently (codex P1). The
+// payload is written by this command from the cycles it actually aggregated, so
+// it cannot be forged by quoting.
+//
+// bd returns event payloads as a JSON STRING, so it is unmarshalled twice.
+func payloadCycleIDs(rawPayload string) map[string]bool {
+	ids := make(map[string]bool)
+	raw := strings.TrimSpace(rawPayload)
+	if raw == "" {
+		return ids
+	}
+	// A payload may arrive as a JSON string containing JSON, or as the object.
+	if strings.HasPrefix(raw, "\"") {
+		var inner string
+		if err := json.Unmarshal([]byte(raw), &inner); err == nil {
+			raw = inner
+		}
+	}
+	var parsed struct {
+		Cycles []struct {
+			ID string `json:"id"`
+		} `json:"cycles"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return ids
+	}
+	for _, c := range parsed.Cycles {
+		if c.ID != "" {
+			ids[c.ID] = true
+		}
+	}
+	return ids
 }
 
 // archivedCycleIDs returns the ids that have their OWN entry in the body.

@@ -1,6 +1,9 @@
 package cmd
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // gt-3uty: `gt patrol digest` queried --label=digest, a label only `gt mol squash`
 // creates. Patrol stopped calling squash when `gt patrol report` replaced the
@@ -162,5 +165,53 @@ func TestArchivedCycleIDsRequiresItsOwnEntry(t *testing.T) {
 	})
 	if len(missing) != 2 {
 		t.Fatalf("missingCycleIDs = %v, want the two without their own entries", missing)
+	}
+}
+
+// codex P1: a summary can QUOTE a heading line, e.g. an agent pasting digest
+// output, so a prose parser can read another cycle's entry out of copied text
+// and mark an unarchived source as covered — which deletes it permanently. The
+// payload is written by this command from what it actually aggregated, so it
+// cannot be forged by quoting.
+func TestPayloadCycleIDsIsAuthoritative(t *testing.T) {
+	// bd returns event payloads as a JSON string containing JSON.
+	inner := `{"date":"2026-09-16","total_cycles":2,"cycles":[{"id":"gt-wisp-aaa"},{"id":"gt-wisp-ccc"}]}`
+	asString, err := json.Marshal(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"payload as a JSON string", string(asString)},
+		{"payload as an object", inner},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := payloadCycleIDs(tc.raw)
+			if !ids["gt-wisp-aaa"] || !ids["gt-wisp-ccc"] {
+				t.Fatalf("payloadCycleIDs missed an archived id: %v", ids)
+			}
+			if len(ids) != 2 {
+				t.Fatalf("payloadCycleIDs = %v, want exactly the two in the payload", ids)
+			}
+		})
+	}
+
+	// The case the prose parser gets wrong: a body that QUOTES another cycle's
+	// heading. The payload must not be influenced by it.
+	quoted := "### 15:04Z — deacon (gt-wisp-aaa)\n\nI am quoting a digest:\n### 09:00Z — witness (gt-wisp-zzz)\n"
+	if archivedCycleIDs(quoted)["gt-wisp-zzz"] != true {
+		t.Log("heading parser does not see the quoted entry here; payload is still the authority")
+	}
+	if payloadCycleIDs(inner)["gt-wisp-zzz"] {
+		t.Error("payload reported an id that is not in it")
+	}
+
+	for _, empty := range []string{"", "   ", "not json", `"not json either"`} {
+		if got := payloadCycleIDs(empty); len(got) != 0 {
+			t.Errorf("payloadCycleIDs(%q) = %v, want empty so the caller falls back rather than deleting", empty, got)
+		}
 	}
 }
