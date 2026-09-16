@@ -93,8 +93,8 @@ func TestBdCreateRepoAliasRe_Discriminates(t *testing.T) {
 	mustNotMatch := []string{
 		"bd -C /test/town/beadsrig create \"...\"",
 		"bd create \"...\"",
-		"**Never use `bd create --repo <name>`.**",      // the warning prose
-		"bd create --repo ../other/.beads \"x\"",        // path-like: native bd semantics
+		"**Never use `bd create --repo <name>`.**", // the warning prose
+		"bd create --repo ../other/.beads \"x\"",   // path-like: native bd semantics
 		"// RewriteBDCreateRepoAlias removes a bd create --repo alias from argv",
 	}
 	for _, s := range mustMatch {
