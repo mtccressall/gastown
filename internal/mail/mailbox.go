@@ -969,7 +969,11 @@ func (m *Mailbox) recordHandledAt(id, beadsDir string, at time.Time) {
 	}
 
 	workDir := m.workDir
-	routed := routedBeadsDirForID(beadsDir, id)
+	// USE THE DIRECTORY THAT CLOSED IT, AS GIVEN. Re-resolving the id here would
+	// recompute the prefix route and send both label operations back to the
+	// database where the bead was NOT found — undoing the whole point of passing
+	// it in, for exactly the cross-rig messages this handles (codex).
+	routed := beadsDir
 	if existing, err := readBeadLabelsShared(workDir, routed, id); err == nil {
 		for _, label := range existing {
 			if strings.HasPrefix(label, HandledAtPrefix) {
