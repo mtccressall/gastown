@@ -1833,6 +1833,18 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// like the agent's busy indicator.
 	sendEscape := !opts.SkipEscape && t.shouldSendEscape(target)
 
+	// 2.9 REFUSE TO TYPE INTO A COMPOSER SOMEBODY IS USING (gt-sglq).
+	// WaitForIdle counts a composer holding typed text as idle, so without this
+	// check the next two steps type the nudge onto the end of a human's unsent
+	// draft and press Enter, submitting text nobody chose to send. Returning
+	// before sendMessageToTarget is the whole point: once the text is typed the
+	// damage is done, and clearing it afterwards is the destruction CLAUDE.md
+	// forbids doing blind. The caller queues on this error, so the nudge is
+	// delayed rather than lost.
+	if text, typed := t.composerHoldsTypedText(target, readyPromptPrefixForSession(t, session)); typed {
+		return fmt.Errorf("%w: %s holds %q", ErrComposerHasText, session, text)
+	}
+
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
 	if err := t.sendMessageToTarget(target, sanitized); err != nil {
@@ -2072,7 +2084,6 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 	// Timeout — no dialog detected, safe to proceed
 	return nil
 }
-
 
 // trustDialogSelection reports which option the cursor is on in a workspace
 // trust dialog, so the acceptor never presses Enter on "No, exit" (gt-ma1).

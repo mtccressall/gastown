@@ -12,6 +12,62 @@ import (
 // transport could not prove it left the target composer.
 var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
+// ErrComposerHasText is returned INSTEAD OF TYPING when the target's composer
+// already holds text somebody typed and has not submitted. Delivery types the
+// nudge into that same composer and presses Enter, which submits the human's
+// unsent draft joined to our notification — reproduced on both delivery paths
+// (gt-sglq). Callers treat this like ErrSubmitNotVerified and QUEUE: a late
+// nudge is recoverable, a submitted draft is not.
+var ErrComposerHasText = errors.New("composer holds unsubmitted text: refusing to type")
+
+// composerTypedText reports text a person typed into the composer, and
+// distinguishes it from the DIM PLACEHOLDER an idle pane shows.
+//
+// The placeholder is rendered with SGR 2 and is not input: clearing or typing
+// over it destroys nothing. Typed text carries no dim attribute. That is the
+// only separation available — the words themselves cannot be trusted, because
+// placeholders are role-appropriate ("continue patrol") and a human has typed
+// exactly that string in this town.
+//
+// It returns ("", false) when there is no composer line, when the composer is
+// empty, when every content rune is dim, and when the prompt prefix is empty.
+// Every one of those is a REFUSAL TO CLAIM typed text, because the caller acts
+// on true by withholding delivery and on false by typing.
+func composerTypedText(escContent, promptPrefix string) (string, bool) {
+	if promptPrefix == "" {
+		return "", false
+	}
+	plain, dim := stripAnsiTrackDim(escContent)
+	lines, dims := splitRunesAndDim(plain, dim)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
+			continue
+		}
+		content, contentDim := composerContent(lines[i], dims[i], promptPrefix)
+		if len(content) == 0 || allDim(contentDim) {
+			return "", false
+		}
+		return strings.TrimSpace(string(content)), true
+	}
+	return "", false
+}
+
+// composerHoldsTypedText captures the target and applies composerTypedText.
+//
+// The -J matters for the same reason it does in composerDetail: without it a
+// soft-wrapped composer arrives as several physical lines and the text we
+// report is truncated at the pane width. A capture ERROR returns false, so a
+// broken probe cannot silence every nudge in the town; a capture that SUCCEEDS
+// and shows typed text refuses delivery. Those two failure directions are
+// deliberately different.
+func (t *Tmux) composerHoldsTypedText(target, promptPrefix string) (string, bool) {
+	content, err := t.run("capture-pane", "-p", "-e", "-J", "-t", target, "-S", "-25")
+	if err != nil {
+		return "", false
+	}
+	return composerTypedText(content, promptPrefix)
+}
+
 type submitProbe int
 
 const (
