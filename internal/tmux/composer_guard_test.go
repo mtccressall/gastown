@@ -180,7 +180,9 @@ const (
 )
 
 func TestComposerTypedTextAgainstRealPaneLayouts(t *testing.T) {
-	const prefix = "❯"
+	// The real prefix carries a trailing space; using a bare glyph here would
+	// test a prefix no caller passes.
+	const prefix = DefaultReadyPromptPrefix
 	for _, tc := range []struct {
 		name     string
 		pane     string
@@ -247,5 +249,26 @@ func TestComposerLineIndexByFooterDeclinesOnUnknownShapes(t *testing.T) {
 				t.Fatalf("composerLineIndexByFooter = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// codex P1, third round: the guard knows only Claude's frame. This pins that as
+// a STATED scope rather than an accident of a footer that happens never to
+// match, and records that those agents are unprotected — the honest status,
+// since I have no Codex or Gemini pane to measure and the two previous designs
+// failed exactly by describing a TUI I had not captured.
+func TestComposerGuardScopeIsClaudeOnlyAndSaysSo(t *testing.T) {
+	if composerLayoutSupported(DefaultReadyPromptPrefix) != true {
+		t.Fatal("claude's layout must be supported or the guard protects nobody")
+	}
+	for _, prefix := range []string{"› ", "> ", ""} {
+		if composerLayoutSupported(prefix) {
+			t.Errorf("claimed support for prefix %q whose frame has never been captured", prefix)
+		}
+		// And the decline must be total: no classification from a Claude-shaped
+		// frame that happens to be rendered by another agent.
+		if text, ok := composerTypedText(paneIdleWithDraft, prefix); ok {
+			t.Errorf("prefix %q classified a draft %q despite unsupported layout", prefix, text)
+		}
 	}
 }

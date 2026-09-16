@@ -58,6 +58,25 @@ func isBoxRuleLine(line string) bool {
 	return true
 }
 
+// composerLayoutSupported reports whether this guard knows the TUI's frame.
+//
+// SCOPE IS CLAUDE-ONLY AND THAT IS DELIBERATE (codex P1, third round). The
+// anchor below is the layout I MEASURED on live panes. Codex renders a "› "
+// prompt and a different status bar; Gemini and Copilot differ again. I have no
+// pane of those to measure, and the previous two versions of this guard were
+// wrong precisely because they described a TUI from argument rather than from
+// capture — writing an unmeasured footer matcher for Codex would repeat that
+// mistake with a destructive failure direction.
+//
+// Declining is not a regression for those agents: they are exactly as exposed
+// as they were before this change, which is to say fully. Extending coverage
+// needs a captured frame per agent and is tracked on gt-sglq. The decline is
+// explicit here rather than emerging by accident from a footer that never
+// matches, so the gap is visible to the next reader.
+func composerLayoutSupported(promptPrefix string) bool {
+	return promptPrefix == DefaultReadyPromptPrefix
+}
+
 // isComposerFooterLine identifies the status bar. The markers are the mode
 // indicator the TUI always renders there; the position check is what keeps this
 // from matching prose, since it is only ever applied to the LAST non-blank line.
@@ -120,6 +139,9 @@ func splitRunesAndDimLines(plain []rune, dim []bool) []string {
 // on true by withholding delivery and on false by typing.
 func composerTypedText(escContent, promptPrefix string) (string, bool) {
 	if promptPrefix == "" {
+		return "", false
+	}
+	if !composerLayoutSupported(promptPrefix) {
 		return "", false
 	}
 	plain, dim := stripAnsiTrackDim(escContent)
