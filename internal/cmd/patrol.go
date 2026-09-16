@@ -117,6 +117,13 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 	} else if existingID != "" {
 		fmt.Printf("%s Patrol digest already exists for %s (bead: %s)\n",
 			style.Dim.Render("○"), dateStr, existingID)
+		// A DRY RUN MUST NOT REACH THE RECONCILE PATH: it appends notes and
+		// deletes wisps, and --dry-run promises neither (codex P1, introduced by
+		// the reconcile change itself).
+		if patrolDigestDryRun {
+			fmt.Printf("  [DRY RUN] would reconcile any surviving sources for %s against %s\n", dateStr, existingID)
+			return nil
+		}
 		// DO NOT STOP HERE WHILE SOURCES REMAIN. If a previous run kept its
 		// sources — the verification failed, or the delete did — returning now
 		// strands those wisps permanently, because every later run exits at this
@@ -325,7 +332,28 @@ func appendCyclesToDigest(digestID, dateStr string, late []PatrolCycleEntry) err
 		return nil
 	}
 
-	chunk.WriteString(fmt.Sprintf("LATE CYCLES appended for %s (closed after the report was built):\n\n", dateStr))
+	// The header totals in the description were written before these cycles
+	// existed and this function does not rewrite that description — an append
+	// cannot lose content, a rewrite can. So the revised figures go here,
+	// explicitly superseding the header, rather than leaving the aggregate
+	// silently undercounting (codex P2).
+	byRole := make(map[string]int, len(late))
+	for _, c := range late {
+		byRole[c.Role]++
+	}
+	roles := make([]string, 0, len(byRole))
+	for r := range byRole {
+		roles = append(roles, r)
+	}
+	sort.Strings(roles)
+	var roleParts []string
+	for _, r := range roles {
+		roleParts = append(roleParts, fmt.Sprintf("%s +%d", r, byRole[r]))
+	}
+
+	chunk.WriteString(fmt.Sprintf("LATE CYCLES appended for %s (closed after the report was built).\n"+
+		"THESE ARE ADDITIONAL TO THE TOTALS IN THE DESCRIPTION ABOVE, which were correct when written:\n"+
+		"  +%d cycles (%s)\n\n", len(late), strings.Join(roleParts, ", ")))
 	for _, c := range late {
 		stamp := c.ClosedAt
 		if stamp.IsZero() {
