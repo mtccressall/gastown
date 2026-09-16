@@ -674,7 +674,12 @@ func findExistingPatrolDigest(dateStr string) (string, error) {
 	// duplicate permanent report per run (gt-3uty).
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
-		"--status=all",
+		// The DOCUMENTED multi-status form, not "all". Measured on this host,
+		// --status=all does work (rc=0, 23 rows, both reports found), so codex's
+		// claim that the command fails is wrong here — but "all" is not in bd's
+		// documented set (open, in_progress, blocked, deferred, closed) and the
+		// enumerated form costs nothing and cannot drift.
+		"--status=open,in_progress,blocked,deferred,closed",
 		"--json",
 		"--limit=50", // Recent events only
 	)
