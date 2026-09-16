@@ -89,7 +89,24 @@ title = "List open PRs with review and CI status"
 description = """
 Fetch all open PRs from the target repo, including review decision and CI check rollup.
 
-**1. Fetch open PRs with full status:**
+**1. Open a scratch directory only this patrol writes to:**
+```bash
+PATROL_DIR="${TMPDIR:-/tmp}/gt-pr-feedback-patrol/$(printf '%s-%s' "${GT_ROLE:-${GT_SESSION:-unknown}}" '{{repo}}' | tr -c 'A-Za-z0-9._-' '-')"
+mkdir -p "$PATROL_DIR"
+: > "$PATROL_DIR/patrol-findings.txt"
+```
+One patrol instance runs per rig, so several instances share this host. A bare
+`/tmp/open-prs.json` is one filename for all of them: the loser reads the
+winner's PR set at rc=0 with nothing on stderr, and this patrol CREATES BEADS
+AND SLINGS POLECATS from what it reads. Scope the path to this agent and this
+repo instead.
+
+Every later step recomputes `PATROL_DIR` with that same one-liner. It is
+deterministic for this agent and this repo, so each step reaches the same
+directory without passing state between shells. Truncating the findings file
+here is what keeps a cycle from dispatching last cycle's findings again.
+
+**2. Fetch open PRs with full status:**
 ```bash
 gh pr list \
   --repo {{repo}} \
@@ -97,26 +114,38 @@ gh pr list \
   --state open \
   --json number,title,url,reviewDecision,statusCheckRollup,isDraft,headRefName \
   --limit 100 \
-  > /tmp/open-prs.json
+  > "$PATROL_DIR/open-prs.json"
 ```
 
-**2. If exclude_drafts is true, filter out drafts:**
+**3. Assert the file you just wrote holds {{repo}}, not somebody else's repo:**
 ```bash
-# Filter drafts client-side from /tmp/open-prs.json
-cat /tmp/open-prs.json | jq '[.[] | select(.isDraft == false)]' > /tmp/open-prs-filtered.json
+jq -e --arg repo '{{repo}}' 'length == 0 or all(.[]; .url | test("/" + $repo + "/pull/"))' \
+  "$PATROL_DIR/open-prs.json" >/dev/null \
+  || { echo "ABORT: $PATROL_DIR/open-prs.json does not hold {{repo}} PRs"; exit 1; }
 ```
-If exclude_drafts is false, use `open-prs.json` unfiltered.
+A clobbered census is neither empty nor malformed — it is a plausible PR list
+with a valid count, from the wrong repo, and nothing in the output names its
+source. Counting the rows does not catch that; checking what the rows ARE does.
 
-**3. Count and log:**
+**4. If exclude_drafts is true, filter out drafts:**
 ```bash
-PR_COUNT=$(jq length /tmp/open-prs-filtered.json)
+jq '[.[] | select(.isDraft == false)]' \
+  "$PATROL_DIR/open-prs.json" > "$PATROL_DIR/open-prs-filtered.json"
+```
+If exclude_drafts is false, copy `open-prs.json` to `open-prs-filtered.json`
+unfiltered — later steps read the filtered name either way.
+
+**5. Count and log:**
+```bash
+PR_COUNT=$(jq length "$PATROL_DIR/open-prs-filtered.json")
 echo "Found ${PR_COUNT} open PRs in {{repo}}"
 ```
 
-**4. Handle empty result:**
+**6. Handle empty result:**
 If PR_COUNT is 0, nothing to patrol — skip to loop-or-exit.
 
-**Exit criteria:** /tmp/open-prs-filtered.json contains current open PRs with status fields.
+**Exit criteria:** $PATROL_DIR/open-prs-filtered.json contains current open PRs
+with status fields, and the repo assertion in step 3 passed.
 """
 
 [[steps]]
@@ -126,30 +155,35 @@ needs = ["list-open-prs"]
 description = """
 Identify PRs where reviewers have requested changes.
 
-**1. Extract PRs with CHANGES_REQUESTED:**
+**1. Recompute the scratch path (the same one-liner as list-open-prs):**
+```bash
+PATROL_DIR="${TMPDIR:-/tmp}/gt-pr-feedback-patrol/$(printf '%s-%s' "${GT_ROLE:-${GT_SESSION:-unknown}}" '{{repo}}' | tr -c 'A-Za-z0-9._-' '-')"
+```
+
+**2. Extract PRs with CHANGES_REQUESTED:**
 ```bash
 jq '[.[] | select(.reviewDecision == "CHANGES_REQUESTED")]' \
-  /tmp/open-prs-filtered.json \
-  > /tmp/prs-needs-review-response.json
+  "$PATROL_DIR/open-prs-filtered.json" \
+  > "$PATROL_DIR/prs-needs-review-response.json"
 
-REVIEW_COUNT=$(jq length /tmp/prs-needs-review-response.json)
+REVIEW_COUNT=$(jq length "$PATROL_DIR/prs-needs-review-response.json")
 echo "PRs with CHANGES_REQUESTED: ${REVIEW_COUNT}"
 ```
 
-**2. For each PR with CHANGES_REQUESTED, record the finding:**
+**3. For each PR with CHANGES_REQUESTED, record the finding:**
 ```bash
-jq -c '.[]' /tmp/prs-needs-review-response.json | while read pr; do
+jq -c '.[]' "$PATROL_DIR/prs-needs-review-response.json" | while read pr; do
   PR_NUM=$(echo "$pr" | jq -r '.number')
   PR_URL=$(echo "$pr" | jq -r '.url')
   PR_TITLE=$(echo "$pr" | jq -r '.title')
-  echo "review-feedback:${PR_NUM}:${PR_URL}:${PR_TITLE}" >> /tmp/patrol-findings.txt
+  echo "review-feedback:${PR_NUM}:${PR_URL}:${PR_TITLE}" >> "$PATROL_DIR/patrol-findings.txt"
 done
 ```
 
-**3. Initialize findings file if first step:**
-If /tmp/patrol-findings.txt does not exist, create it empty before appending.
+list-open-prs truncates `patrol-findings.txt` at the start of every cycle, so
+these appends carry this cycle's findings and no earlier cycle's.
 
-**Exit criteria:** /tmp/patrol-findings.txt has one line per PR needing review response.
+**Exit criteria:** $PATROL_DIR/patrol-findings.txt has one line per PR needing review response.
 """
 
 [[steps]]
@@ -159,34 +193,39 @@ needs = ["list-open-prs"]
 description = """
 Identify PRs where CI checks have failed or errored.
 
-**1. Extract PRs with failing checks:**
+**1. Recompute the scratch path (the same one-liner as list-open-prs):**
+```bash
+PATROL_DIR="${TMPDIR:-/tmp}/gt-pr-feedback-patrol/$(printf '%s-%s' "${GT_ROLE:-${GT_SESSION:-unknown}}" '{{repo}}' | tr -c 'A-Za-z0-9._-' '-')"
+```
+
+**2. Extract PRs with failing checks:**
 ```bash
 jq '[.[] | select(
   .statusCheckRollup != null and
   (.statusCheckRollup | map(select(.state == "FAILURE" or .state == "ERROR")) | length > 0)
-)]' /tmp/open-prs-filtered.json > /tmp/prs-ci-failing.json
+)]' "$PATROL_DIR/open-prs-filtered.json" > "$PATROL_DIR/prs-ci-failing.json"
 
-CI_COUNT=$(jq length /tmp/prs-ci-failing.json)
+CI_COUNT=$(jq length "$PATROL_DIR/prs-ci-failing.json")
 echo "PRs with failing CI: ${CI_COUNT}"
 ```
 
-**2. For each PR with failing CI, record which checks failed:**
+**3. For each PR with failing CI, record which checks failed:**
 ```bash
-jq -c '.[]' /tmp/prs-ci-failing.json | while read pr; do
+jq -c '.[]' "$PATROL_DIR/prs-ci-failing.json" | while read pr; do
   PR_NUM=$(echo "$pr" | jq -r '.number')
   PR_URL=$(echo "$pr" | jq -r '.url')
   PR_TITLE=$(echo "$pr" | jq -r '.title')
   FAILING_CHECKS=$(echo "$pr" | jq -r '[.statusCheckRollup[] | select(.state == "FAILURE" or .state == "ERROR") | .name] | join(", ")')
-  echo "ci-failure:${PR_NUM}:${PR_URL}:${PR_TITLE}:${FAILING_CHECKS}" >> /tmp/patrol-findings.txt
+  echo "ci-failure:${PR_NUM}:${PR_URL}:${PR_TITLE}:${FAILING_CHECKS}" >> "$PATROL_DIR/patrol-findings.txt"
 done
 ```
 
-**3. Dedup findings:**
+**4. Dedup findings:**
 A PR may appear in both review-feedback and ci-failure categories. That is fine —
 each creates a separate, distinctly-typed bead. The dedup guard (next step)
 checks for existing open beads by PR number AND type.
 
-**Exit criteria:** /tmp/patrol-findings.txt contains all actionable PRs (review + CI).
+**Exit criteria:** $PATROL_DIR/patrol-findings.txt contains all actionable PRs (review + CI).
 """
 
 [[steps]]
@@ -194,7 +233,12 @@ id = "dispatch-work"
 title = "Dispatch polecats for each actionable PR finding"
 needs = ["check-review-status", "check-ci-status"]
 description = """
-For each finding in /tmp/patrol-findings.txt, create a work bead and sling a polecat.
+For each finding in the findings file, create a work bead and sling a polecat.
+
+**Recompute the scratch path (the same one-liner as list-open-prs):**
+```bash
+PATROL_DIR="${TMPDIR:-/tmp}/gt-pr-feedback-patrol/$(printf '%s-%s' "${GT_ROLE:-${GT_SESSION:-unknown}}" '{{repo}}' | tr -c 'A-Za-z0-9._-' '-')"
+```
 
 **Safety valve — check open bead count first:**
 ```bash
@@ -266,7 +310,7 @@ Dispatched by mol-pr-feedback-patrol."
   # Sling a polecat to handle it
   gt sling {{rig}} "$BEAD_ID" 2>/dev/null || echo "Warning: sling failed for ${BEAD_ID}"
 
-done < /tmp/patrol-findings.txt
+done < "$PATROL_DIR/patrol-findings.txt"
 ```
 
 **Exit criteria:** All actionable PRs have either a newly created+slung bead, or were
@@ -288,12 +332,14 @@ Context-check and either sleep for the next cycle or exit if context is filling.
 gt mol step context-check 2>/dev/null || true
 ```
 
-**2. Clean up temp files from this cycle:**
+**2. Clean up this cycle's scratch directory:**
 ```bash
-rm -f /tmp/open-prs.json /tmp/open-prs-filtered.json
-rm -f /tmp/prs-needs-review-response.json /tmp/prs-ci-failing.json
-rm -f /tmp/patrol-findings.txt
+PATROL_DIR="${TMPDIR:-/tmp}/gt-pr-feedback-patrol/$(printf '%s-%s' "${GT_ROLE:-${GT_SESSION:-unknown}}" '{{repo}}' | tr -c 'A-Za-z0-9._-' '-')"
+rm -rf "$PATROL_DIR"
 ```
+Remove the directory this patrol owns, never bare `/tmp/*.json` names — the
+old form deleted whatever another rig's patrol had in flight under the same
+filenames.
 
 **3. Sleep before next cycle:**
 ```bash

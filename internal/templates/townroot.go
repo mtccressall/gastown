@@ -12,7 +12,7 @@ var townRootCLAUDEmdRaw string
 
 // TownRootCLAUDEmdVersion is the version of the embedded town-root CLAUDE.md.
 // Increment this when updating the template content with new sections.
-const TownRootCLAUDEmdVersion = 2
+const TownRootCLAUDEmdVersion = 3
 
 // TownRootCLAUDEmd returns the canonical town-root CLAUDE.md content
 // with the CLI command name substituted.
@@ -30,6 +30,10 @@ type TownRootRequiredSection struct {
 // in the town-root CLAUDE.md for proper agent behavior.
 func TownRootRequiredSections() []TownRootRequiredSection {
 	return []TownRootRequiredSection{
+		{
+			Name:    "Scratch file hygiene",
+			Heading: "## Scratch files",
+		},
 		{
 			Name:    "Dolt awareness",
 			Heading: "## Dolt Server",

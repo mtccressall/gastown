@@ -358,9 +358,15 @@ test directory this user created under its own TMPDIR.
 
 Positive control before trusting any edit to this - it must print HOLDERS 1:
 
-    mkdir -p /tmp/g/sub && echo hi > /tmp/g/sub/f
-    ( exec 9< /tmp/g/sub/f; sleep 20 ) &
-    # then run the scan below against /tmp/g
+    CTL="${TMPDIR:-/tmp}/beads-bd-tests-holder-control"
+    mkdir -p "$CTL/sub" && echo hi > "$CTL/sub/f"
+    ( exec 9< "$CTL/sub/f"; sleep 20 ) &
+    # then run the scan below against "$CTL"
+
+The control must live under the same TMPDIR the scan walks. A bare /tmp path
+here is a control that silently tests a directory the scan never visits when
+TMPDIR is set elsewhere - and a positive control that cannot fire is worse than
+none, because its silence reads as a pass.
 
 ```bash
 TMPDIR="${TMPDIR:-/tmp}"

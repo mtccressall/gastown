@@ -21,8 +21,8 @@ state needed to explain the incident.
 Capture non-fatal diagnostics first:
 
 ```bash
-gt dolt dump 2>&1 | tee /tmp/dolt-hang-$(date +%s).log
-gt dolt status 2>&1 | tee /tmp/dolt-status-$(date +%s).log
+gt dolt dump 2>&1 | tee "${TMPDIR:-/tmp}/dolt-hang-$(date +%s)-$$.log"
+gt dolt status 2>&1 | tee "${TMPDIR:-/tmp}/dolt-status-$(date +%s)-$$.log"
 ```
 
 Then escalate with the evidence path:
