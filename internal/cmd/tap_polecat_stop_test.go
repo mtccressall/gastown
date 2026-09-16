@@ -144,7 +144,7 @@ func TestStopHookActive(t *testing.T) {
 	}
 }
 
-func TestPolecatStopShouldBlock(t *testing.T) {
+func TestPolecatStopShouldRemind(t *testing.T) {
 	for _, tc := range []struct {
 		pending, reminded, want bool
 	}{
@@ -153,8 +153,8 @@ func TestPolecatStopShouldBlock(t *testing.T) {
 		{pending: true, reminded: false, want: true},
 		{pending: true, reminded: true, want: false},
 	} {
-		if got := polecatStopShouldBlock(tc.pending, tc.reminded); got != tc.want {
-			t.Errorf("polecatStopShouldBlock(pending=%v, reminded=%v) = %v, want %v", tc.pending, tc.reminded, got, tc.want)
+		if got := polecatStopShouldRemind(tc.pending, tc.reminded); got != tc.want {
+			t.Errorf("polecatStopShouldRemind(pending=%v, reminded=%v) = %v, want %v", tc.pending, tc.reminded, got, tc.want)
 		}
 	}
 }
@@ -162,8 +162,10 @@ func TestPolecatStopShouldBlock(t *testing.T) {
 // A Stop hook fires at every turn end. A polecat that ends a turn while its
 // gates run in the background still has unsubmitted commits, and the hook
 // used to run gt done for it, closing the bead and tearing the session down
-// mid-gates (gt-e3upy). With pending work the hook must block the stop with a
-// reminder, and must not run gt done.
+// mid-gates (gt-e3upy). With pending work the hook must emit the reminder
+// decision, and must not run gt done. Live measurement 2026-09-15T23:30:36Z
+// shows Claude Code surfaces that decision as feedback without preventing the
+// stop, which is what a polecat waiting on gates needs.
 func TestRunTapPolecatStopRemindsInsteadOfRunningDone(t *testing.T) {
 	// The old auto-done path ran os.Executable() with "done". Under go test that
 	// is this test binary, so a regression would re-run this test recursively.
@@ -232,7 +234,7 @@ func TestRunTapPolecatStopRemindsInsteadOfRunningDone(t *testing.T) {
 		return string(out)
 	}
 
-	t.Run("first stop is blocked with a reminder", func(t *testing.T) {
+	t.Run("pending work gets the reminder", func(t *testing.T) {
 		out := run(t, `{"stop_hook_active":false}`)
 		var decision struct {
 			Decision string `json:"decision"`
@@ -242,7 +244,7 @@ func TestRunTapPolecatStopRemindsInsteadOfRunningDone(t *testing.T) {
 			t.Fatalf("stdout is not a Stop hook decision: %v\n%s", err, out)
 		}
 		if decision.Decision != "block" {
-			t.Fatalf("decision = %q, want block", decision.Decision)
+			t.Fatalf("decision = %q, want block (the payload Claude Code surfaces as feedback)", decision.Decision)
 		}
 		for _, want := range []string{"run gt done now", "keep waiting", "will not be run for you", "unsubmitted commit"} {
 			if !strings.Contains(decision.Reason, want) {
@@ -251,7 +253,7 @@ func TestRunTapPolecatStopRemindsInsteadOfRunningDone(t *testing.T) {
 		}
 	})
 
-	t.Run("stop after a reminder is allowed", func(t *testing.T) {
+	t.Run("a second stop is not reminded twice", func(t *testing.T) {
 		if out := run(t, `{"stop_hook_active":true}`); strings.TrimSpace(out) != "" {
 			t.Fatalf("stdout = %q, want no decision", out)
 		}

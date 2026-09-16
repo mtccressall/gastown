@@ -26,18 +26,26 @@ This command is designed to run from a Claude Code Stop hook. It checks:
 2. Whether gt done has already run (heartbeat state is "exiting" or "idle")
 3. Whether the polecat has commits, stashes, or non-runtime dirty work
 
-If the polecat has pending work that wasn't submitted, this command blocks
-the stop once and tells the polecat to run gt done if its work is finished.
-It never runs gt done itself: Claude Code fires Stop at the end of every
-turn, not only when a session ends, so a polecat that ends a turn to wait
-for background tests or gates also has "pending work". Running gt done for
-it closed the bead and tore the session down mid-gates (gt-e3upy).
+If the polecat has pending work that wasn't submitted, this command surfaces a
+reminder telling the polecat to run gt done if its work is finished. It never
+runs gt done itself: Claude Code fires Stop at the end of every turn, not only
+when a session ends, so a polecat that ends a turn to wait for background tests
+or gates also has "pending work". Running gt done for it closed the bead and
+tore the session down mid-gates (gt-e3upy).
 
-When the stop was already blocked once (stop_hook_active in the hook
-input), the stop is allowed, so a polecat that is waiting is not looped.
+OBSERVED BEHAVIOUR, measured on a live polecat 2026-09-15T23:30:36Z: the reason
+below reaches the polecat's transcript (recorded there under hookErrors) but the
+turn still ends — preventedContinuation was false. So this REMINDS; it does not
+prevent the stop. That is the wanted behaviour for a polecat waiting on gates,
+which must be free to end its turn. Earlier wording claimed it blocked the stop;
+the docs do not specify whether a command Stop hook's stdout decision blocks, and
+here it did not.
 
-Output: nothing when the stop is allowed (not a polecat, already done, nothing
-pending, or already reminded). When blocked, a Stop hook decision on stdout:
+stop_hook_active is still read and still suppresses a second reminder, so a hook
+that ever does block cannot loop.
+
+Output: nothing when there is nothing to say (not a polecat, already done,
+nothing pending, or already reminded). Otherwise a Stop hook decision on stdout:
   {"decision":"block","reason":"<reminder for the polecat>"}
 Always exits 0.`,
 	RunE:         runTapPolecatStop,
@@ -113,7 +121,7 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 	}
 
 	input, _ := io.ReadAll(os.Stdin)
-	if !polecatStopShouldBlock(pending, stopHookActive(input)) {
+	if !polecatStopShouldRemind(pending, stopHookActive(input)) {
 		return nil // Already reminded this stop — let the polecat wait
 	}
 
@@ -129,7 +137,10 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 }
 
 // stopHookActive reports whether Claude Code is already continuing because a
-// Stop hook blocked the previous stop. Unparseable input reads as false.
+// Stop hook blocked the previous stop. Unparseable input reads as false. The
+// observed behaviour is that this hook's decision does not block (see the
+// command help), so this is a guard against a future blocking form rather than
+// a live loop-breaker.
 func stopHookActive(input []byte) bool {
 	var payload struct {
 		StopHookActive bool `json:"stop_hook_active"`
@@ -140,10 +151,10 @@ func stopHookActive(input []byte) bool {
 	return payload.StopHookActive
 }
 
-// polecatStopShouldBlock decides whether a stop with pending work is blocked
-// with a reminder. There is deliberately no outcome that runs gt done: a stop
-// is a turn end, not proof the polecat is finished (gt-e3upy).
-func polecatStopShouldBlock(pending, alreadyReminded bool) bool {
+// polecatStopShouldRemind decides whether a stop with pending work gets the
+// reminder. There is deliberately no outcome that runs gt done: a stop is a
+// turn end, not proof the polecat is finished (gt-e3upy).
+func polecatStopShouldRemind(pending, alreadyReminded bool) bool {
 	return pending && !alreadyReminded
 }
 
