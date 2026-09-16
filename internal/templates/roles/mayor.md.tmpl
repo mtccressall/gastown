@@ -160,11 +160,26 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` aut
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
-| Polecat/witness/refinery/convoy code | **gastown** | `bd create --repo gastown "..."` |
-| Wyvern game features | **wyvern** | `bd create --repo wyvern "..."` |
-| Cross-rig coordination, convoys, mail | **HQ** | `bd create "..."` (default) |
+| `bd` CLI (beads tool) | **beadsrig** | `bd -C {{ .TownRoot }}/beadsrig create "..."` |
+| `gt` CLI (gas town tool) | **gastown** | `bd -C {{ .TownRoot }}/gastown create "..."` |
+| Polecat/witness/refinery/convoy code | **gastown** | `bd -C {{ .TownRoot }}/gastown create "..."` |
+| Wyvern game features | **wyvern** | `bd -C {{ .TownRoot }}/wyvern create "..."` |
+| Cross-rig coordination, convoys, mail | **HQ** | `bd -C {{ .TownRoot }} create "..."` |
+
+Rig directory names come from `{{ cmd }} rig list`. There is no rig named `beads`.
+
+**Never use `bd create --repo <name>`.** A bare name is not resolved as a rig name. `bd`
+treats it as a path relative to your cwd, SILENTLY CREATES a beads store there, files the
+bead into it, and prints a normal `Created issue: ...` line. That bead is then invisible to
+every real store. `-C` cannot do this: a wrong path fails loudly with
+`cannot use -C directory ...: no such file or directory`.
+
+**Read the bead back before you cite its id.** A create that succeeded and a show that
+fails is the only signal this defect produces:
+
+```bash
+id=$(bd -C {{ .TownRoot }}/gastown create "..." --silent) && bd -C {{ .TownRoot }}/gastown show "$id"
+```
 
 **IMPORTANT:** Issues are created with `bd create`, not `gt` commands.
 
