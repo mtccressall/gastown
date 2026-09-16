@@ -8,6 +8,7 @@ package mail
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -253,4 +254,25 @@ func sdkIssueToMessage(si *beadsdk.Issue) *Message {
 	}
 
 	return bm.ToMessage()
+}
+
+// storeRecordHandledAt writes the handled-at label through the in-process store.
+//
+// Idempotent by reading the issue's labels first, exactly as the bd path does: a
+// second archive must not append a second timestamp, since each timestamp is a
+// different string and AddLabel would happily accept it (gt-745z0).
+func (m *Mailbox) storeRecordHandledAt(id, label string) {
+	ctx, cancel := mailStoreCtx()
+	defer cancel()
+
+	if si, err := m.store.GetIssue(ctx, id); err == nil && si != nil {
+		for _, existing := range si.Labels {
+			if strings.HasPrefix(existing, HandledAtPrefix) {
+				return // already recorded
+			}
+		}
+	}
+	if err := m.store.AddLabel(ctx, id, label, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not record %s on %s: %v\n", label, id, err)
+	}
 }

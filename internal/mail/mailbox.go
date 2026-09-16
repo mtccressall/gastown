@@ -605,6 +605,11 @@ func (m *Mailbox) MarkRead(id string) error {
 }
 
 func (m *Mailbox) markReadBeads(id string) error {
+	// handled-at is recorded HERE, the shared close path, rather than in Delete.
+	// Delete is not the only route: runMoleculeAttachFromMail closes handled mail
+	// by calling MarkRead directly, and those messages would leave the live inbox
+	// with no audit label at all (codex). Recording happens after the close
+	// succeeds — see below.
 	if err := m.acknowledgeDeliveryForPrimary(id); err != nil {
 		return err
 	}
@@ -616,7 +621,13 @@ func (m *Mailbox) markReadBeads(id string) error {
 		// Cross-rig bead IDs (e.g. ne-*) may live in the home DB when created
 		// via the mail router (which always uses town beads). Fall back to
 		// m.beadsDir before giving up. See ne-bgr.
-		return m.closeInDir(id, m.beadsDir)
+		err = m.closeInDir(id, m.beadsDir)
+	}
+	if err == nil {
+		// Only after the close succeeds. A label written on a failed attempt
+		// would record the time of that failure, and recordHandledAt treats the
+		// label as permanent, so a later successful retry would keep it.
+		m.recordHandledAt(id, time.Now().UTC())
 	}
 	return err
 }
@@ -887,16 +898,7 @@ func (m *Mailbox) Delete(id string) error {
 	//
 	// Before the close, and best-effort: an audit label must never cost the
 	// clearing operation itself.
-	if err := m.MarkRead(id); err != nil { // beads: just acknowledge/close
-		return err
-	}
-	// AFTER the close, not before. If the ack or the close fails, Delete returns
-	// an error and the message is still live — labelling it handled at that
-	// point records the time of a FAILED attempt, and recordHandledAt treats the
-	// label as permanent, so a later successful retry would keep the wrong
-	// timestamp (codex).
-	m.recordHandledAt(id, time.Now().UTC())
-	return nil
+	return m.MarkRead(id) // beads: acknowledge/close, which records handled-at
 }
 
 func (m *Mailbox) deleteLegacy(id string) error {
@@ -947,6 +949,18 @@ func (m *Mailbox) recordHandledAt(id string, at time.Time) {
 	// both bd calls run against the process's current directory. The error is
 	// swallowed by design, so the symptom would be a label that silently never
 	// appears — a fix that works only where it happens to be tested (codex).
+	label := HandledAtPrefix + at.Format(time.RFC3339)
+
+	// IN-PROCESS STORE FIRST. A mailbox built with a store (NewMailboxBeadsWithStore,
+	// NewMailboxWithBeadsDirAndStore, SetStore) closes through m.store and may not
+	// have a bd-reachable database at all, so shelling out would target nothing or
+	// the wrong database — and since the error here is swallowed by design, the
+	// symptom would be a label that silently never appears (codex).
+	if m.store != nil {
+		m.storeRecordHandledAt(id, label)
+		return
+	}
+
 	workDir := m.workDir
 	routed := routedBeadsDirForID(m.beadsDir, id)
 	if existing, err := readBeadLabelsShared(workDir, routed, id); err == nil {
@@ -956,7 +970,6 @@ func (m *Mailbox) recordHandledAt(id string, at time.Time) {
 			}
 		}
 	}
-	label := HandledAtPrefix + at.Format(time.RFC3339)
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
 	if _, err := runBdCommand(ctx, []string{"label", "add", id, label}, workDir, routed); err != nil {
