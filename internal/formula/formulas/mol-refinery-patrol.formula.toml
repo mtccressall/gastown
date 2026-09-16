@@ -94,7 +94,7 @@ When `await-event` outputs `EFFORT: reduced`, run an ABBREVIATED patrol.
 This happens when idle_cycles >= {{idle_effort_threshold}} (no events on channel).
 
 Abbreviated patrol rules:
-- **inbox-check**: Run `gt mail drain` and quick inbox check. Skip individual message processing unless new MERGE_READY found.
+- **inbox-check**: Run `gt mail drain` AND `gt mail inbox`. Drain alone is BLIND to ordinary mail: it only archives the fixed protocol-subject list (gt-jiohc). Skip individual message processing unless the inbox is non-empty or a new MERGE_READY is found.
 - **queue-scan**: Quick `gt mq list` check. If queue is empty, skip directly to check-integration-branches.
 - **merged-pr-sweep**: Run even in reduced mode when queue-scan found queued MRs.
 - **process-branch through merge-push**: Only run if queue-scan found remaining actionable work. Otherwise SKIP all.
@@ -1279,7 +1279,7 @@ After await-event returns, check the EFFORT directive in the output:
 **If `EFFORT: full`** — Run all steps thoroughly (normal patrol).
 
 **If `EFFORT: reduced`** — Run ABBREVIATED patrol:
-- inbox-check: Quick drain + check for MERGE_READY only
+- inbox-check: Drain AND read the inbox (drain cannot see ordinary mail, gt-jiohc); check for MERGE_READY
 - queue-scan: Quick `gt mq list`. If empty, skip to check-integration-branches
 - process-branch through merge-push: SKIP if queue empty
 - loop-check through generate-summary: SKIP if no merges processed
