@@ -166,3 +166,82 @@ func TestNudgeRefusesToTypeIntoADraftedComposer(t *testing.T) {
 		t.Errorf("the draft did not survive delivery, which is the loss this guards:\n%s", after)
 	}
 }
+
+// codex P1 on this change: during generation the last ❯ line is the turn the
+// agent is ANSWERING, not a live composer. Reading it as an unsent draft would
+// refuse every direct nudge mid-turn, and several direct callers do not queue,
+// so the message would be lost rather than delayed.
+func TestComposerTypedTextDeclinesOnABusyPane(t *testing.T) {
+	const prefix = "❯"
+	busy := "\x1b[39m❯ go fix the merge queue\n" +
+		"  I'll start by reading the queue state.\n" +
+		"  ⏵⏵ bypass permissions · esc to interrupt\n"
+
+	if text, ok := composerTypedText(busy, prefix); ok {
+		t.Errorf("claimed a draft on a BUSY pane: %q — that is the submitted turn, not a composer", text)
+	}
+
+	// The same pane once the turn ends and the text is genuinely a draft.
+	idle := "\x1b[39m❯ go fix the merge queue\n" +
+		"  ⏵⏵ bypass permissions\n"
+	if _, ok := composerTypedText(idle, prefix); !ok {
+		t.Error("declined on an IDLE pane holding typed text — the guard would never fire")
+	}
+}
+
+// codex P2: an agent whose preset declares no ReadyPromptPrefix has no composer
+// this code can find. Falling back to Claude's ❯ scans arbitrary output as
+// though it were a composer.
+func TestComposerPromptPrefixDoesNotFallBackForAgentsWithoutOne(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		want   bool
+	}{
+		{"agent with no prompt prefix declines", "", false},
+		{"claude's prefix still classifies", DefaultReadyPromptPrefix, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := "\x1b[39m❯ some typed text\n  ⏵⏵ bypass permissions\n"
+			_, got := composerTypedText(content, tc.prefix)
+			if got != tc.want {
+				t.Fatalf("composerTypedText with prefix %q = %v, want %v", tc.prefix, got, tc.want)
+			}
+		})
+	}
+}
+
+// The table above passes a prefix in directly, so it CANNOT see the call site
+// choosing the wrong one — verified by sabotaging composerPromptPrefixForSession
+// back to the fallback and watching the table stay green. This drives the real
+// resolver against a real session whose GT_AGENT declares an agent with no
+// prompt prefix, which is the case codex P2 is about.
+func TestComposerPromptPrefixForSessionDeclinesForPrefixlessAgent(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	socket := fmt.Sprintf("gt-composer-prefix-%d", os.Getpid())
+	tm := NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _, _ = tm.run("kill-server") })
+
+	for _, tc := range []struct {
+		session string
+		agent   string
+		want    string
+	}{
+		// copilot's preset declares ReadyPromptPrefix "" on purpose: it renders
+		// hint text, not a detectable prompt.
+		{"prefixless", "copilot", ""},
+		{"claudeish", "claude", DefaultReadyPromptPrefix},
+	} {
+		t.Run(tc.agent, func(t *testing.T) {
+			if out, err := tm.run("new-session", "-d", "-s", tc.session, "-e", "GT_AGENT="+tc.agent, "cat"); err != nil {
+				t.Skipf("cannot start tmux session: %v (%s)", err, out)
+			}
+			got := composerPromptPrefixForSession(tm, tc.session)
+			if got != tc.want {
+				t.Errorf("composerPromptPrefixForSession(GT_AGENT=%s) = %q, want %q", tc.agent, got, tc.want)
+			}
+		})
+	}
+}

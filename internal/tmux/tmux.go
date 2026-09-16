@@ -1841,7 +1841,7 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// damage is done, and clearing it afterwards is the destruction CLAUDE.md
 	// forbids doing blind. The caller queues on this error, so the nudge is
 	// delayed rather than lost.
-	if text, typed := t.composerHoldsTypedText(target, readyPromptPrefixForSession(t, session)); typed {
+	if text, typed := t.composerHoldsTypedText(target, composerPromptPrefixForSession(t, session)); typed {
 		return fmt.Errorf("%w: %s holds %q", ErrComposerHasText, session, text)
 	}
 
@@ -3430,6 +3430,25 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 		return false
 	}
 	return shouldSendEscapeForLines(lines)
+}
+
+// composerPromptPrefixForSession is readyPromptPrefixForSession WITHOUT the
+// fallback to Claude's prefix. An agent whose preset declares no
+// ReadyPromptPrefix (Gemini, Copilot, Pi) has no composer this code can find,
+// and scanning its output for Claude's ❯ classifies arbitrary text as a draft
+// (codex P2 on this change). Returning "" makes the guard decline rather than
+// guess, which is the same reason `gt nudge` degrades those agents to queue
+// mode instead of probing for idle.
+func composerPromptPrefixForSession(t *Tmux, session string) string {
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentName == "" {
+		return DefaultReadyPromptPrefix
+	}
+	preset := config.GetAgentPresetByName(agentName)
+	if preset == nil {
+		return DefaultReadyPromptPrefix
+	}
+	return preset.ReadyPromptPrefix
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {

@@ -38,6 +38,16 @@ func composerTypedText(escContent, promptPrefix string) (string, bool) {
 		return "", false
 	}
 	plain, dim := stripAnsiTrackDim(escContent)
+	// A BUSY PANE HAS NO LIVE COMPOSER, AND ITS LAST PROMPT LINE IS THE TURN THE
+	// AGENT IS CURRENTLY ANSWERING (codex P1 on this change). Reading that as an
+	// unsent draft would refuse every direct nudge during an active turn, and
+	// several direct callers do not queue. Declining here keeps the guard scoped
+	// to the defect it is for: WaitForIdle calling a DRAFTED composer idle.
+	for _, line := range strings.Split(string(plain), "\n") {
+		if hasBusyIndicator(line) {
+			return "", false
+		}
+	}
 	lines, dims := splitRunesAndDim(plain, dim)
 	for i := len(lines) - 1; i >= 0; i-- {
 		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
