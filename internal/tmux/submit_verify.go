@@ -20,11 +20,80 @@ var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in 
 // nudge is recoverable, a submitted draft is not.
 var ErrComposerHasText = errors.New("composer holds unsubmitted text: refusing to type")
 
-// busyStatusLines is how many trailing non-blank lines count as the status area.
-// The busy marker renders in the status bar, which sits below the composer, so a
-// small window is enough; shouldSendEscape reads the last 5 lines for the same
-// signal.
-const busyStatusLines = 3
+// The composer is located by POSITION, measured on live panes 2026-09-16 (four
+// idle, one generating):
+//
+//	─────────────────────────   rule
+//	❯ <composer>                <- this line
+//	─────────────────────────   rule
+//	  ⏵⏵ bypass permissions on (shift+tab to cycle) · [esc to interrupt ·] …
+//
+// TWO THINGS THAT MEASUREMENT SETTLED, both of which I had wrong from argument:
+//
+//  1. THE COMPOSER BOX PERSISTS WHILE THE AGENT IS GENERATING. It is not
+//     replaced by the status text, so "the last prompt line is the turn being
+//     answered" is false for this TUI — the composer is always its own box below
+//     the transcript. Text typed during generation is queued input and is a real
+//     draft, so declining to guard a busy pane would WEAKEN this.
+//  2. The busy marker renders inside the FOOTER line itself, not on a line of
+//     its own, which is why scanning trailing lines for it was both unnecessary
+//     and defeatable by transcript text quoting the marker.
+//
+// Anchoring on the footer makes a ❯ anywhere in the scrollback unusable as a
+// composer, which no amount of pattern matching achieved.
+const composerRuleSearchDepth = 4
+
+func isBoxRuleLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		switch r {
+		case 0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0xFFFD:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isComposerFooterLine identifies the status bar. The markers are the mode
+// indicator the TUI always renders there; the position check is what keeps this
+// from matching prose, since it is only ever applied to the LAST non-blank line.
+func isComposerFooterLine(line string) bool {
+	l := strings.ToLower(line)
+	return strings.Contains(l, "bypass permissions") ||
+		strings.Contains(l, "manual mode") ||
+		strings.Contains(l, "shift+tab to cycle")
+}
+
+// composerLineIndexByFooter returns the index of the composer line, or -1 when
+// the pane does not have the expected shape. Returning -1 means DECLINE TO
+// CLASSIFY: the caller then delivers as it always did, rather than guessing from
+// a prompt character that may belong to the transcript.
+func composerLineIndexByFooter(lines []string) int {
+	footer := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		footer = i
+		break
+	}
+	if footer < 0 || !isComposerFooterLine(lines[footer]) {
+		return -1
+	}
+	for i := footer - 1; i >= 0 && i >= footer-composerRuleSearchDepth; i-- {
+		if isBoxRuleLine(lines[i]) {
+			if i-1 < 0 {
+				return -1
+			}
+			return i - 1
+		}
+	}
+	return -1
+}
 
 // splitRunesAndDimLines returns the pane's plain text as lines.
 func splitRunesAndDimLines(plain []rune, dim []bool) []string {
@@ -34,22 +103,6 @@ func splitRunesAndDimLines(plain []rune, dim []bool) []string {
 		out = append(out, string(l))
 	}
 	return out
-}
-
-// hasBusyIndicatorInStatusArea tests only the last few NON-BLANK lines, so a
-// transcript line quoting the marker cannot disable the guard.
-func hasBusyIndicatorInStatusArea(lines []string) bool {
-	seen := 0
-	for i := len(lines) - 1; i >= 0 && seen < busyStatusLines; i-- {
-		if strings.TrimSpace(lines[i]) == "" {
-			continue
-		}
-		seen++
-		if hasBusyIndicator(lines[i]) {
-			return true
-		}
-	}
-	return false
 }
 
 // composerTypedText reports text a person typed into the composer, and
@@ -70,33 +123,19 @@ func composerTypedText(escContent, promptPrefix string) (string, bool) {
 		return "", false
 	}
 	plain, dim := stripAnsiTrackDim(escContent)
-	// A BUSY PANE HAS NO LIVE COMPOSER, AND ITS LAST PROMPT LINE IS THE TURN THE
-	// AGENT IS CURRENTLY ANSWERING (codex P1). Reading that as an unsent draft
-	// would refuse every direct nudge during an active turn, and several direct
-	// callers do not queue. Declining keeps the guard scoped to the defect it is
-	// for: WaitForIdle calling a DRAFTED composer idle.
-	//
-	// THE MARKER IS READ BY POSITION, NOT BY PATTERN (codex P1 again, on the
-	// first version of this check, which scanned the whole capture). The status
-	// bar is the last rendered line, but "esc to interrupt" is also ordinary
-	// TEXT that agents in this town write to each other constantly. A pane whose
-	// scrollback merely DISCUSSES the marker would have disabled the guard and
-	// let the draft be submitted — the probe matching its own subject matter.
-	if hasBusyIndicatorInStatusArea(splitRunesAndDimLines(plain, dim)) {
+	lines, dims := splitRunesAndDim(plain, dim)
+	idx := composerLineIndexByFooter(splitRunesAndDimLines(plain, dim))
+	if idx < 0 || idx >= len(lines) {
 		return "", false
 	}
-	lines, dims := splitRunesAndDim(plain, dim)
-	for i := len(lines) - 1; i >= 0; i-- {
-		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
-			continue
-		}
-		content, contentDim := composerContent(lines[i], dims[i], promptPrefix)
-		if len(content) == 0 || allDim(contentDim) {
-			return "", false
-		}
-		return strings.TrimSpace(string(content)), true
+	if !matchesPromptPrefix(string(lines[idx]), promptPrefix) {
+		return "", false
 	}
-	return "", false
+	content, contentDim := composerContent(lines[idx], dims[idx], promptPrefix)
+	if len(content) == 0 || allDim(contentDim) {
+		return "", false
+	}
+	return strings.TrimSpace(string(content)), true
 }
 
 // composerHoldsTypedText captures the target and applies composerTypedText.

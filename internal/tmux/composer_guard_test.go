@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,85 +21,10 @@ import (
 // separation is SGR 2 and nothing else: placeholder text is role-appropriate
 // ("continue patrol") and a human has typed exactly that string in this town,
 // so the words cannot be used to tell them apart.
-func TestComposerTypedText(t *testing.T) {
-	const prefix = "❯"
-
-	tests := []struct {
-		name     string
-		content  string
-		wantText string
-		wantOK   bool
-	}{
-		{
-			name:     "typed text carries no dim attribute",
-			content:  "scrollback\n\x1b[39m❯ unblock brahmin\n  ⏵⏵ bypass permissions\n",
-			wantText: "unblock brahmin",
-			wantOK:   true,
-		},
-		{
-			name:    "dim placeholder is NOT typed text",
-			content: "scrollback\n\x1b[39m❯ \x1b[2mcontinue patrol\x1b[0m\n  ⏵⏵ bypass permissions\n",
-			wantOK:  false,
-		},
-		{
-			// The placeholder text differs per agent, so nothing may key on the
-			// words. This is the same line with different content and must also
-			// read as empty.
-			name:    "a different agent's placeholder is also not typed text",
-			content: "\x1b[39m❯ \x1b[2mkeep patrolling\x1b[0m\n  ⏵⏵ bypass permissions\n",
-			wantOK:  false,
-		},
-		{
-			name:    "empty composer",
-			content: "some output\n❯\n  ⏵⏵ bypass permissions\n",
-			wantOK:  false,
-		},
-		{
-			name:    "no composer line at all",
-			content: "just output\nnothing here\n",
-			wantOK:  false,
-		},
-		{
-			// Every ❯ in the scrollback marks a past user turn. Taking an earlier
-			// one would report text that was submitted long ago as unsent.
-			name:     "takes the LAST prompt line, not scrollback",
-			content:  "❯ an older submitted turn\nmiddle\n\x1b[39m❯ live draft\n",
-			wantText: "live draft",
-			wantOK:   true,
-		},
-		{
-			name:    "last prompt line is a placeholder even when scrollback has typed turns",
-			content: "❯ an older submitted turn\nmiddle\n\x1b[39m❯ \x1b[2mcontinue patrol\x1b[0m\n",
-			wantOK:  false,
-		},
-		{
-			// An empty prefix would otherwise match every line and report the
-			// pane's last line as a draft.
-			name:    "empty prompt prefix claims nothing",
-			content: "❯ something typed",
-			wantOK:  false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			p := prefix
-			if tc.name == "empty prompt prefix claims nothing" {
-				p = ""
-			}
-			gotText, gotOK := composerTypedText(tc.content, p)
-			if gotOK != tc.wantOK {
-				t.Fatalf("composerTypedText() ok = %v, want %v (text %q)", gotOK, tc.wantOK, gotText)
-			}
-			if tc.wantOK && gotText != tc.wantText {
-				t.Errorf("composerTypedText() text = %q, want %q", gotText, tc.wantText)
-			}
-			if !tc.wantOK && gotText != "" {
-				t.Errorf("composerTypedText() returned %q alongside ok=false", gotText)
-			}
-		})
-	}
-}
+const (
+	rule   = "───────────────────────────────"
+	footer = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+)
 
 // The error must carry the text it refused to type over. A refusal that does
 // not say what it saw leaves the draft existing only in a pane nobody will
@@ -117,14 +43,20 @@ func TestComposerHasTextErrorIsIdentifiableAndCarriesTheDraft(t *testing.T) {
 	}
 }
 
-// THE WIRING TEST. The table above is pure-function and stays GREEN when the
+// THE WIRING TEST. The tables above are pure-function and stay GREEN when the
 // guard is deleted from NudgeSessionWithOpts entirely — verified by removing it
-// — so on its own it certifies a fix that is not connected to anything. This
-// runs the real delivery path against a real tmux and asserts the property that
-// matters: WITH A DRAFT IN THE COMPOSER, NOTHING IS TYPED.
+// — so on their own they certify a fix connected to nothing. This runs the real
+// delivery path against a real tmux and asserts the property that matters: WITH
+// A DRAFT IN THE COMPOSER, NOTHING IS TYPED.
+//
+// The pane RENDERS the frame rather than having it typed in, because a composer
+// is the second line from the bottom and anything typed into a bare shell lands
+// last. What is under test here is the wiring — that delivery consults the guard
+// and returns before sendMessageToTarget — not tmux's own rendering, which the
+// fixtures above cover with text captured from live panes.
 //
 // The socket is unique to this test and cleanup kills only that server, never
-// the town's (gt-lgt4: a test that signals a whole session took this machine
+// the town's (gt-lgt4: a test that signalled a whole session took this machine
 // down four times in one morning).
 func TestNudgeRefusesToTypeIntoADraftedComposer(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
@@ -136,16 +68,25 @@ func TestNudgeRefusesToTypeIntoADraftedComposer(t *testing.T) {
 	socket := fmt.Sprintf("gt-composer-guard-%d", os.Getpid())
 	session := "composer-guard"
 	tm := NewTmuxWithSocket(socket)
-	if out, err := tm.run("new-session", "-d", "-s", session, "-x", "120", "-y", "12", "cat"); err != nil {
+	// Written to a file and cat'd: sh's printf does not portably grok \x
+	// escapes, and a half-rendered frame would make the refusal below vacuous.
+	frame := "transcript output\n" + rule + "\n\x1b[39m❯\u00a0" + draft + "\n" + rule + "\n" + footer + "\n"
+	framePath := filepath.Join(t.TempDir(), "frame")
+	if err := os.WriteFile(framePath, []byte(frame), 0o600); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+	if out, err := tm.run("new-session", "-d", "-s", session, "-x", "120", "-y", "12",
+		"sh", "-c", "cat "+framePath+"; sleep 120"); err != nil {
 		t.Skipf("cannot start tmux session: %v (%s)", err, out)
 	}
 	t.Cleanup(func() { _, _ = tm.run("kill-server") })
+	time.Sleep(500 * time.Millisecond)
 
-	// A human's unsent draft: typed, never submitted, and NOT dim.
-	if _, err := tm.run("send-keys", "-t", session, DefaultReadyPromptPrefix+" "+draft); err != nil {
-		t.Fatalf("send-keys: %v", err)
+	// Guard the guard: if the frame did not render, the refusal below would be
+	// vacuous and this test would pass for the wrong reason.
+	if pre, err := tm.run("capture-pane", "-p", "-J", "-t", session); err != nil || !strings.Contains(pre, draft) {
+		t.Skipf("pane did not render the frame (err %v):\n%s", err, pre)
 	}
-	time.Sleep(400 * time.Millisecond)
 
 	err := tm.NudgeSessionWithOpts(session, nudgeText, NudgeOpts{})
 
@@ -164,50 +105,6 @@ func TestNudgeRefusesToTypeIntoADraftedComposer(t *testing.T) {
 	}
 	if !strings.Contains(after, draft) {
 		t.Errorf("the draft did not survive delivery, which is the loss this guards:\n%s", after)
-	}
-}
-
-// codex P1 on this change: during generation the last ❯ line is the turn the
-// agent is ANSWERING, not a live composer. Reading it as an unsent draft would
-// refuse every direct nudge mid-turn, and several direct callers do not queue,
-// so the message would be lost rather than delayed.
-func TestComposerTypedTextDeclinesOnABusyPane(t *testing.T) {
-	const prefix = "❯"
-	busy := "\x1b[39m❯ go fix the merge queue\n" +
-		"  I'll start by reading the queue state.\n" +
-		"  ⏵⏵ bypass permissions · esc to interrupt\n"
-
-	if text, ok := composerTypedText(busy, prefix); ok {
-		t.Errorf("claimed a draft on a BUSY pane: %q — that is the submitted turn, not a composer", text)
-	}
-
-	// The same pane once the turn ends and the text is genuinely a draft.
-	idle := "\x1b[39m❯ go fix the merge queue\n" +
-		"  ⏵⏵ bypass permissions\n"
-	if _, ok := composerTypedText(idle, prefix); !ok {
-		t.Error("declined on an IDLE pane holding typed text — the guard would never fire")
-	}
-}
-
-// codex P2: an agent whose preset declares no ReadyPromptPrefix has no composer
-// this code can find. Falling back to Claude's ❯ scans arbitrary output as
-// though it were a composer.
-func TestComposerPromptPrefixDoesNotFallBackForAgentsWithoutOne(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		prefix string
-		want   bool
-	}{
-		{"agent with no prompt prefix declines", "", false},
-		{"claude's prefix still classifies", DefaultReadyPromptPrefix, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			content := "\x1b[39m❯ some typed text\n  ⏵⏵ bypass permissions\n"
-			_, got := composerTypedText(content, tc.prefix)
-			if got != tc.want {
-				t.Fatalf("composerTypedText with prefix %q = %v, want %v", tc.prefix, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -246,44 +143,108 @@ func TestComposerPromptPrefixForSessionDeclinesForPrefixlessAgent(t *testing.T) 
 	}
 }
 
-// codex P1, second round: the first busy check scanned the WHOLE capture for
-// "esc to interrupt". That string is also ordinary prose — this town's agents
-// write it to each other constantly — so a pane whose scrollback merely
-// DISCUSSES the marker would disable the guard and let the draft be submitted.
-// The probe would have been defeated by its own subject matter.
-func TestComposerTypedTextIgnoresBusyMarkerInScrollback(t *testing.T) {
-	const prefix = "❯"
-
-	// Idle pane. The marker appears only as quoted text in the transcript.
-	content := "  I was explaining that a busy pane shows esc to interrupt in its status bar.\n" +
-		"  That is how WaitForIdle decides.\n" +
+// Fixtures transcribed from REAL panes on this host, 2026-09-16, because the
+// two previous designs of this guard were argued rather than measured and both
+// were wrong. The layout is rule / composer / rule / footer, and it is the SAME
+// while the agent is generating — the busy marker joins the footer line instead
+// of replacing the composer box.
+const (
+	paneIdleWithDraft = "  some transcript output\n" +
+		"───────────────────────────────\n" +
 		"\x1b[39m❯ dont send this yet\n" +
-		"  ⏵⏵ bypass permissions\n"
+		"───────────────────────────────\n" +
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
 
-	text, ok := composerTypedText(content, prefix)
-	if !ok {
-		t.Fatal("scrollback mentioning the busy marker disabled the guard; a draft would be submitted")
-	}
-	if text != "dont send this yet" {
-		t.Errorf("got %q, want the draft", text)
+	paneIdlePlaceholder = "  some transcript output\n" +
+		"───────────────────────────────\n" +
+		"\x1b[39m❯ \x1b[2mcontinue patrol\x1b[0m\n" +
+		"───────────────────────────────\n" +
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+
+	// Captured from hq-deacon mid-turn: the composer box is still there.
+	paneBusyWithDraft = "✶ Cultivating… (1d 5h 32m · ↓ 547.5k tokens)\n" +
+		"  ⎿  Tip: Use /clear to start fresh\n" +
+		"───────────────────────────────\n" +
+		"\x1b[39m❯ typed while it was thinking\n" +
+		"───────────────────────────────\n" +
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for ag…\n"
+
+	// A ❯ in the transcript must never be read as the composer.
+	paneScrollbackPromptOnly = "❯ a turn submitted ten minutes ago\n" +
+		"  the agent answered it at length\n" +
+		"  and mentioned esc to interrupt while doing so\n" +
+		"───────────────────────────────\n" +
+		"\x1b[39m❯ \x1b[2mcontinue patrol\x1b[0m\n" +
+		"───────────────────────────────\n" +
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+)
+
+func TestComposerTypedTextAgainstRealPaneLayouts(t *testing.T) {
+	const prefix = "❯"
+	for _, tc := range []struct {
+		name     string
+		pane     string
+		wantText string
+		wantOK   bool
+	}{
+		{"idle pane holding a draft", paneIdleWithDraft, "dont send this yet", true},
+		{"idle pane showing the dim placeholder", paneIdlePlaceholder, "", false},
+		{
+			// The earlier design DECLINED here, which was backwards: text typed
+			// during generation is queued input and is exactly the draft the
+			// next Enter would submit.
+			"BUSY pane holding a draft is still protected", paneBusyWithDraft, "typed while it was thinking", true,
+		},
+		{
+			// Footer anchoring is what makes this safe: the scrollback ❯ is not
+			// adjacent to the footer, so it is never a candidate.
+			"submitted turn in scrollback is not a draft", paneScrollbackPromptOnly, "", false,
+		},
+		{
+			// SEPARATES FOOTER ANCHORING FROM "take the last ❯". A pane with no
+			// composer frame — a plain shell, or Claude before its TUI paints —
+			// has prompt characters and no composer. The scan version calls this
+			// a draft and refuses every nudge to that session forever; anchoring
+			// declines and delivery behaves as it always did.
+			"no composer frame at all", "$ ls\n❯ not a composer, just output\n$ \n", "", false,
+		},
+		{
+			"empty composer", "out\n" + rule + "\n❯\n" + rule + "\n" + footer + "\n", "", false,
+		},
+		{
+			// Placeholder text differs per agent, so nothing may key on the words.
+			"another agent's placeholder", "out\n" + rule + "\n\x1b[39m❯\u00a0\x1b[2mkeep patrolling\x1b[0m\n" + rule + "\n" + footer + "\n", "", false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := composerTypedText(tc.pane, prefix)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (text %q)", ok, tc.wantOK, got)
+			}
+			if got != tc.wantText {
+				t.Errorf("text = %q, want %q", got, tc.wantText)
+			}
+		})
 	}
 }
 
-func TestHasBusyIndicatorInStatusArea(t *testing.T) {
+// A pane that does not have the expected shape must DECLINE rather than guess:
+// delivery then behaves as it always did.
+func TestComposerLineIndexByFooterDeclinesOnUnknownShapes(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		lines []string
-		want  bool
+		want  int
 	}{
-		{"marker in the status bar", []string{"output", "❯ x", "⏵⏵ bypass · esc to interrupt"}, true},
-		{"marker far up in scrollback", []string{"we discussed esc to interrupt earlier", "a", "b", "c", "❯ draft"}, false},
-		{"blank lines do not consume the window", []string{"esc to interrupt", "", "", ""}, true},
-		{"no marker", []string{"a", "b", "c"}, false},
-		{"empty", nil, false},
+		{"no footer", []string{"❯ text", "more output"}, -1},
+		{"footer but no rule above", []string{"❯ text", "  ⏵⏵ bypass permissions on"}, -1},
+		{"empty", nil, -1},
+		{"well formed", []string{"out", "──────", "❯ draft", "──────", "  ⏵⏵ bypass permissions on"}, 2},
+		{"trailing blank lines do not hide the footer", []string{"──────", "❯ draft", "──────", "  ⏵⏵ bypass permissions on", "", ""}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hasBusyIndicatorInStatusArea(tc.lines); got != tc.want {
-				t.Fatalf("hasBusyIndicatorInStatusArea(%q) = %v, want %v", tc.lines, got, tc.want)
+			if got := composerLineIndexByFooter(tc.lines); got != tc.want {
+				t.Fatalf("composerLineIndexByFooter = %d, want %d", got, tc.want)
 			}
 		})
 	}
