@@ -325,6 +325,11 @@ func createSupplementalPatrolDigest(dateStr, primaryID string, late []PatrolCycl
 		return "", nil
 	}
 
+	if existing := findSupplementCarrying(dateStr, late); existing != "" {
+		fmt.Printf("  Supplement %s already carries these %d late cycles; not writing another\n", existing, len(late))
+		return existing, nil
+	}
+
 	digest := PatrolDigest{
 		Date:        dateStr,
 		TotalCycles: len(late),
@@ -383,7 +388,50 @@ func createSupplementalPatrolDigest(dateStr, primaryID string, late []PatrolCycl
 	if idErr != nil || id == "" {
 		return "", fmt.Errorf("could not read the supplemental digest id from %q: %v", strings.TrimSpace(string(out)), idErr)
 	}
+
+	// Close it, as the primary report is closed immediately below its own
+	// creation. A supplement is an audit record, not actionable work, and an
+	// open one shows up in every default open/ready query (codex P2).
+	closeCmd := exec.Command("bd", "close", id, "--reason=supplemental patrol digest")
+	if closeOut, closeErr := closeCmd.CombinedOutput(); closeErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: supplemental digest %s created but not closed: %v (%s)\n",
+			id, closeErr, strings.TrimSpace(string(closeOut)))
+	}
 	return id, nil
+}
+
+// findSupplementCarrying returns an existing supplement for this date that
+// already contains every one of the given cycle ids, or "".
+//
+// Creation is otherwise NOT idempotent: if the supplement is written but its
+// read-back fails, the sources are deliberately kept, and the next run writes a
+// SECOND permanent supplement holding the same cycles. A failure parsing bd's
+// output does the same. Searching first makes a transient verification failure
+// cost a retry rather than a duplicate archive record (codex P2).
+func findSupplementCarrying(dateStr string, late []PatrolCycleEntry) string {
+	listCmd := exec.Command("bd", "list",
+		"--type=event",
+		"--status=open,in_progress,blocked,deferred,closed",
+		"--title", fmt.Sprintf("Patrol Report %s (supplement", dateStr),
+		"--json",
+		"--limit=0",
+	)
+	out, err := listCmd.Output()
+	if err != nil {
+		return ""
+	}
+	var events []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(out, &events); err != nil {
+		return ""
+	}
+	for _, evt := range events {
+		if missing, err := digestMissingCycles(evt.ID, late); err == nil && len(missing) == 0 {
+			return evt.ID
+		}
+	}
+	return ""
 }
 
 // queryPatrolDigests queries ephemeral patrol digest beads for a target date.
