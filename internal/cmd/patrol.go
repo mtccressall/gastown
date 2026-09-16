@@ -240,8 +240,45 @@ func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, date
 		}
 	}
 
+	// APPEND THE LATE ONES RATHER THAN DESCRIBING A REMEDY THAT DOES NOT EXIST.
+	// A cycle closing after the report was built is missing from it, and the
+	// earlier version of this code kept it and told the operator to "re-run after
+	// adding them" — which nothing could do, so those cycles were unaggregated
+	// forever (codex P2). Appending makes the reconcile path converge.
+	if len(missing) > 0 {
+		byID := make(map[string]PatrolCycleEntry, len(cycles))
+		for _, c := range cycles {
+			byID[c.ID] = c
+		}
+		late := make([]PatrolCycleEntry, 0, len(missing))
+		for _, id := range missing {
+			if c, ok := byID[id]; ok {
+				late = append(late, c)
+			}
+		}
+		if err := appendCyclesToDigest(existingID, dateStr, late); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not append %d late cycles to %s (%v); they are KEPT\n",
+				len(late), existingID, err)
+		} else {
+			// Re-verify by reading back, never by assuming the append landed.
+			if stillMissing, err := digestMissingCycles(existingID, cycles); err == nil {
+				missingSet = make(map[string]bool, len(stillMissing))
+				for _, id := range stillMissing {
+					missingSet[id] = true
+				}
+				covered = covered[:0]
+				for _, c := range cycles {
+					if !missingSet[c.ID] {
+						covered = append(covered, c.ID)
+					}
+				}
+				missing = stillMissing
+			}
+		}
+	}
+
 	if len(covered) == 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s but %s carries none of them; sources KEPT (they are NOT in the report)\n",
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s but %s carries none of them; sources KEPT\n",
 			len(cycles), dateStr, existingID)
 		return nil
 	}
@@ -251,12 +288,58 @@ func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, date
 		fmt.Fprintf(os.Stderr, "warning: retrying delete of covered sources failed: %v\n", delErr)
 		return nil
 	}
-	fmt.Printf("  Cleared %d stranded source cycles already present in %s\n", deleted, existingID)
+	fmt.Printf("  Cleared %d stranded source cycles now present in %s\n", deleted, existingID)
 	if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d source cycles are NOT in %s and were kept; re-run after adding them\n",
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles could not be added to %s and were KEPT\n",
 			len(missing), existingID)
 	}
 	return nil
+}
+
+// appendCyclesToDigest adds late cycles to an existing report's notes.
+//
+// Notes rather than a rewritten description, because appending cannot lose what
+// is already there. Chunked at 20KB: a day of summaries exceeds MAX_ARG_STRLEN
+// as one argument, which is the same limit that kept this command from ever
+// running (gt-3uty).
+func appendCyclesToDigest(digestID, dateStr string, late []PatrolCycleEntry) error {
+	if len(late) == 0 {
+		return nil
+	}
+	const maxChunk = 20000
+
+	var chunk strings.Builder
+	flush := func() error {
+		if chunk.Len() == 0 {
+			return nil
+		}
+		// The text goes as an ARGUMENT, bounded by maxChunk. bd update has no
+		// stdin form for notes: passing "-" writes a literal hyphen and EXITS
+		// ZERO, so a fallback keyed on the error never fires and the note is
+		// silently wrong. Measured: notes went from 0 bytes to 1.
+		cmd := exec.Command("bd", "update", digestID, "--append-notes", chunk.String())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("appending to %s: %v (%s)", digestID, err, strings.TrimSpace(string(out)))
+		}
+		chunk.Reset()
+		return nil
+	}
+
+	chunk.WriteString(fmt.Sprintf("LATE CYCLES appended for %s (closed after the report was built):\n\n", dateStr))
+	for _, c := range late {
+		stamp := c.ClosedAt
+		if stamp.IsZero() {
+			stamp = c.CreatedAt
+		}
+		entry := fmt.Sprintf("### %s — %s (%s)\n\n%s\n\n", stamp.UTC().Format("15:04Z"), c.Role, c.ID, strings.TrimSpace(c.Description))
+		if chunk.Len()+len(entry) > maxChunk {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		chunk.WriteString(entry)
+	}
+	return flush()
 }
 
 // queryPatrolDigests queries ephemeral patrol digest beads for a target date.
@@ -411,24 +494,28 @@ func digestMissingCycles(digestID string, cycles []PatrolCycleEntry) ([]string, 
 	if err != nil {
 		return nil, fmt.Errorf("reading back digest %s: %w", digestID, err)
 	}
-	// bd show --json returns an ARRAY (be-73x); accept either shape.
+	// bd show --json returns an ARRAY (be-73x); accept either shape. Notes count
+	// as much as the description: a late cycle is APPENDED there by reconcile,
+	// and a check that ignored notes would call it missing forever.
 	var many []struct {
 		Description string `json:"description"`
+		Notes       string `json:"notes"`
 	}
 	body := ""
 	if err := json.Unmarshal(out, &many); err == nil {
 		if len(many) == 0 {
 			return nil, fmt.Errorf("digest %s read back empty", digestID)
 		}
-		body = many[0].Description
+		body = many[0].Description + "\n" + many[0].Notes
 	} else {
 		var one struct {
 			Description string `json:"description"`
+			Notes       string `json:"notes"`
 		}
 		if err2 := json.Unmarshal(out, &one); err2 != nil {
 			return nil, fmt.Errorf("parsing digest %s: %w", digestID, err2)
 		}
-		body = one.Description
+		body = one.Description + "\n" + one.Notes
 	}
 
 	var missing []string
