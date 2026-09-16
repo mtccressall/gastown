@@ -876,6 +876,18 @@ func (m *Mailbox) Delete(id string) error {
 	if m.legacy {
 		return m.deleteLegacy(id)
 	}
+	// RECORD WHEN THIS WAS CLEARED, on the path every clearing route shares.
+	//
+	// Delete is what `gt mail archive` (by id and --stale), `gt mail drain`,
+	// `gt mail clear` and Mailbox.Archive all call, so one write here covers
+	// every way a message stops being live. Mailbox.Archive is NOT that path on
+	// its own: it has exactly one caller in the tree (the reaper dog), and the
+	// CLI never routes through it — a correction to this bead's own design note,
+	// which claimed it did (gt-745z0).
+	//
+	// Before the close, and best-effort: an audit label must never cost the
+	// clearing operation itself.
+	m.recordHandledAt(id, time.Now().UTC())
 	return m.MarkRead(id) // beads: just acknowledge/close
 }
 
@@ -906,6 +918,37 @@ func (m *Mailbox) deleteLegacy(id string) error {
 	}
 
 	return m.rewriteLegacy(filtered)
+}
+
+// recordHandledAt writes the handled-at label onto a message bead.
+//
+// Idempotent by READING the bead's labels first: a message that already carries
+// handled-at is left alone, so re-archiving cannot append a second timestamp.
+// bd label add would happily do exactly that, since each timestamp is a
+// different string.
+//
+// Errors are reported and swallowed. By this point the archive copy is already
+// durable, and failing an archive because an audit label could not be written
+// would trade the thing that matters for the thing that merely helps.
+func (m *Mailbox) recordHandledAt(id string, at time.Time) {
+	if m.legacy {
+		return
+	}
+	workDir := filepath.Dir(m.beadsDir)
+	routed := routedBeadsDirForID(m.beadsDir, id)
+	if existing, err := readBeadLabelsShared(workDir, routed, id); err == nil {
+		for _, label := range existing {
+			if strings.HasPrefix(label, HandledAtPrefix) {
+				return // already recorded
+			}
+		}
+	}
+	label := HandledAtPrefix + at.Format(time.RFC3339)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	if _, err := runBdCommand(ctx, []string{"label", "add", id, label}, workDir, routed); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not record %s on %s: %v\n", label, id, err)
+	}
 }
 
 // Archive moves a message to the archive file and removes it from inbox.

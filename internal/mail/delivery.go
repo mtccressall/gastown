@@ -21,6 +21,25 @@ const (
 	DeliveryLabelAcked         = "delivery:acked"
 	DeliveryLabelAckedByPrefix = "delivery-acked-by:"
 	DeliveryLabelAckedAtPrefix = "delivery-acked-at:"
+
+	// HandledAtPrefix records WHEN a message was archived, which is not the same
+	// event as the delivery ack and cannot be derived from it.
+	//
+	// Measured on this town before adding it: 24 beads carry delivery-acked-by
+	// while still OPEN, so the ack fires at DELIVERY and says only "this reached
+	// its recipient". Across 442 closed messages the gap between the ack and the
+	// close is p50 123s but p90 ~41 hours, and 38% were acked more than five
+	// minutes before being cleared. So "delivered" and "dealt with" are distinct
+	// facts and only one of them was recorded (gt-745z0).
+	//
+	// There is deliberately NO handled-by companion. delivery-acked-by never
+	// disagrees with the assignee — 0 of 1959 across 19 roles — so an identity
+	// label would be vacuous unless a handler can differ from a recipient, and
+	// the store cannot answer that: message beads carry created_by and
+	// close_reason but NO closed_by. The case is not absent, it is UNTESTABLE
+	// today. If a closed_by field is ever added, that is when to revisit this,
+	// not before (gastown/refinery's framing).
+	HandledAtPrefix = "handled-at:"
 )
 
 // DeliverySendLabels returns labels written during phase-1 (send).
