@@ -1,9 +1,6 @@
 package cmd
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
 // gt-3uty: `gt patrol digest` queried --label=digest, a label only `gt mol squash`
 // creates. Patrol stopped calling squash when `gt patrol report` replaced the
@@ -67,8 +64,10 @@ func TestDigestMissingCyclesFailsTowardKeeping(t *testing.T) {
 		{ID: "gt-wisp-bbb", Role: "witness", Description: "cycle two"},
 	}
 
-	// A body that carries both ids is complete; one that carries neither, or only
-	// one, must report what is missing rather than reporting success.
+	// THIS CALLS THE PRODUCTION PREDICATE. The first version of this test
+	// reimplemented the loop inline, so defeating the real verification left it
+	// green — on the path that deletes beads permanently. Caught by
+	// gastown/refinery, by sabotage rather than by reading.
 	for _, tc := range []struct {
 		name        string
 		body        string
@@ -80,16 +79,17 @@ func TestDigestMissingCyclesFailsTowardKeeping(t *testing.T) {
 		{"empty", "", 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			missing := 0
-			for _, c := range cycles {
-				if !strings.Contains(tc.body, c.ID) {
-					missing++
-				}
-			}
-			if missing != tc.wantMissing {
-				t.Fatalf("missing = %d, want %d", missing, tc.wantMissing)
+			got := missingCycleIDs(tc.body, cycles)
+			if len(got) != tc.wantMissing {
+				t.Fatalf("missingCycleIDs = %v (%d), want %d missing", got, len(got), tc.wantMissing)
 			}
 		})
+	}
+
+	// And the property the delete depends on, stated directly: a body that
+	// mentions nothing must report EVERY cycle missing, never an empty slice.
+	if got := missingCycleIDs("", cycles); len(got) != len(cycles) {
+		t.Fatalf("an empty body reported %d missing; a verification that reports nothing missing deletes everything", len(got))
 	}
 }
 

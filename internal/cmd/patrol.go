@@ -247,7 +247,7 @@ func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, date
 		}
 	}
 
-	// APPEND THE LATE ONES RATHER THAN DESCRIBING A REMEDY THAT DOES NOT EXIST.
+	// WRITE A SUPPLEMENTAL REPORT FOR THE LATE ONES.
 	// A cycle closing after the report was built is missing from it, and the
 	// earlier version of this code kept it and told the operator to "re-run after
 	// adding them" — which nothing could do, so those cycles were unaggregated
@@ -263,23 +263,30 @@ func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, date
 				late = append(late, c)
 			}
 		}
-		if err := appendCyclesToDigest(existingID, dateStr, late); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not append %d late cycles to %s (%v); they are KEPT\n",
-				len(late), existingID, err)
+		supplementID, err := createSupplementalPatrolDigest(dateStr, existingID, late)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write a supplemental report for %d late cycles (%v); they are KEPT\n",
+				len(late), err)
 		} else {
-			// Re-verify by reading back, never by assuming the append landed.
-			if stillMissing, err := digestMissingCycles(existingID, cycles); err == nil {
-				missingSet = make(map[string]bool, len(stillMissing))
+			fmt.Printf("  Wrote supplemental report %s for %d late cycles\n", supplementID, len(late))
+			// Re-verify by reading back the SUPPLEMENT, never by assuming it landed.
+			if stillMissing, err := digestMissingCycles(supplementID, late); err == nil {
+				// A cycle is covered if the ORIGINAL report carries it or the
+				// supplement does. Recomputed from both, never assumed.
+				stillMissingSet := make(map[string]bool, len(stillMissing))
 				for _, id := range stillMissing {
-					missingSet[id] = true
+					stillMissingSet[id] = true
 				}
 				covered = covered[:0]
+				var remaining []string
 				for _, c := range cycles {
-					if !missingSet[c.ID] {
+					if !missingSet[c.ID] || !stillMissingSet[c.ID] {
 						covered = append(covered, c.ID)
+					} else {
+						remaining = append(remaining, c.ID)
 					}
 				}
-				missing = stillMissing
+				missing = remaining
 			}
 		}
 	}
@@ -303,71 +310,80 @@ func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, date
 	return nil
 }
 
-// appendCyclesToDigest adds late cycles to an existing report's notes.
+// createSupplementalPatrolDigest writes a second permanent report carrying the
+// cycles that closed after the first one was built.
 //
-// Notes rather than a rewritten description, because appending cannot lose what
-// is already there. Chunked at 20KB: a day of summaries exceeds MAX_ARG_STRLEN
-// as one argument, which is the same limit that kept this command from ever
-// running (gt-3uty).
-func appendCyclesToDigest(digestID, dateStr string, late []PatrolCycleEntry) error {
+// A supplement rather than an append to the original's notes, because
+// `bd update` has NO --event-payload: appending bodies to notes leaves the
+// original's structured payload stating a total and a cycle list that no longer
+// match what has been archived, and the sources are then deleted, so the
+// incomplete structured record becomes the only one (gastown/refinery). A
+// supplement carries its own payload, so every archived cycle is in exactly one
+// structured record.
+func createSupplementalPatrolDigest(dateStr, primaryID string, late []PatrolCycleEntry) (string, error) {
 	if len(late) == 0 {
-		return nil
-	}
-	const maxChunk = 20000
-
-	var chunk strings.Builder
-	flush := func() error {
-		if chunk.Len() == 0 {
-			return nil
-		}
-		// The text goes as an ARGUMENT, bounded by maxChunk. bd update has no
-		// stdin form for notes: passing "-" writes a literal hyphen and EXITS
-		// ZERO, so a fallback keyed on the error never fires and the note is
-		// silently wrong. Measured: notes went from 0 bytes to 1.
-		cmd := exec.Command("bd", "update", digestID, "--append-notes", chunk.String())
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("appending to %s: %v (%s)", digestID, err, strings.TrimSpace(string(out)))
-		}
-		chunk.Reset()
-		return nil
+		return "", nil
 	}
 
-	// The header totals in the description were written before these cycles
-	// existed and this function does not rewrite that description — an append
-	// cannot lose content, a rewrite can. So the revised figures go here,
-	// explicitly superseding the header, rather than leaving the aggregate
-	// silently undercounting (codex P2).
-	byRole := make(map[string]int, len(late))
+	digest := PatrolDigest{
+		Date:        dateStr,
+		TotalCycles: len(late),
+		ByRole:      make(map[string]int, len(late)),
+		Cycles:      late,
+	}
 	for _, c := range late {
-		byRole[c.Role]++
+		digest.ByRole[c.Role]++
 	}
-	roles := make([]string, 0, len(byRole))
-	for r := range byRole {
-		roles = append(roles, r)
+
+	var desc strings.Builder
+	desc.WriteString(fmt.Sprintf("Supplemental patrol aggregate for %s.\n\n", dateStr))
+	desc.WriteString(fmt.Sprintf("These cycles closed after %s was written and are ADDITIONAL to its totals.\n\n", primaryID))
+	desc.WriteString(fmt.Sprintf("**Total Cycles:** %d\n\n## By Role\n", digest.TotalCycles))
+	roles := make([]string, 0, len(digest.ByRole))
+	for role := range digest.ByRole {
+		roles = append(roles, role)
 	}
 	sort.Strings(roles)
-	var roleParts []string
-	for _, r := range roles {
-		roleParts = append(roleParts, fmt.Sprintf("%s +%d", r, byRole[r]))
+	for _, role := range roles {
+		desc.WriteString(fmt.Sprintf("- %s: %d cycles\n", role, digest.ByRole[role]))
 	}
-
-	chunk.WriteString(fmt.Sprintf("LATE CYCLES appended for %s (closed after the report was built).\n"+
-		"THESE ARE ADDITIONAL TO THE TOTALS IN THE DESCRIPTION ABOVE, which were correct when written:\n"+
-		"  +%d cycles (%s)\n\n", dateStr, len(late), strings.Join(roleParts, ", ")))
+	desc.WriteString("\n## Cycles\n\n")
 	for _, c := range late {
 		stamp := c.ClosedAt
 		if stamp.IsZero() {
 			stamp = c.CreatedAt
 		}
-		entry := fmt.Sprintf("### %s — %s (%s)\n\n%s\n\n", stamp.UTC().Format("15:04Z"), c.Role, c.ID, strings.TrimSpace(c.Description))
-		if chunk.Len()+len(entry) > maxChunk {
-			if err := flush(); err != nil {
-				return err
-			}
+		body := strings.TrimSpace(c.Description)
+		if body == "" {
+			body = "_(no summary recorded on this cycle)_"
 		}
-		chunk.WriteString(entry)
+		desc.WriteString(fmt.Sprintf("### %s — %s (%s)\n\n%s\n\n", stamp.UTC().Format("15:04Z"), c.Role, c.ID, body))
 	}
-	return flush()
+
+	payloadJSON, err := json.Marshal(digestPayloadWithoutBodies(digest))
+	if err != nil {
+		return "", fmt.Errorf("marshaling supplemental payload: %w", err)
+	}
+
+	title := fmt.Sprintf("Patrol Report %s (supplement %s)", dateStr, time.Now().UTC().Format("150405Z"))
+	cmd := exec.Command("bd", "create",
+		"--type=event",
+		"--title="+title,
+		"--event-category=patrol.digest",
+		"--event-payload="+string(payloadJSON),
+		"--stdin",
+		"--silent",
+	)
+	cmd.Stdin = strings.NewReader(desc.String())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("creating supplemental digest: %w\nOutput: %s", err, string(out))
+	}
+	id, idErr := extractBeadID(string(out))
+	if idErr != nil || id == "" {
+		return "", fmt.Errorf("could not read the supplemental digest id from %q: %v", strings.TrimSpace(string(out)), idErr)
+	}
+	return id, nil
 }
 
 // queryPatrolDigests queries ephemeral patrol digest beads for a target date.
@@ -546,13 +562,23 @@ func digestMissingCycles(digestID string, cycles []PatrolCycleEntry) ([]string, 
 		body = one.Description + "\n" + one.Notes
 	}
 
+	return missingCycleIDs(body, cycles), nil
+}
+
+// missingCycleIDs returns the ids of cycles the given body does not mention.
+//
+// Split out of digestMissingCycles so a test can drive THE REAL PREDICATE. The
+// first version of that test reimplemented this loop inline, which meant
+// defeating the production check entirely left the test green — on the path
+// that permanently deletes beads (found by gastown/refinery, by sabotage).
+func missingCycleIDs(body string, cycles []PatrolCycleEntry) []string {
 	var missing []string
 	for _, c := range cycles {
 		if !strings.Contains(body, c.ID) {
 			missing = append(missing, c.ID)
 		}
 	}
-	return missing, nil
+	return missing
 }
 
 // digestPayloadWithoutBodies returns the digest with each cycle's Description
@@ -681,7 +707,12 @@ func findExistingPatrolDigest(dateStr string) (string, error) {
 		// enumerated form costs nothing and cannot drift.
 		"--status=open,in_progress,blocked,deferred,closed",
 		"--json",
-		"--limit=50", // Recent events only
+		// NO --limit: a truncated row set can hide the report from its own
+		// lookup, and the failure mode is a DUPLICATE permanent report rather
+		// than an error. --title narrows server-side instead (gastown/refinery,
+		// and CLAUDE.md names row-set truncation outright).
+		"--title", expectedTitle,
+		"--limit=0",
 	)
 	listOutput, err := listCmd.Output()
 	if err != nil {
