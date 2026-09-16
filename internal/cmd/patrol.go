@@ -117,7 +117,13 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 	} else if existingID != "" {
 		fmt.Printf("%s Patrol digest already exists for %s (bead: %s)\n",
 			style.Dim.Render("○"), dateStr, existingID)
-		return nil
+		// DO NOT STOP HERE WHILE SOURCES REMAIN. If a previous run kept its
+		// sources — the verification failed, or the delete did — returning now
+		// strands those wisps permanently, because every later run exits at this
+		// same check and nobody ever retries (codex P2). Re-verify the existing
+		// report against whatever is still on the floor and clear only what it
+		// demonstrably contains.
+		return reconcileExistingPatrolDigest(existingID, targetDate, dateStr)
 	}
 
 	// Query ephemeral patrol digest beads for target date
@@ -196,6 +202,60 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Deleted %d source digests\n", deletedCount)
 	}
 
+	return nil
+}
+
+// reconcileExistingPatrolDigest retries the delete for a date whose report was
+// already written.
+//
+// It exists because the keep-the-sources branch is not self-healing on its own:
+// the permanent report is in place, so the idempotency check short-circuits
+// every later run, and any wisp held back stays held back forever. This re-reads
+// the report, keeps the same failing-toward-keeping rule, and removes only the
+// ids that report demonstrably carries.
+func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, dateStr string) error {
+	cycles, err := queryPatrolDigests(targetDate)
+	if err != nil {
+		return fmt.Errorf("querying patrol digests: %w", err)
+	}
+	if len(cycles) == 0 {
+		return nil // nothing stranded
+	}
+
+	missing, checkErr := digestMissingCycles(existingID, cycles)
+	if checkErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s and %s could not be read (%v); sources KEPT\n",
+			len(cycles), dateStr, existingID, checkErr)
+		return nil
+	}
+
+	var covered []string
+	missingSet := make(map[string]bool, len(missing))
+	for _, id := range missing {
+		missingSet[id] = true
+	}
+	for _, c := range cycles {
+		if !missingSet[c.ID] {
+			covered = append(covered, c.ID)
+		}
+	}
+
+	if len(covered) == 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s but %s carries none of them; sources KEPT (they are NOT in the report)\n",
+			len(cycles), dateStr, existingID)
+		return nil
+	}
+
+	deleted, delErr := deletePatrolDigestsByID(covered)
+	if delErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: retrying delete of covered sources failed: %v\n", delErr)
+		return nil
+	}
+	fmt.Printf("  Cleared %d stranded source cycles already present in %s\n", deleted, existingID)
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles are NOT in %s and were kept; re-run after adding them\n",
+			len(missing), existingID)
+	}
 	return nil
 }
 
@@ -491,9 +551,15 @@ func createPatrolDigestBead(digest PatrolDigest) (string, error) {
 func findExistingPatrolDigest(dateStr string) (string, error) {
 	expectedTitle := fmt.Sprintf("Patrol Report %s", dateStr)
 
-	// Query event beads with patrol.digest category
+	// --status=all is LOAD-BEARING: the digest bead is CLOSED the moment it is
+	// written, and bd list defaults to open rows, so this check could never see
+	// its own output and reported "no existing digest" every time. Measured on
+	// this store: the default query returns 3 rows and none is a Patrol Report,
+	// while two reports for today exist and are closed. The visible symptom is a
+	// duplicate permanent report per run (gt-3uty).
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
+		"--status=all",
 		"--json",
 		"--limit=50", // Recent events only
 	)
