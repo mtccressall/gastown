@@ -1839,8 +1839,17 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// draft and press Enter, submitting text nobody chose to send. Returning
 	// before sendMessageToTarget is the whole point: once the text is typed the
 	// damage is done, and clearing it afterwards is the destruction CLAUDE.md
-	// forbids doing blind. The caller queues on this error, so the nudge is
-	// delayed rather than lost.
+	// forbids doing blind.
+	//
+	// WHAT HAPPENS NEXT DEPENDS ON THE CALLER, and only two of them queue
+	// (codex P2): `gt nudge`'s wait-idle branch treats this like
+	// ErrSubmitNotVerified and enqueues, and the poller requeues on any
+	// injection error. Every other direct caller — broadcast, estop, deacon
+	// health, sling notifications — currently SURFACES the refusal and the
+	// notification is not delivered. That is a deliberate trade for now, not an
+	// oversight: a lost "polecat dispatched" notice costs a cycle, a submitted
+	// draft costs a human's words. Teaching those callers to queue is tracked on
+	// gt-sglq.
 	if text, typed := t.composerHoldsTypedText(target, composerPromptPrefixForSession(t, session)); typed {
 		return fmt.Errorf("%w: %s holds %q", ErrComposerHasText, session, text)
 	}

@@ -20,6 +20,38 @@ var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in 
 // nudge is recoverable, a submitted draft is not.
 var ErrComposerHasText = errors.New("composer holds unsubmitted text: refusing to type")
 
+// busyStatusLines is how many trailing non-blank lines count as the status area.
+// The busy marker renders in the status bar, which sits below the composer, so a
+// small window is enough; shouldSendEscape reads the last 5 lines for the same
+// signal.
+const busyStatusLines = 3
+
+// splitRunesAndDimLines returns the pane's plain text as lines.
+func splitRunesAndDimLines(plain []rune, dim []bool) []string {
+	lines, _ := splitRunesAndDim(plain, dim)
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, string(l))
+	}
+	return out
+}
+
+// hasBusyIndicatorInStatusArea tests only the last few NON-BLANK lines, so a
+// transcript line quoting the marker cannot disable the guard.
+func hasBusyIndicatorInStatusArea(lines []string) bool {
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < busyStatusLines; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		seen++
+		if hasBusyIndicator(lines[i]) {
+			return true
+		}
+	}
+	return false
+}
+
 // composerTypedText reports text a person typed into the composer, and
 // distinguishes it from the DIM PLACEHOLDER an idle pane shows.
 //
@@ -39,14 +71,19 @@ func composerTypedText(escContent, promptPrefix string) (string, bool) {
 	}
 	plain, dim := stripAnsiTrackDim(escContent)
 	// A BUSY PANE HAS NO LIVE COMPOSER, AND ITS LAST PROMPT LINE IS THE TURN THE
-	// AGENT IS CURRENTLY ANSWERING (codex P1 on this change). Reading that as an
-	// unsent draft would refuse every direct nudge during an active turn, and
-	// several direct callers do not queue. Declining here keeps the guard scoped
-	// to the defect it is for: WaitForIdle calling a DRAFTED composer idle.
-	for _, line := range strings.Split(string(plain), "\n") {
-		if hasBusyIndicator(line) {
-			return "", false
-		}
+	// AGENT IS CURRENTLY ANSWERING (codex P1). Reading that as an unsent draft
+	// would refuse every direct nudge during an active turn, and several direct
+	// callers do not queue. Declining keeps the guard scoped to the defect it is
+	// for: WaitForIdle calling a DRAFTED composer idle.
+	//
+	// THE MARKER IS READ BY POSITION, NOT BY PATTERN (codex P1 again, on the
+	// first version of this check, which scanned the whole capture). The status
+	// bar is the last rendered line, but "esc to interrupt" is also ordinary
+	// TEXT that agents in this town write to each other constantly. A pane whose
+	// scrollback merely DISCUSSES the marker would have disabled the guard and
+	// let the draft be submitted — the probe matching its own subject matter.
+	if hasBusyIndicatorInStatusArea(splitRunesAndDimLines(plain, dim)) {
+		return "", false
 	}
 	lines, dims := splitRunesAndDim(plain, dim)
 	for i := len(lines) - 1; i >= 0; i-- {

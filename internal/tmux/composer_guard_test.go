@@ -245,3 +245,46 @@ func TestComposerPromptPrefixForSessionDeclinesForPrefixlessAgent(t *testing.T) 
 		})
 	}
 }
+
+// codex P1, second round: the first busy check scanned the WHOLE capture for
+// "esc to interrupt". That string is also ordinary prose — this town's agents
+// write it to each other constantly — so a pane whose scrollback merely
+// DISCUSSES the marker would disable the guard and let the draft be submitted.
+// The probe would have been defeated by its own subject matter.
+func TestComposerTypedTextIgnoresBusyMarkerInScrollback(t *testing.T) {
+	const prefix = "❯"
+
+	// Idle pane. The marker appears only as quoted text in the transcript.
+	content := "  I was explaining that a busy pane shows esc to interrupt in its status bar.\n" +
+		"  That is how WaitForIdle decides.\n" +
+		"\x1b[39m❯ dont send this yet\n" +
+		"  ⏵⏵ bypass permissions\n"
+
+	text, ok := composerTypedText(content, prefix)
+	if !ok {
+		t.Fatal("scrollback mentioning the busy marker disabled the guard; a draft would be submitted")
+	}
+	if text != "dont send this yet" {
+		t.Errorf("got %q, want the draft", text)
+	}
+}
+
+func TestHasBusyIndicatorInStatusArea(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{"marker in the status bar", []string{"output", "❯ x", "⏵⏵ bypass · esc to interrupt"}, true},
+		{"marker far up in scrollback", []string{"we discussed esc to interrupt earlier", "a", "b", "c", "❯ draft"}, false},
+		{"blank lines do not consume the window", []string{"esc to interrupt", "", "", ""}, true},
+		{"no marker", []string{"a", "b", "c"}, false},
+		{"empty", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasBusyIndicatorInStatusArea(tc.lines); got != tc.want {
+				t.Fatalf("hasBusyIndicatorInStatusArea(%q) = %v, want %v", tc.lines, got, tc.want)
+			}
+		})
+	}
+}
