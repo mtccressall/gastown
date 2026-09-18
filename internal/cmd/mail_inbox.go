@@ -408,6 +408,25 @@ type staleMessage struct {
 	Reason  string
 }
 
+// partitionStaleByRead splits a stale set into what --stale may archive and what
+// it must refuse.
+//
+// Extracted so a test can drive THE FUNCTION THE COMMAND USES. Asserting the
+// partition inline in a test proves nothing: deleting the guard from the command
+// leaves such a test green, which is the vacuous-test shape this town has caught
+// on four of my PRs (gt-745z0).
+func partitionStaleByRead(staleMessages []staleMessage) (readable, unread []staleMessage) {
+	readable = staleMessages[:0:0]
+	for _, stale := range staleMessages {
+		if stale.Message != nil && stale.Message.Read {
+			readable = append(readable, stale)
+			continue
+		}
+		unread = append(unread, stale)
+	}
+	return readable, unread
+}
+
 func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 	identity, err := session.ParseAddress(address)
 	if err != nil {
@@ -430,6 +449,43 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 	}
 
 	staleMessages := staleMessagesForSession(messages, sessionStart)
+
+	// REFUSE TO ARCHIVE ANYTHING UNREAD, AND NAME WHAT WOULD HAVE GONE.
+	//
+	// Every other archive path takes explicit ids, which is what stops an agent
+	// clearing an inbox by looping a listing — the failure that ate a correction
+	// unread in this town. --stale is the one path that selects by PATTERN, so
+	// the same protection has to live in the command rather than in the caller's
+	// discipline: age is not evidence that a message was dealt with (gt-745z0).
+	return archiveStaleSet(staleMessages, mailbox.Delete)
+}
+
+// archiveStaleSet applies the unread guard and archives what survives it.
+//
+// It takes the DELETE FUNCTION rather than a mailbox so a test can assert what
+// the command actually calls. Driving partitionStaleByRead alone cannot do that:
+// a test on an extracted predicate passes whether or not the caller still calls
+// it, so the previous repair moved the gap up a level instead of closing it
+// (gastown/refinery, instance five of this class on my PRs). The assertion that
+// matters is "nothing was handed to delete", and it can only be made where
+// delete is visible.
+//
+// RESIDUAL GAP, STATED RATHER THAN IMPLIED: this still does not prove that
+// runMailArchiveStale calls THIS function. Closing that needs a test driving the
+// command itself, which requires a live tmux session for SessionCreatedAt — and
+// a test that errored out before reaching the archive would assert "nothing was
+// archived" for the wrong reason, which is worse than no test at all.
+func archiveStaleSet(staleMessages []staleMessage, del func(string) error) error {
+	readable, unread := partitionStaleByRead(staleMessages)
+	if len(unread) > 0 {
+		fmt.Printf("%s Refusing to archive %d UNREAD stale message(s):\n", style.Bold.Render("⚠"), len(unread))
+		for _, stale := range unread {
+			fmt.Printf("  %s %s\n", style.Dim.Render(stale.Message.ID), stale.Message.Subject)
+		}
+		fmt.Printf("  Read them, or archive them by explicit id if you have handled them.\n")
+	}
+	staleMessages = readable
+
 	if mailArchiveDryRun {
 		if len(staleMessages) == 0 {
 			fmt.Printf("%s No stale messages found\n", style.Success.Render("✓"))
@@ -455,7 +511,7 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 	gcd := 0
 	var errMsgs []string
 	for _, stale := range staleMessages {
-		err := mailbox.Delete(stale.Message.ID)
+		err := del(stale.Message.ID)
 		switch {
 		case err == nil:
 			archived++

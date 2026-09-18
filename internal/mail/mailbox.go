@@ -605,18 +605,36 @@ func (m *Mailbox) MarkRead(id string) error {
 }
 
 func (m *Mailbox) markReadBeads(id string) error {
+	// handled-at is recorded HERE, the shared close path, rather than in Delete.
+	// Delete is not the only route: runMoleculeAttachFromMail closes handled mail
+	// by calling MarkRead directly, and those messages would leave the live inbox
+	// with no audit label at all (codex). Recording happens after the close
+	// succeeds — see below.
 	if err := m.acknowledgeDeliveryForPrimary(id); err != nil {
 		return err
 	}
 
 	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
+	closedIn := primary
 	err := m.closeInDir(id, primary)
 	if errors.Is(err, ErrMessageNotFound) && primary != m.beadsDir {
 		// Cross-rig bead IDs (e.g. ne-*) may live in the home DB when created
 		// via the mail router (which always uses town beads). Fall back to
 		// m.beadsDir before giving up. See ne-bgr.
-		return m.closeInDir(id, m.beadsDir)
+		closedIn = m.beadsDir
+		err = m.closeInDir(id, closedIn)
+	}
+	if err == nil {
+		// Label the database the close ACTUALLY used. Recomputing the prefix
+		// route here would send both label operations to the database where the
+		// bead was not found, and since the write is best-effort the symptom is
+		// a cross-rig message silently missing its audit label (codex).
+		//
+		// And only after the close succeeds: a label written on a failed attempt
+		// records the time of that failure, and recordHandledAt treats it as
+		// permanent, so a later successful retry would keep the wrong timestamp.
+		m.recordHandledAt(id, closedIn, time.Now().UTC())
 	}
 	return err
 }
@@ -876,7 +894,18 @@ func (m *Mailbox) Delete(id string) error {
 	if m.legacy {
 		return m.deleteLegacy(id)
 	}
-	return m.MarkRead(id) // beads: just acknowledge/close
+	// RECORD WHEN THIS WAS CLEARED, on the path every clearing route shares.
+	//
+	// Delete is what `gt mail archive` (by id and --stale), `gt mail drain`,
+	// `gt mail clear` and Mailbox.Archive all call, so one write here covers
+	// every way a message stops being live. Mailbox.Archive is NOT that path on
+	// its own: it has exactly one caller in the tree (the reaper dog), and the
+	// CLI never routes through it — a correction to this bead's own design note,
+	// which claimed it did (gt-745z0).
+	//
+	// Before the close, and best-effort: an audit label must never cost the
+	// clearing operation itself.
+	return m.MarkRead(id) // beads: acknowledge/close, which records handled-at
 }
 
 func (m *Mailbox) deleteLegacy(id string) error {
@@ -906,6 +935,65 @@ func (m *Mailbox) deleteLegacy(id string) error {
 	}
 
 	return m.rewriteLegacy(filtered)
+}
+
+// recordHandledAt writes the handled-at label onto a message bead.
+//
+// Idempotent by READING the bead's labels first: a message that already carries
+// handled-at is left alone, so re-archiving cannot append a second timestamp.
+// bd label add would happily do exactly that, since each timestamp is a
+// different string.
+//
+// Errors are reported and swallowed. By this point the archive copy is already
+// durable, and failing an archive because an audit label could not be written
+// would trade the thing that matters for the thing that merely helps.
+func (m *Mailbox) recordHandledAt(id, beadsDir string, at time.Time) {
+	if m.legacy {
+		return
+	}
+	// m.workDir, NOT filepath.Dir(m.beadsDir): for mailboxes built by
+	// NewMailboxBeads the beadsDir is empty, so that expression yields "." and
+	// both bd calls run against the process's current directory. The error is
+	// swallowed by design, so the symptom would be a label that silently never
+	// appears — a fix that works only where it happens to be tested (codex).
+	label := HandledAtPrefix + at.Format(time.RFC3339)
+
+	// IN-PROCESS STORE FIRST. A mailbox built with a store (NewMailboxBeadsWithStore,
+	// NewMailboxWithBeadsDirAndStore, SetStore) closes through m.store and may not
+	// have a bd-reachable database at all, so shelling out would target nothing or
+	// the wrong database — and since the error here is swallowed by design, the
+	// symptom would be a label that silently never appears (codex).
+	if m.store != nil {
+		m.storeRecordHandledAt(id, label)
+		return
+	}
+
+	workDir := m.workDir
+	// USE THE DIRECTORY THAT CLOSED IT, AS GIVEN. Re-resolving the id here would
+	// recompute the prefix route and send both label operations back to the
+	// database where the bead was NOT found — undoing the whole point of passing
+	// it in, for exactly the cross-rig messages this handles (codex).
+	routed := beadsDir
+	existing, err := readBeadLabelsShared(workDir, routed, id)
+	if err != nil {
+		// FAIL TOWARD NOT WRITING. Without the current labels there is no way to
+		// know whether handled-at is already there, and adding one anyway can
+		// append a SECOND distinct timestamp on a later re-archive — breaking the
+		// idempotency this function promises. A missing audit label is
+		// recoverable; two contradictory ones are not (codex).
+		fmt.Fprintf(os.Stderr, "Warning: could not read labels for %s (%v); not recording %s\n", id, err, label)
+		return
+	}
+	for _, l := range existing {
+		if strings.HasPrefix(l, HandledAtPrefix) {
+			return // already recorded
+		}
+	}
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	if _, err := runBdCommand(ctx, []string{"label", "add", id, label}, workDir, routed); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not record %s on %s: %v\n", label, id, err)
+	}
 }
 
 // Archive moves a message to the archive file and removes it from inbox.
