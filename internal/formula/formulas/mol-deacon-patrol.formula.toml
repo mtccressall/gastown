@@ -42,7 +42,7 @@ This happens when idle_cycles >= {{idle_effort_threshold}} (no activity detected
 
 Abbreviated patrol rules:
 - **heartbeat**: ALWAYS run (required by daemon).
-- **inbox-check**: Run `gt mail drain` only. Skip individual message processing unless drain reports unprocessed HELP or RECOVERED_BEAD messages.
+- **inbox-check**: Run `gt mail drain` AND `gt mail inbox`. Drain alone is BLIND to ordinary mail: it only archives the fixed protocol-subject list, so it prints 'No drainable messages' while unread mail sits in the inbox (gt-jiohc, measured: drain said '(2 messages total)' in the same cycle inbox said '2 messages, 2 unread'). A looping agent is never idle at a prompt, so queued nudges expire and the prompt hook never fires: this step is the ONLY way it learns it has mail. Skip individual message processing unless the inbox is non-empty or drain reports unprocessed HELP or RECOVERED_BEAD messages.
 - **orphan-process-cleanup**: SKIP.
 - **test-pollution-cleanup**: SKIP.
 - **gate-evaluation**: SKIP.
@@ -2019,7 +2019,7 @@ After await-signal returns, check the EFFORT directive in the output:
 
 **If `EFFORT: reduced`** — Run ABBREVIATED patrol:
 - heartbeat: ALWAYS run
-- inbox-check: Quick drain only, skip individual messages unless HELP/RECOVERED_BEAD
+- inbox-check: Drain AND read the inbox (drain cannot see ordinary mail, gt-jiohc); skip individual messages unless the inbox is non-empty or HELP/RECOVERED_BEAD
 - orphan-process-cleanup through fire-notifications: SKIP all
 - heartbeat-mid: SKIP
 - health-scan: Quick status checks only, skip nudges
