@@ -70,16 +70,16 @@ func init() {
 
 // PatrolDigest represents the aggregated daily patrol report.
 type PatrolDigest struct {
-	Date         string                   `json:"date"`
-	TotalCycles  int                      `json:"total_cycles"`
-	ByRole       map[string]int           `json:"by_role"`        // deacon, witness, refinery
-	Cycles       []PatrolCycleEntry       `json:"cycles"`
+	Date        string             `json:"date"`
+	TotalCycles int                `json:"total_cycles"`
+	ByRole      map[string]int     `json:"by_role"` // deacon, witness, refinery
+	Cycles      []PatrolCycleEntry `json:"cycles"`
 }
 
 // PatrolCycleEntry represents a single patrol cycle in the digest.
 type PatrolCycleEntry struct {
 	ID          string    `json:"id"`
-	Role        string    `json:"role"`         // deacon, witness, refinery
+	Role        string    `json:"role"` // deacon, witness, refinery
 	Title       string    `json:"title"`
 	Description string    `json:"description"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -117,7 +117,20 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 	} else if existingID != "" {
 		fmt.Printf("%s Patrol digest already exists for %s (bead: %s)\n",
 			style.Dim.Render("○"), dateStr, existingID)
-		return nil
+		// A DRY RUN MUST NOT REACH THE RECONCILE PATH: it appends notes and
+		// deletes wisps, and --dry-run promises neither (codex P1, introduced by
+		// the reconcile change itself).
+		if patrolDigestDryRun {
+			fmt.Printf("  [DRY RUN] would reconcile any surviving sources for %s against %s\n", dateStr, existingID)
+			return nil
+		}
+		// DO NOT STOP HERE WHILE SOURCES REMAIN. If a previous run kept its
+		// sources — the verification failed, or the delete did — returning now
+		// strands those wisps permanently, because every later run exits at this
+		// same check and nobody ever retries (codex P2). Re-verify the existing
+		// report against whatever is still on the floor and clear only what it
+		// demonstrably contains.
+		return reconcileExistingPatrolDigest(existingID, targetDate, dateStr)
 	}
 
 	// Query ephemeral patrol digest beads for target date
@@ -164,10 +177,27 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating digest bead: %w", err)
 	}
 
-	// Delete source digests (they're ephemeral)
-	deletedCount, deleteErr := deletePatrolDigests(targetDate)
-	if deleteErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to delete some source digests: %v\n", deleteErr)
+	// DELETE ONLY WHAT THE AGGREGATE DEMONSTRABLY CONTAINS. The check is by
+	// CONTENT, not by trusting the code above: re-read the bead just written and
+	// require every cycle id to appear in it. A deleted wisp cannot be recovered
+	// (dolt_ignore), so the failure direction here has to be "keep the sources"
+	// (gt-fwzgp).
+	deletedCount := 0
+	if missing, checkErr := digestMissingCycles(digestID, digest.Cycles); checkErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not verify digest %s carries the cycle bodies (%v); sources KEPT\n", digestID, checkErr)
+	} else if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: digest %s is missing %d of %d cycles (first: %s); sources KEPT\n",
+			digestID, len(missing), len(digest.Cycles), missing[0])
+	} else {
+		// Delete EXACTLY the ids that were verified present, never a fresh date
+		// query: a cycle that closes between the query above and this point would
+		// match the date but is absent from the aggregate, and these sources are
+		// unrecoverable (codex P1).
+		var deleteErr error
+		deletedCount, deleteErr = deletePatrolDigestsByID(cycleIDs(digest.Cycles))
+		if deleteErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to delete some source digests: %v\n", deleteErr)
+		}
 	}
 
 	fmt.Printf("%s Created Patrol Report %s (bead: %s)\n", style.Success.Render("✓"), dateStr, digestID)
@@ -182,13 +212,306 @@ func runPatrolDigest(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// reconcileExistingPatrolDigest retries the delete for a date whose report was
+// already written.
+//
+// It exists because the keep-the-sources branch is not self-healing on its own:
+// the permanent report is in place, so the idempotency check short-circuits
+// every later run, and any wisp held back stays held back forever. This re-reads
+// the report, keeps the same failing-toward-keeping rule, and removes only the
+// ids that report demonstrably carries.
+func reconcileExistingPatrolDigest(existingID string, targetDate time.Time, dateStr string) error {
+	cycles, err := queryPatrolDigests(targetDate)
+	if err != nil {
+		return fmt.Errorf("querying patrol digests: %w", err)
+	}
+	if len(cycles) == 0 {
+		return nil // nothing stranded
+	}
+
+	// COVERAGE IS PER CYCLE, ACROSS EVERY REPORT FOR THE DAY. The primary and any
+	// supplements each archive part of the day, so asking one bead whether it
+	// holds everything would write a further supplement duplicating what is
+	// already archived (codex). Read the whole set once.
+	covered := supplementCoverage(dateStr)
+	if len(covered) == 0 {
+		// supplementCoverage failing and the day genuinely being empty look the
+		// same, so fall back to reading the primary directly rather than treating
+		// an unreadable set as "nothing archived" and deleting on that basis.
+		missing, checkErr := digestMissingCycles(existingID, cycles)
+		if checkErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s and %s could not be read (%v); sources KEPT\n",
+				len(cycles), dateStr, existingID, checkErr)
+			return nil
+		}
+		covered = make(map[string]bool, len(cycles))
+		missingSet := make(map[string]bool, len(missing))
+		for _, id := range missing {
+			missingSet[id] = true
+		}
+		for _, c := range cycles {
+			if !missingSet[c.ID] {
+				covered[c.ID] = true
+			}
+		}
+	}
+
+	var late []PatrolCycleEntry
+	for _, c := range cycles {
+		if !covered[c.ID] {
+			late = append(late, c)
+		}
+	}
+
+	if len(late) > 0 {
+		supplementID, err := createSupplementalPatrolDigest(dateStr, existingID, late)
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "warning: could not write a supplemental report for %d late cycles (%v); they are KEPT\n",
+				len(late), err)
+		case supplementID == "":
+			// Everything was archived elsewhere between the two reads; nothing
+			// written, nothing to verify.
+		default:
+			fmt.Printf("  Wrote supplemental report %s for %d late cycles\n", supplementID, len(late))
+		}
+		// Re-read coverage from the store either way: what gets deleted must rest
+		// on what the store SAYS, never on what this function believes it wrote.
+		covered = supplementCoverage(dateStr)
+	}
+
+	var toDelete, stillMissing []string
+	for _, c := range cycles {
+		if covered[c.ID] {
+			toDelete = append(toDelete, c.ID)
+		} else {
+			stillMissing = append(stillMissing, c.ID)
+		}
+	}
+
+	if len(toDelete) == 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles remain for %s but no report carries them; sources KEPT\n",
+			len(cycles), dateStr)
+		return nil
+	}
+
+	deleted, delErr := deletePatrolDigestsByID(toDelete)
+	if delErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: retrying delete of covered sources failed: %v\n", delErr)
+		return nil
+	}
+	fmt.Printf("  Cleared %d stranded source cycles now archived for %s\n", deleted, dateStr)
+	if len(stillMissing) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d source cycles are archived nowhere and were KEPT\n", len(stillMissing))
+	}
+	return nil
+}
+
+// createSupplementalPatrolDigest writes a second permanent report carrying the
+// cycles that closed after the first one was built.
+//
+// A supplement rather than an append to the original's notes, because
+// `bd update` has NO --event-payload: appending bodies to notes leaves the
+// original's structured payload stating a total and a cycle list that no longer
+// match what has been archived, and the sources are then deleted, so the
+// incomplete structured record becomes the only one (gastown/refinery). A
+// supplement carries its own payload, so every archived cycle is in exactly one
+// structured record.
+func createSupplementalPatrolDigest(dateStr, primaryID string, late []PatrolCycleEntry) (string, error) {
+	if len(late) == 0 {
+		return "", nil
+	}
+
+	if existing := findSupplementCarrying(dateStr, late); existing != "" {
+		fmt.Printf("  Supplement %s already carries these %d late cycles; not writing another\n", existing, len(late))
+		return existing, nil
+	}
+
+	// Coverage is PER CYCLE across every report for the day, not per supplement.
+	// Late cycles can be spread over several supplements — one archived earlier
+	// plus one that just closed — and requiring a single supplement to hold them
+	// all would write yet another record duplicating what is already archived
+	// (codex). Supplement only what nothing carries yet.
+	if covered := supplementCoverage(dateStr); len(covered) > 0 {
+		var uncovered []PatrolCycleEntry
+		for _, c := range late {
+			if !covered[c.ID] {
+				uncovered = append(uncovered, c)
+			}
+		}
+		if len(uncovered) == 0 {
+			fmt.Printf("  All %d late cycles are already archived across this date's reports; not writing another\n", len(late))
+			return "", nil
+		}
+		if len(uncovered) < len(late) {
+			fmt.Printf("  %d of %d late cycles are already archived; supplementing only the rest\n", len(late)-len(uncovered), len(late))
+		}
+		late = uncovered
+	}
+
+	digest := PatrolDigest{
+		Date:        dateStr,
+		TotalCycles: len(late),
+		ByRole:      make(map[string]int, len(late)),
+		Cycles:      late,
+	}
+	for _, c := range late {
+		digest.ByRole[c.Role]++
+	}
+
+	var desc strings.Builder
+	desc.WriteString(fmt.Sprintf("Supplemental patrol aggregate for %s.\n\n", dateStr))
+	desc.WriteString(fmt.Sprintf("These cycles closed after %s was written and are ADDITIONAL to its totals.\n\n", primaryID))
+	desc.WriteString(fmt.Sprintf("**Total Cycles:** %d\n\n## By Role\n", digest.TotalCycles))
+	roles := make([]string, 0, len(digest.ByRole))
+	for role := range digest.ByRole {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		desc.WriteString(fmt.Sprintf("- %s: %d cycles\n", role, digest.ByRole[role]))
+	}
+	desc.WriteString("\n## Cycles\n\n")
+	for _, c := range late {
+		stamp := c.ClosedAt
+		if stamp.IsZero() {
+			stamp = c.CreatedAt
+		}
+		body := strings.TrimSpace(c.Description)
+		if body == "" {
+			body = "_(no summary recorded on this cycle)_"
+		}
+		desc.WriteString(fmt.Sprintf("### %s — %s (%s)\n\n%s\n\n", stamp.UTC().Format("15:04Z"), c.Role, c.ID, body))
+	}
+
+	payloadJSON, err := json.Marshal(digestPayloadWithoutBodies(digest))
+	if err != nil {
+		return "", fmt.Errorf("marshaling supplemental payload: %w", err)
+	}
+
+	title := fmt.Sprintf("Patrol Report %s (supplement %s)", dateStr, time.Now().UTC().Format("150405Z"))
+	cmd := exec.Command("bd", "create",
+		"--type=event",
+		"--title="+title,
+		"--event-category=patrol.digest",
+		"--event-payload="+string(payloadJSON),
+		"--stdin",
+		"--silent",
+	)
+	cmd.Stdin = strings.NewReader(desc.String())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("creating supplemental digest: %w\nOutput: %s", err, string(out))
+	}
+	id, idErr := extractBeadID(string(out))
+	if idErr != nil || id == "" {
+		return "", fmt.Errorf("could not read the supplemental digest id from %q: %v", strings.TrimSpace(string(out)), idErr)
+	}
+
+	// Close it, as the primary report is closed immediately below its own
+	// creation. A supplement is an audit record, not actionable work, and an
+	// open one shows up in every default open/ready query (codex P2).
+	closeCmd := exec.Command("bd", "close", id, "--reason=supplemental patrol digest")
+	if closeOut, closeErr := closeCmd.CombinedOutput(); closeErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: supplemental digest %s created but not closed: %v (%s)\n",
+			id, closeErr, strings.TrimSpace(string(closeOut)))
+	}
+	return id, nil
+}
+
+// findSupplementCarrying returns an existing supplement for this date that
+// already contains every one of the given cycle ids, or "".
+//
+// Creation is otherwise NOT idempotent: if the supplement is written but its
+// read-back fails, the sources are deliberately kept, and the next run writes a
+// SECOND permanent supplement holding the same cycles. A failure parsing bd's
+// output does the same. Searching first makes a transient verification failure
+// cost a retry rather than a duplicate archive record (codex P2).
+func supplementCoverage(dateStr string) map[string]bool {
+	covered := make(map[string]bool)
+	listCmd := exec.Command("bd", "list",
+		"--type=event",
+		"--status=open,in_progress,blocked,deferred,closed",
+		"--title", fmt.Sprintf("Patrol Report %s", dateStr),
+		"--json",
+		"--limit=0",
+	)
+	out, err := listCmd.Output()
+	if err != nil {
+		return covered
+	}
+	var events []struct {
+		ID          string          `json:"id"`
+		Description string          `json:"description"`
+		Notes       string          `json:"notes"`
+		Payload     json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(out, &events); err != nil {
+		return covered
+	}
+	for _, evt := range events {
+		// The payload is authoritative. The heading parse is a FALLBACK for
+		// reports written before payloads carried the cycle list; it can be
+		// fooled by a summary that quotes a heading, so it is only consulted
+		// when the payload yields nothing.
+		fromPayload := payloadCycleIDs(string(evt.Payload))
+		if len(fromPayload) > 0 {
+			for id := range fromPayload {
+				covered[id] = true
+			}
+			continue
+		}
+		for id := range archivedCycleIDs(evt.Description + "\n" + evt.Notes) {
+			covered[id] = true
+		}
+	}
+	return covered
+}
+
+func findSupplementCarrying(dateStr string, late []PatrolCycleEntry) string {
+	listCmd := exec.Command("bd", "list",
+		"--type=event",
+		"--status=open,in_progress,blocked,deferred,closed",
+		"--title", fmt.Sprintf("Patrol Report %s (supplement", dateStr),
+		"--json",
+		"--limit=0",
+	)
+	out, err := listCmd.Output()
+	if err != nil {
+		return ""
+	}
+	var events []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(out, &events); err != nil {
+		return ""
+	}
+	for _, evt := range events {
+		if missing, err := digestMissingCycles(evt.ID, late); err == nil && len(missing) == 0 {
+			return evt.ID
+		}
+	}
+	return ""
+}
+
 // queryPatrolDigests queries ephemeral patrol digest beads for a target date.
 func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
-	// List closed issues with "digest" label that are ephemeral
-	// Patrol digests have titles like "Digest: mol-deacon-patrol", "Digest: mol-witness-patrol"
+	// Read the CLOSED PATROL WISPS, which is where cycle summaries live now.
+	//
+	// This used to query --label=digest, and that label is created only by
+	// `gt mol squash` (molecule_lifecycle.go). Patrol stopped calling squash when
+	// `gt patrol report` replaced the squash-and-new pattern: report closes the
+	// patrol root wisp with the summary and opens the next one, so no digest bead
+	// is ever produced and this aggregation could never return anything. Measured
+	// town-wide: 0 beads carry the digest label in any status (gt-3uty).
+	//
+	// --include-infra is LOAD-BEARING: wisps are hidden from bd list by default.
+	// Measured on the town store, same predicate, same minute:
+	//     without --include-infra      1 matching row
+	//     with    --include-infra   1256 matching rows
 	listCmd := exec.Command("bd", "list",
 		"--status=closed",
-		"--label=digest",
+		"--include-infra",
 		"--json",
 		"--limit=0", // Get all
 	)
@@ -224,13 +547,33 @@ func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
 			continue
 		}
 
-		// Must be a patrol digest (title starts with "Digest: mol-")
-		if !strings.HasPrefix(issue.Title, "Digest: mol-") {
+		if !isPatrolCycleTitle(issue.Title) {
 			continue
 		}
 
-		// Check if created on target date (both in UTC)
-		if issue.CreatedAt.UTC().Format("2006-01-02") != targetDay {
+		// A patrol-shaped title is not evidence of a REPORTED cycle. Roots are
+		// also closed by cleanup and rollback paths (burnPreviousPatrolWisps,
+		// rollbackSuccessorPatrol), which leave no summary; counting those
+		// inflates the day and deleting them destroys nothing useful but is still
+		// a delete of something this command did not aggregate (codex P1).
+		// `gt patrol report` writes "Patrol report: ..." into the description, so
+		// that prefix is the evidence. Legacy squash digests are exempt: they
+		// carry a "Digest: " title and their own body format.
+		if !isLegacyDigestTitle(issue.Title) && !hasPatrolReportBody(issue.Description) {
+			continue
+		}
+
+		// A cycle belongs to the day it ENDED, not the day it began. Patrol wisps
+		// routinely span midnight — and a role with a quiet rig can hold one open
+		// for days — so anchoring on CreatedAt files those cycles under a day
+		// nobody aggregates again, or under no day at all. Measured on this store:
+		// three surviving wisps closed on 2026-09-16 were created on 09-15 and
+		// 09-12, and the creation anchor matched none of them (gt-3uty).
+		day := issue.ClosedAt
+		if day.IsZero() {
+			day = issue.CreatedAt
+		}
+		if day.UTC().Format("2006-01-02") != targetDay {
 			continue
 		}
 
@@ -248,6 +591,30 @@ func queryPatrolDigests(targetDate time.Time) ([]PatrolCycleEntry, error) {
 	}
 
 	return patrolDigests, nil
+}
+
+// isLegacyDigestTitle marks the squash-era digest, which has its own body shape
+// and predates the "Patrol report:" convention.
+func isLegacyDigestTitle(title string) bool {
+	return strings.HasPrefix(title, "Digest: ")
+}
+
+// hasPatrolReportBody reports whether a wisp carries a summary written by
+// `gt patrol report`, as opposed to having been closed by a cleanup or rollback
+// path that leaves the body empty.
+func hasPatrolReportBody(description string) bool {
+	return strings.HasPrefix(strings.TrimSpace(description), "Patrol report:")
+}
+
+// isPatrolCycleTitle reports whether a bead title names a patrol cycle record.
+//
+// Two shapes are accepted because two producers have existed: the legacy squash
+// digest ("Digest: mol-deacon-patrol") and the patrol root wisp that replaced it
+// ("mol-deacon-patrol"). Accepting both means an aggregation run over a window
+// that spans the change does not silently lose half its input.
+func isPatrolCycleTitle(title string) bool {
+	title = strings.TrimPrefix(title, "Digest: ")
+	return strings.HasPrefix(title, "mol-") && strings.HasSuffix(title, "-patrol")
 }
 
 // extractPatrolRole extracts the role from a patrol digest title.
@@ -270,6 +637,161 @@ func extractPatrolRole(title string) string {
 	return "patrol"
 }
 
+// digestMissingCycles re-reads the digest bead and returns the ids of cycles it
+// does not mention. Verification is by reading back what was WRITTEN rather than
+// by trusting what was built, because the consequence of being wrong is the
+// permanent loss of every source.
+func digestMissingCycles(digestID string, cycles []PatrolCycleEntry) ([]string, error) {
+	out, err := exec.Command("bd", "show", digestID, "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("reading back digest %s: %w", digestID, err)
+	}
+	// bd show --json returns an ARRAY (be-73x); accept either shape. Notes count
+	// as much as the description for the legacy prose path.
+	var many []struct {
+		Description string          `json:"description"`
+		Notes       string          `json:"notes"`
+		Payload     json.RawMessage `json:"payload"`
+	}
+	body := ""
+	payload := ""
+	if err := json.Unmarshal(out, &many); err == nil {
+		if len(many) == 0 {
+			return nil, fmt.Errorf("digest %s read back empty", digestID)
+		}
+		body = many[0].Description + "\n" + many[0].Notes
+		payload = string(many[0].Payload)
+	} else {
+		var one struct {
+			Description string          `json:"description"`
+			Notes       string          `json:"notes"`
+			Payload     json.RawMessage `json:"payload"`
+		}
+		if err2 := json.Unmarshal(out, &one); err2 != nil {
+			return nil, fmt.Errorf("parsing digest %s: %w", digestID, err2)
+		}
+		body = one.Description + "\n" + one.Notes
+		payload = string(one.Payload)
+	}
+
+	// THE PAYLOAD IS AUTHORITATIVE HERE TOO. This function is the fallback used
+	// when supplementCoverage cannot be read, and it guards the same delete, so
+	// it must not fall back to a weaker guarantee: prose can quote a heading and
+	// name a cycle that was never archived (codex P1). Prose is consulted only
+	// when the payload yields nothing, which means a genuinely legacy report.
+	if fromPayload := payloadCycleIDs(payload); len(fromPayload) > 0 {
+		var missing []string
+		for _, c := range cycles {
+			if !fromPayload[c.ID] {
+				missing = append(missing, c.ID)
+			}
+		}
+		return missing, nil
+	}
+
+	return missingCycleIDs(body, cycles), nil
+}
+
+// missingCycleIDs returns the ids of cycles the given body does not mention.
+//
+// Split out of digestMissingCycles so a test can drive THE REAL PREDICATE. The
+// first version of that test reimplemented this loop inline, which meant
+// defeating the production check entirely left the test green — on the path
+// that permanently deletes beads (found by gastown/refinery, by sabotage).
+func missingCycleIDs(body string, cycles []PatrolCycleEntry) []string {
+	archived := archivedCycleIDs(body)
+	var missing []string
+	for _, c := range cycles {
+		if !archived[c.ID] {
+			missing = append(missing, c.ID)
+		}
+	}
+	return missing
+}
+
+// payloadCycleIDs reads the archived cycle ids from a report's STRUCTURED
+// payload.
+//
+// This is the authoritative source and prose is not. A summary can itself
+// contain a line like "### 15:04Z — deacon (gt-wisp-bbb)" — agents quote digest
+// output at each other, and this PR's own cycles quote bead ids — so a heading
+// parser can read another cycle's entry out of copied text and mark an
+// unarchived source as covered, which deletes it permanently (codex P1). The
+// payload is written by this command from the cycles it actually aggregated, so
+// it cannot be forged by quoting.
+//
+// bd returns event payloads as a JSON STRING, so it is unmarshalled twice.
+func payloadCycleIDs(rawPayload string) map[string]bool {
+	ids := make(map[string]bool)
+	raw := strings.TrimSpace(rawPayload)
+	if raw == "" {
+		return ids
+	}
+	// A payload may arrive as a JSON string containing JSON, or as the object.
+	if strings.HasPrefix(raw, "\"") {
+		var inner string
+		if err := json.Unmarshal([]byte(raw), &inner); err == nil {
+			raw = inner
+		}
+	}
+	var parsed struct {
+		Cycles []struct {
+			ID string `json:"id"`
+		} `json:"cycles"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return ids
+	}
+	for _, c := range parsed.Cycles {
+		if c.ID != "" {
+			ids[c.ID] = true
+		}
+	}
+	return ids
+}
+
+// archivedCycleIDs returns the ids that have their OWN entry in the body.
+//
+// A bare substring test is not good enough here and the failure direction is
+// deletion: patrol summaries routinely quote other beads' ids — this session's
+// own cycles cite wisp and report ids constantly — so a cycle mentioned inside
+// ANOTHER cycle's prose would read as archived and its source would be deleted
+// with its entry absent (codex). An id that is a prefix of another id has the
+// same effect.
+//
+// Entries are written as "### <time> — <role> (<id>)", so coverage means a
+// heading line that ENDS with exactly "(<id>)".
+func archivedCycleIDs(body string) map[string]bool {
+	archived := make(map[string]bool)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "###") || !strings.HasSuffix(line, ")") {
+			continue
+		}
+		open := strings.LastIndex(line, "(")
+		if open < 0 {
+			continue
+		}
+		if id := strings.TrimSpace(line[open+1 : len(line)-1]); id != "" {
+			archived[id] = true
+		}
+	}
+	return archived
+}
+
+// digestPayloadWithoutBodies returns the digest with each cycle's Description
+// cleared. See the call site for why: one argv entry cannot carry a day of
+// summaries, and the description already does.
+func digestPayloadWithoutBodies(digest PatrolDigest) PatrolDigest {
+	out := digest
+	out.Cycles = make([]PatrolCycleEntry, len(digest.Cycles))
+	for i, c := range digest.Cycles {
+		c.Description = ""
+		out.Cycles[i] = c
+	}
+	return out
+}
+
 // createPatrolDigestBead creates a permanent bead for the daily patrol digest.
 func createPatrolDigestBead(digest PatrolDigest) (string, error) {
 	// Build description with aggregate data
@@ -290,25 +812,65 @@ func createPatrolDigestBead(digest PatrolDigest) (string, error) {
 		desc.WriteString("\n")
 	}
 
-	// Build payload JSON with cycle details
-	payloadJSON, err := json.Marshal(digest)
+	// EMBED EVERY CYCLE'S BODY IN THE DESCRIPTION BEFORE ANYTHING IS DELETED.
+	//
+	// This aggregation deletes its sources, and the sources are wisps, which are
+	// in dolt_ignore and therefore never committed — deletion is permanent with
+	// no AS OF to recover from. Until this was added the digest kept only counts,
+	// so the first successful run in this command's life destroyed 117 cycle
+	// summaries and replaced them with 137 bytes of totals (gt-fwzgp).
+	desc.WriteString("\n## Cycles\n\n")
+	for _, c := range digest.Cycles {
+		// Label with the CLOSE time, matching the grouping above. A cycle created
+		// at 23:00 and closed at 02:00 belongs to the later day, and showing its
+		// creation time there reads as an entry from a day the report is not
+		// about (codex P2). The heading carries no date, so the time alone has to
+		// be consistent with the day it is filed under.
+		stamp := c.ClosedAt
+		if stamp.IsZero() {
+			stamp = c.CreatedAt
+		}
+		desc.WriteString(fmt.Sprintf("### %s — %s (%s)\n\n", stamp.UTC().Format("15:04Z"), c.Role, c.ID))
+		body := strings.TrimSpace(c.Description)
+		if body == "" {
+			body = "_(no summary recorded on this cycle)_"
+		}
+		desc.WriteString(body)
+		desc.WriteString("\n\n")
+	}
+
+	// Build payload JSON with cycle details, WITHOUT each cycle's body.
+	//
+	// A single argv entry is capped (MAX_ARG_STRLEN, 128KB on Linux) independently
+	// of the total, and one day's cycles carry roughly 700 bytes of summary each:
+	// 117 of them on the day this was written, which blows the cap on its own and
+	// fails as "argument list too long". The bodies are already in the description
+	// above, so the payload keeps identity and timing and drops the duplicate
+	// prose rather than truncating it (gt-3uty).
+	payloadJSON, err := json.Marshal(digestPayloadWithoutBodies(digest))
 	if err != nil {
 		return "", fmt.Errorf("marshaling digest payload: %w", err)
 	}
 
 	// Create the digest bead (NOT ephemeral - this is permanent)
 	title := fmt.Sprintf("Patrol Report %s", digest.Date)
+	// The description is passed on STDIN, not in argv. A day's aggregate carries
+	// every cycle's summary, so as an argument it exceeds ARG_MAX and bd fails
+	// with "argument list too long" — which nobody had seen, because until the
+	// query above was fixed this function never had any input to aggregate
+	// (gt-3uty). 117 cycles on the day this was written.
 	bdArgs := []string{
 		"create",
 		"--type=event",
 		"--title=" + title,
 		"--event-category=patrol.digest",
 		"--event-payload=" + string(payloadJSON),
-		"--description=" + desc.String(),
+		"--stdin",
 		"--silent",
 	}
 
 	bdCmd := exec.Command("bd", bdArgs...)
+	bdCmd.Stdin = strings.NewReader(desc.String())
 	output, err := bdCmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("creating digest bead: %w\nOutput: %s", err, string(output))
@@ -328,11 +890,27 @@ func createPatrolDigestBead(digest PatrolDigest) (string, error) {
 func findExistingPatrolDigest(dateStr string) (string, error) {
 	expectedTitle := fmt.Sprintf("Patrol Report %s", dateStr)
 
-	// Query event beads with patrol.digest category
+	// --status=all is LOAD-BEARING: the digest bead is CLOSED the moment it is
+	// written, and bd list defaults to open rows, so this check could never see
+	// its own output and reported "no existing digest" every time. Measured on
+	// this store: the default query returns 3 rows and none is a Patrol Report,
+	// while two reports for today exist and are closed. The visible symptom is a
+	// duplicate permanent report per run (gt-3uty).
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
+		// The DOCUMENTED multi-status form, not "all". Measured on this host,
+		// --status=all does work (rc=0, 23 rows, both reports found), so codex's
+		// claim that the command fails is wrong here — but "all" is not in bd's
+		// documented set (open, in_progress, blocked, deferred, closed) and the
+		// enumerated form costs nothing and cannot drift.
+		"--status=open,in_progress,blocked,deferred,closed",
 		"--json",
-		"--limit=50", // Recent events only
+		// NO --limit: a truncated row set can hide the report from its own
+		// lookup, and the failure mode is a DUPLICATE permanent report rather
+		// than an error. --title narrows server-side instead (gastown/refinery,
+		// and CLAUDE.md names row-set truncation outright).
+		"--title", expectedTitle,
+		"--limit=0",
 	)
 	listOutput, err := listCmd.Output()
 	if err != nil {
@@ -358,21 +936,24 @@ func findExistingPatrolDigest(dateStr string) (string, error) {
 }
 
 // deletePatrolDigests deletes ephemeral patrol digest beads for a target date.
-func deletePatrolDigests(targetDate time.Time) (int, error) {
-	// Query patrol digests for the target date
-	cycles, err := queryPatrolDigests(targetDate)
-	if err != nil {
-		return 0, err
+// cycleIDs returns the ids of the cycles that were aggregated and verified.
+func cycleIDs(cycles []PatrolCycleEntry) []string {
+	ids := make([]string, 0, len(cycles))
+	for _, c := range cycles {
+		ids = append(ids, c.ID)
 	}
+	return ids
+}
 
-	if len(cycles) == 0 {
+// deletePatrolDigestsByID removes exactly the ids handed to it.
+//
+// It takes ids rather than a date on purpose. Re-running the date query here
+// would pick up any cycle that closed since the aggregate was built, and that
+// cycle's body is NOT in the digest that was just verified — a permanent loss of
+// a record nothing else holds (gt-fwzgp, codex P1).
+func deletePatrolDigestsByID(idsToDelete []string) (int, error) {
+	if len(idsToDelete) == 0 {
 		return 0, nil
-	}
-
-	// Collect IDs to delete
-	var idsToDelete []string
-	for _, cycle := range cycles {
-		idsToDelete = append(idsToDelete, cycle.ID)
 	}
 
 	// Delete in batch
