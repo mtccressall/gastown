@@ -273,7 +273,12 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				Priority: nudgePriorityFlag,
 			}})
 			deliverErr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
-			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) {
+			// ErrComposerHasText joins ErrSubmitNotVerified here because both mean
+			// the message did not land and MUST NOT be retyped into that composer:
+			// the first because somebody's unsent draft is sitting in it (gt-sglq),
+			// the second because ours is. Queueing delays a nudge; typing submits
+			// text nobody chose to send.
+			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) && !errors.Is(deliverErr, tmux.ErrComposerHasText) {
 				return deliverErr
 			}
 			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)

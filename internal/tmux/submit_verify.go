@@ -12,6 +12,170 @@ import (
 // transport could not prove it left the target composer.
 var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
+// ErrComposerHasText is returned INSTEAD OF TYPING when the target's composer
+// already holds text somebody typed and has not submitted. Delivery types the
+// nudge into that same composer and presses Enter, which submits the human's
+// unsent draft joined to our notification — reproduced on both delivery paths
+// (gt-sglq). Callers treat this like ErrSubmitNotVerified and QUEUE: a late
+// nudge is recoverable, a submitted draft is not.
+var ErrComposerHasText = errors.New("composer holds unsubmitted text: refusing to type")
+
+// The composer is located by POSITION, measured on live panes 2026-09-16 (four
+// idle, one generating):
+//
+//	─────────────────────────   rule
+//	❯ <composer>                <- this line
+//	─────────────────────────   rule
+//	  ⏵⏵ bypass permissions on (shift+tab to cycle) · [esc to interrupt ·] …
+//
+// TWO THINGS THAT MEASUREMENT SETTLED, both of which I had wrong from argument:
+//
+//  1. THE COMPOSER BOX PERSISTS WHILE THE AGENT IS GENERATING. It is not
+//     replaced by the status text, so "the last prompt line is the turn being
+//     answered" is false for this TUI — the composer is always its own box below
+//     the transcript. Text typed during generation is queued input and is a real
+//     draft, so declining to guard a busy pane would WEAKEN this.
+//  2. The busy marker renders inside the FOOTER line itself, not on a line of
+//     its own, which is why scanning trailing lines for it was both unnecessary
+//     and defeatable by transcript text quoting the marker.
+//
+// Anchoring on the footer makes a ❯ anywhere in the scrollback unusable as a
+// composer, which no amount of pattern matching achieved.
+const composerRuleSearchDepth = 4
+
+func isBoxRuleLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		switch r {
+		case 0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0xFFFD:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// composerLayoutSupported reports whether this guard knows the TUI's frame.
+//
+// SCOPE IS CLAUDE-ONLY AND THAT IS DELIBERATE (codex P1, third round). The
+// anchor below is the layout I MEASURED on live panes. Codex renders a "› "
+// prompt and a different status bar; Gemini and Copilot differ again. I have no
+// pane of those to measure, and the previous two versions of this guard were
+// wrong precisely because they described a TUI from argument rather than from
+// capture — writing an unmeasured footer matcher for Codex would repeat that
+// mistake with a destructive failure direction.
+//
+// Declining is not a regression for those agents: they are exactly as exposed
+// as they were before this change, which is to say fully. Extending coverage
+// needs a captured frame per agent and is tracked on gt-sglq. The decline is
+// explicit here rather than emerging by accident from a footer that never
+// matches, so the gap is visible to the next reader.
+func composerLayoutSupported(promptPrefix string) bool {
+	return promptPrefix == DefaultReadyPromptPrefix
+}
+
+// isComposerFooterLine identifies the status bar. The markers are the mode
+// indicator the TUI always renders there; the position check is what keeps this
+// from matching prose, since it is only ever applied to the LAST non-blank line.
+func isComposerFooterLine(line string) bool {
+	l := strings.ToLower(line)
+	return strings.Contains(l, "bypass permissions") ||
+		strings.Contains(l, "manual mode") ||
+		strings.Contains(l, "shift+tab to cycle")
+}
+
+// composerLineIndexByFooter returns the index of the composer line, or -1 when
+// the pane does not have the expected shape. Returning -1 means DECLINE TO
+// CLASSIFY: the caller then delivers as it always did, rather than guessing from
+// a prompt character that may belong to the transcript.
+func composerLineIndexByFooter(lines []string) int {
+	footer := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		footer = i
+		break
+	}
+	if footer < 0 || !isComposerFooterLine(lines[footer]) {
+		return -1
+	}
+	for i := footer - 1; i >= 0 && i >= footer-composerRuleSearchDepth; i-- {
+		if isBoxRuleLine(lines[i]) {
+			if i-1 < 0 {
+				return -1
+			}
+			return i - 1
+		}
+	}
+	return -1
+}
+
+// splitRunesAndDimLines returns the pane's plain text as lines.
+func splitRunesAndDimLines(plain []rune, dim []bool) []string {
+	lines, _ := splitRunesAndDim(plain, dim)
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, string(l))
+	}
+	return out
+}
+
+// composerTypedText reports text a person typed into the composer, and
+// distinguishes it from the DIM PLACEHOLDER an idle pane shows.
+//
+// The placeholder is rendered with SGR 2 and is not input: clearing or typing
+// over it destroys nothing. Typed text carries no dim attribute. That is the
+// only separation available — the words themselves cannot be trusted, because
+// placeholders are role-appropriate ("continue patrol") and a human has typed
+// exactly that string in this town.
+//
+// It returns ("", false) when there is no composer line, when the composer is
+// empty, when every content rune is dim, and when the prompt prefix is empty.
+// Every one of those is a REFUSAL TO CLAIM typed text, because the caller acts
+// on true by withholding delivery and on false by typing.
+func composerTypedText(escContent, promptPrefix string) (string, bool) {
+	if promptPrefix == "" {
+		return "", false
+	}
+	if !composerLayoutSupported(promptPrefix) {
+		return "", false
+	}
+	plain, dim := stripAnsiTrackDim(escContent)
+	lines, dims := splitRunesAndDim(plain, dim)
+	idx := composerLineIndexByFooter(splitRunesAndDimLines(plain, dim))
+	if idx < 0 || idx >= len(lines) {
+		return "", false
+	}
+	if !matchesPromptPrefix(string(lines[idx]), promptPrefix) {
+		return "", false
+	}
+	content, contentDim := composerContent(lines[idx], dims[idx], promptPrefix)
+	if len(content) == 0 || allDim(contentDim) {
+		return "", false
+	}
+	return strings.TrimSpace(string(content)), true
+}
+
+// composerHoldsTypedText captures the target and applies composerTypedText.
+//
+// The -J matters for the same reason it does in composerDetail: without it a
+// soft-wrapped composer arrives as several physical lines and the text we
+// report is truncated at the pane width. A capture ERROR returns false, so a
+// broken probe cannot silence every nudge in the town; a capture that SUCCEEDS
+// and shows typed text refuses delivery. Those two failure directions are
+// deliberately different.
+func (t *Tmux) composerHoldsTypedText(target, promptPrefix string) (string, bool) {
+	content, err := t.run("capture-pane", "-p", "-e", "-J", "-t", target, "-S", "-25")
+	if err != nil {
+		return "", false
+	}
+	return composerTypedText(content, promptPrefix)
+}
+
 type submitProbe int
 
 const (

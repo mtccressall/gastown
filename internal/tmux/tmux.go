@@ -1833,6 +1833,27 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// like the agent's busy indicator.
 	sendEscape := !opts.SkipEscape && t.shouldSendEscape(target)
 
+	// 2.9 REFUSE TO TYPE INTO A COMPOSER SOMEBODY IS USING (gt-sglq).
+	// WaitForIdle counts a composer holding typed text as idle, so without this
+	// check the next two steps type the nudge onto the end of a human's unsent
+	// draft and press Enter, submitting text nobody chose to send. Returning
+	// before sendMessageToTarget is the whole point: once the text is typed the
+	// damage is done, and clearing it afterwards is the destruction CLAUDE.md
+	// forbids doing blind.
+	//
+	// WHAT HAPPENS NEXT DEPENDS ON THE CALLER, and only two of them queue
+	// (codex P2): `gt nudge`'s wait-idle branch treats this like
+	// ErrSubmitNotVerified and enqueues, and the poller requeues on any
+	// injection error. Every other direct caller — broadcast, estop, deacon
+	// health, sling notifications — currently SURFACES the refusal and the
+	// notification is not delivered. That is a deliberate trade for now, not an
+	// oversight: a lost "polecat dispatched" notice costs a cycle, a submitted
+	// draft costs a human's words. Teaching those callers to queue is tracked on
+	// gt-sglq.
+	if text, typed := t.composerHoldsTypedText(target, composerPromptPrefixForSession(t, session)); typed {
+		return fmt.Errorf("%w: %s holds %q", ErrComposerHasText, session, text)
+	}
+
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
 	if err := t.sendMessageToTarget(target, sanitized); err != nil {
@@ -2072,7 +2093,6 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 	// Timeout — no dialog detected, safe to proceed
 	return nil
 }
-
 
 // trustDialogSelection reports which option the cursor is on in a workspace
 // trust dialog, so the acceptor never presses Enter on "No, exit" (gt-ma1).
@@ -3419,6 +3439,25 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 		return false
 	}
 	return shouldSendEscapeForLines(lines)
+}
+
+// composerPromptPrefixForSession is readyPromptPrefixForSession WITHOUT the
+// fallback to Claude's prefix. An agent whose preset declares no
+// ReadyPromptPrefix (Gemini, Copilot, Pi) has no composer this code can find,
+// and scanning its output for Claude's ❯ classifies arbitrary text as a draft
+// (codex P2 on this change). Returning "" makes the guard decline rather than
+// guess, which is the same reason `gt nudge` degrades those agents to queue
+// mode instead of probing for idle.
+func composerPromptPrefixForSession(t *Tmux, session string) string {
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentName == "" {
+		return DefaultReadyPromptPrefix
+	}
+	preset := config.GetAgentPresetByName(agentName)
+	if preset == nil {
+		return DefaultReadyPromptPrefix
+	}
+	return preset.ReadyPromptPrefix
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
