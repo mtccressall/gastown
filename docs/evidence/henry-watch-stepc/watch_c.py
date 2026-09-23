@@ -36,6 +36,16 @@ CHANNEL = "#dev"
 HENRY_ID = "agent:henry"
 SELF_ID = "agent:gas-new"  # what the server stamps on the Mayor's posts
 RECIPIENTS = {"gastown", "agent:gas-new", "gas new", "mayor", "gastown/mayor"}
+# C2: only these authenticated identities may create work here. Anything else
+# addressed to us becomes a visible quarantine record, never a delivery.
+ALLOWED_SENDERS = {"agent:henry"}
+# C2: only these kinds enter the ACTIONABLE inbox (they get mail + nudge + ACK).
+ACTIONABLE_KINDS = {"request", "review_request", "review-handoff", "decision",
+                    "agree", "amend", "blocked", "result", "correction"}
+# Delivered for information only: no nudge, no ACK (an ACK of an ACK is the loop).
+INFORMATIONAL_KINDS = {"ack", "status", "coordination-status", "heartbeat"}
+QUARANTINE = os.path.join(RUNTIME, "henry-watch.quarantine.json")
+QUARANTINE_MAX = 1000
 LEMONADE = "http://127.0.0.1:13305/api/v1/chat/completions"
 # The model already resident for the workers; never force a swap for a summary.
 LOCAL_MODEL = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M"
@@ -87,15 +97,9 @@ def meta(m):
 
 
 def wanted(m):
-    """Henry by AUTHENTICATED id (the display name is user-editable), or any
-    other agent's message addressed to Gastown. Never our own posts."""
-    md = meta(m)
-    who = md.get("authenticatedAgentId") or ""
-    if who == SELF_ID:
-        return False
-    if who == HENRY_ID:
-        return True
-    return str(md.get("recipient") or "").lower() in RECIPIENTS
+    """True for anything this adapter must handle at all: delivered or quarantined.
+    classify() decides which."""
+    return classify(m)[0] in ("actionable", "informational", "quarantine")
 
 
 def read_state():
@@ -156,6 +160,63 @@ def already_in_inbox(mid):
     return mid in (out or "")
 
 
+def read_quarantine():
+    if not os.path.exists(QUARANTINE):
+        return {}
+    with open(QUARANTINE) as f:
+        return json.load(f)
+
+
+def quarantine(mid, reason, md, ts):
+    """A visible, durable, bounded record of a message we refused. It carries the
+    REASON and the correlation, never the payload, and is never dispatched."""
+    q = read_quarantine()
+    if mid in q:
+        return q
+    if len(q) >= QUARANTINE_MAX:
+        log(f"ERROR quarantine at capacity ({len(q)}); refusing {mid} without a record")
+        return q
+    q[mid] = {"reason": reason, "at": int(datetime.now(timezone.utc).timestamp()),
+              "ts": ts, "sender": md.get("authenticatedAgentId"),
+              "kind": md.get("kind"), "correlationId": md.get("correlationId")}
+    tmp = QUARANTINE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(q, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, QUARANTINE)
+    log(f"QUARANTINED {mid} reason={reason} sender={md.get('authenticatedAgentId')} kind={md.get('kind')}")
+    return q
+
+
+def classify(m):
+    """-> ('actionable'|'informational'|'ignore'|'quarantine', reason).
+
+    Targeting first: a message aimed at somebody else is not ours and has no
+    effect here. Then identity, then kind."""
+    md = meta(m)
+    who = md.get("authenticatedAgentId") or ""
+    kind = str(md.get("kind") or "").lower()
+    rcpt = str(md.get("recipient") or "").lower()
+    if who == SELF_ID:
+        return "ignore", "own post"
+    if rcpt and rcpt not in RECIPIENTS:
+        return "ignore", "addressed to " + rcpt
+    if not isinstance(m.get("metadata"), (dict, str)) or (m.get("metadata") is None):
+        return "quarantine", "malformed: no metadata object"
+    if not who:
+        return "quarantine", "malformed: no authenticated identity"
+    if who not in ALLOWED_SENDERS:
+        if not rcpt:
+            return "ignore", "broadcast from " + who
+        return "quarantine", "identity not allowlisted: " + who
+    if kind in INFORMATIONAL_KINDS:
+        return "informational", kind
+    if kind in ACTIONABLE_KINDS:
+        return "actionable", kind
+    return "quarantine", "unsupported kind: " + (kind or "(none)")
+
+
 def post_ack(env, m):
     """Durable-receipt ACK. Receipt only: never acceptance, never completion."""
     md = meta(m)
@@ -210,7 +271,8 @@ def run(cmd):
 def deliver(m, overflow):
     summary = summarize(m["content"])
     who = "Henry" if meta(m).get("authenticatedAgentId") == HENRY_ID else m.get("sender")
-    subject = f"{who} #dev: {summary}" if summary else f"{who} #dev message {m['timestamp']}"
+    tag = "" if classify(m)[0] == "actionable" else "[FYI] "
+    subject = f"{tag}{who} #dev: {summary}" if summary else f"{tag}{who} #dev message {m['timestamp']}"
     parts = []
     if overflow:
         parts.append("WARNING: the poll window may have skipped messages since the last "
@@ -269,8 +331,18 @@ def main():
     delivered = 0
     for m in new:
         mid = m["id"]
+        kindclass, reason = classify(m)
+        if kindclass == "ignore":
+            continue
+        if kindclass == "quarantine":
+            quarantine(mid, reason, meta(m), m["timestamp"])
+            mark(led, mid, "quarantined", m["timestamp"])   # never dispatched later
+            seen = (seen if m["timestamp"] == last else []) + [mid]
+            last = m["timestamp"]
+            write_state(last, seen)
+            continue
         e = led.get(mid, {})
-        if e.get("stage") in ("delivered", "acked"):
+        if e.get("stage") in ("delivered", "acked", "informational", "quarantined"):
             continue                      # idempotent: this id is already fenced
         if e.get("stage") == "intent":
             # Ambiguous: we may have crashed mid-send. Reconcile before retrying,
@@ -284,13 +356,14 @@ def main():
         if led.get(mid, {}).get("stage") != "delivered":
             mark(led, mid, "intent", m["timestamp"])   # fence BEFORE the side effect
             subject = deliver(m, overflow)
-            mark(led, mid, "delivered", m["timestamp"])
-            log(f"DELIVERED {mid} {m['timestamp']} :: {subject}")
+            mark(led, mid, "delivered" if kindclass == "actionable" else "informational",
+                 m["timestamp"])
+            log(f"DELIVERED {mid} {m['timestamp']} [{kindclass}] :: {subject}")
         # The watermark advances only after the inbox write is durable.
         seen = (seen if m["timestamp"] == last else []) + [mid]
         last = m["timestamp"]
         write_state(last, seen)
-        delivered += 1
+        delivered += 1 if kindclass == "actionable" else 0
     if delivered:
         # Wake only; the nudge carries no content (gt-4iuw: keep it dash-free).
         try:
@@ -312,7 +385,7 @@ def main():
         log(f"ACKED {acked}")
     if overflow and not new:
         log(f"WARN window oldest {oldest} is newer than last_seen {last}; messages may be missed")
-    log(f"OK window={len(msgs)} ledger={len(led)} oldest={oldest} henry={len(henry)} new={delivered} last_seen={last}")
+    log(f"OK window={len(msgs)} ledger={len(led)} quarantine={len(read_quarantine())} oldest={oldest} henry={len(henry)} new={delivered} last_seen={last}")
     return 0
 
 

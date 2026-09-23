@@ -56,7 +56,7 @@ class Harness(unittest.TestCase):
             if cmd[:3] == ["gt", "mail", "send"]:
                 if self.fail_mail:
                     raise RuntimeError("mail send failed")
-                self.mail.append(cmd[4])
+                self.mail.append(cmd[cmd.index("-s") + 1])   # the subject, not the flag
             return ""
 
         self.m.run = fake_run
@@ -191,3 +191,89 @@ class TestIntake(Harness):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestC2Allowlist(Harness):
+    """C2 (Henry, 2650a920): explicit actionable allowlist, visible bounded
+    quarantine, no dispatch from quarantine, correlated reason evidence without
+    payloads, no ACK loops or foreign-recipient effects, restart-safe."""
+
+    def test_only_allowlisted_kinds_become_actionable(self):
+        self.seed()
+        self.window = [
+            msg("a1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST"),
+            msg("a2", "2026-09-23T01:00:01.000Z", recipient="agent:gas-new", kind="REVIEW_REQUEST"),
+            msg("a3", "2026-09-23T01:00:02.000Z", recipient="agent:gas-new", kind="review-handoff"),
+            msg("a4", "2026-09-23T01:00:03.000Z", recipient="agent:gas-new", kind="DECISION"),
+        ]
+        self.run_tick()
+        self.assertEqual(len(self.mail), 4, "targeted allowlisted kinds must be delivered")
+        self.assertEqual(sorted(self.posts), ["a1", "a2", "a3", "a4"], "each actionable message gets one receipt ACK")
+
+    def test_status_and_ack_do_not_create_work_or_ack_loops(self):
+        self.seed()
+        self.window = [
+            msg("s1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new", kind="STATUS"),
+            msg("k1", "2026-09-23T01:00:01.000Z", recipient="agent:gas-new", kind="ACK"),
+        ]
+        self.run_tick()
+        self.assertEqual(self.posts, [], "never ACK a STATUS or an ACK: that is the loop")
+        for subj in self.mail:
+            self.assertIn("FYI", subj, "non-actionable mail must be marked as such")
+
+    def test_unknown_identity_is_quarantined_not_delivered(self):
+        self.seed()
+        self.window = [msg("u1", "2026-09-23T01:00:00.000Z", auth="agent:stranger",
+                           recipient="agent:gas-new", kind="REQUEST")]
+        self.run_tick()
+        self.assertEqual(self.mail, [], "an unknown sender must not reach the actionable inbox")
+        self.assertEqual(self.posts, [], "and must not be ACKed")
+        q = self.m.read_quarantine()
+        self.assertIn("u1", q, "it must leave a VISIBLE quarantine record")
+        self.assertIn("identity", q["u1"]["reason"], "the record must carry a correlated reason")
+
+    def test_quarantine_records_carry_no_payload(self):
+        self.seed()
+        secret = "SENSITIVE-PAYLOAD-DO-NOT-STORE"
+        self.window = [msg("u2", "2026-09-23T01:00:00.000Z", auth="agent:stranger",
+                           recipient="agent:gas-new", kind="REQUEST", content=secret)]
+        self.run_tick()
+        blob = json.dumps(self.m.read_quarantine())
+        self.assertNotIn(secret, blob, "quarantine evidence must not store message payloads")
+
+    def test_quarantine_is_never_dispatched_on_a_later_tick(self):
+        self.seed()
+        self.window = [msg("u3", "2026-09-23T01:00:00.000Z", auth="agent:stranger",
+                           recipient="agent:gas-new", kind="REQUEST")]
+        self.run_tick()
+        self.run_tick()            # same message still in the window
+        self.assertEqual(self.mail, [], "a quarantined message must never later be dispatched")
+
+    def test_quarantine_survives_restart_and_is_bounded(self):
+        self.seed()
+        self.window = [msg(f"b{i}", "2026-09-23T01:00:00.000Z", auth="agent:stranger",
+                           recipient="agent:gas-new", kind="REQUEST") for i in range(5)]
+        self.run_tick()
+        m2 = load(self.home)       # fresh process, same HOME: restart
+        self.assertEqual(len(m2.read_quarantine()), 5, "quarantine must be durable across restart")
+        self.assertTrue(hasattr(m2, "QUARANTINE_MAX"), "quarantine must be bounded")
+
+    def test_foreign_recipient_has_no_effect_even_from_henry(self):
+        self.seed()
+        self.window = [msg("f1", "2026-09-23T01:00:00.000Z", recipient="agent:casey", kind="REQUEST")]
+        self.run_tick()
+        self.assertEqual(self.mail, [], "a message targeted at another agent is not ours to act on")
+        self.assertEqual(self.posts, [], "and must not be ACKed")
+
+    def test_unsupported_kind_from_a_trusted_sender_is_quarantined(self):
+        """The allowlist is a positive list: a kind nobody agreed on does not
+        become work just because Henry sent it."""
+        self.seed()
+        self.window = [msg("x1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new",
+                           kind="PLEASE_DEPLOY_EVERYTHING")]
+        self.run_tick()
+        self.assertEqual(self.mail, [], "an unsupported kind must not be delivered")
+        self.assertEqual(self.posts, [], "and must not be ACKed")
+        q = self.m.read_quarantine()
+        self.assertIn("x1", q, "it must leave a visible quarantine record")
+        self.assertIn("unsupported kind", q["x1"]["reason"])
