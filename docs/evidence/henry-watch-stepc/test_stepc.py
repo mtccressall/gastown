@@ -277,3 +277,69 @@ class TestC2Allowlist(Harness):
         q = self.m.read_quarantine()
         self.assertIn("x1", q, "it must leave a visible quarantine record")
         self.assertIn("unsupported kind", q["x1"]["reason"])
+
+
+class TestC2Henry(Harness):
+    """Henry's independent step C findings (a209a305), as rejection regressions."""
+
+    def test_application_error_envelope_does_not_count_as_a_sent_ack(self):
+        """(2) An HTTP 200 carrying an error envelope is NOT a sent ACK.
+
+        Drives the REAL post_ack through a faked urlopen, so bypassing the
+        validator is detectable."""
+        import contextlib
+        import io
+        self.seed()
+        self.window = [msg("e1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST")]
+        del self.m.post_ack      # restore the module's own implementation
+        import importlib.machinery, importlib.util
+        ld = importlib.machinery.SourceFileLoader("reload_e1", TARGET)
+        spec = importlib.util.spec_from_loader(ld.name, ld)
+        fresh = importlib.util.module_from_spec(spec)
+        ld.exec_module(fresh)
+        fresh.summarize = lambda t: "S"
+        fresh.load_env = self.m.load_env
+        fresh.run = self.m.run
+        fresh.poll = self.m.poll
+
+        @contextlib.contextmanager
+        def fake_urlopen(req, timeout=0):
+            yield io.StringIO(json.dumps({"errors": [{"message": "AccessDenied"}]}))
+        fresh.urllib.request.urlopen = fake_urlopen
+        fresh.main()
+        led = fresh.read_ledger()
+        self.assertEqual(led["e1"]["stage"], "delivered",
+                         "an error envelope must leave the ACK unsent, not 'acked'")
+
+    def test_pending_ack_survives_the_message_leaving_the_poll_window(self):
+        """(3) The retry must not depend on the source message still being visible."""
+        self.seed()
+        self.window = [msg("w1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST")]
+        self.fail_post = True
+        self.run_tick()                     # delivered, ACK failed
+        self.fail_post = False
+        self.posts.clear()
+        self.window = []                    # the message has scrolled out of the window
+        self.run_tick()
+        self.assertEqual(self.posts, ["w1"], "a pending ACK must be retried from durable state")
+
+    def test_reconcile_requires_an_exact_id_match(self):
+        """(4) A substring hit on unrelated mail must not count as reconciled."""
+        self.seed()
+        self.m.run = lambda cmd: ('[{"description":"message id: w1-UNRELATED-SUFFIX"}]'
+                                  if cmd[0] == "bd" else "")
+        self.assertFalse(self.m.already_in_inbox("w1"),
+                         "a longer id containing ours is not ours")
+        self.m.run = lambda cmd: ('[{"description":"message id: w1"}]' if cmd[0] == "bd" else "")
+        self.assertTrue(self.m.already_in_inbox("w1"), "an exact id must reconcile")
+
+    def test_saturated_window_records_a_visible_gap_and_never_claims_drained(self):
+        """(5) A full window whose oldest row is newer than the mark may hide rows."""
+        self.seed(ts="2026-09-20T00:00:00.000Z")
+        self.window = [msg(f"g{i}", f"2026-09-23T02:{i:02d}:00.000Z",
+                           recipient="agent:gas-new", kind="STATUS") for i in range(100)]
+        self.run_tick()
+        gaps = self.m.read_gaps()
+        self.assertTrue(gaps, "a saturated window past the watermark must record a visible gap")
+        self.assertIn("2026-09-20T00:00:00.000Z", json.dumps(gaps),
+                      "the gap record must carry the watermark it could not reach")

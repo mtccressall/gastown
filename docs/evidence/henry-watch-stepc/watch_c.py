@@ -46,6 +46,8 @@ ACTIONABLE_KINDS = {"request", "review_request", "review-handoff", "decision",
 INFORMATIONAL_KINDS = {"ack", "status", "coordination-status", "heartbeat"}
 QUARANTINE = os.path.join(RUNTIME, "henry-watch.quarantine.json")
 QUARANTINE_MAX = 1000
+GAPS = os.path.join(RUNTIME, "henry-watch.gaps.json")
+GAPS_MAX = 200
 LEMONADE = "http://127.0.0.1:13305/api/v1/chat/completions"
 # The model already resident for the workers; never force a swap for a summary.
 LOCAL_MODEL = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M"
@@ -135,6 +137,14 @@ def write_ledger(led):
     os.replace(tmp, LEDGER)
 
 
+def ack_payload(m):
+    """The minimum needed to ACK later, even if the message leaves the window."""
+    md = meta(m)
+    return {"id": m["id"], "timestamp": m["timestamp"],
+            "metadata": {"authenticatedAgentId": md.get("authenticatedAgentId"),
+                         "correlationId": md.get("correlationId")}}
+
+
 def mark(led, mid, stage, ts=""):
     """Persist the dedupe key BEFORE the side effect it fences (v2 5C)."""
     e = led.setdefault(mid, {})
@@ -157,7 +167,19 @@ def already_in_inbox(mid):
     Searches every mail bead, including archived ones, for the message id."""
     out = run(["bd", "-C", os.path.join(HOME, "gt"), "list", "--include-infra",
                "--status=all", "--limit=0", "--json"])
-    return mid in (out or "")
+    try:
+        rows = json.loads(out or "[]")
+    except ValueError:
+        raise RuntimeError("could not parse the bead listing while reconciling " + mid)
+    needle = "message id: " + mid
+    for row in rows if isinstance(rows, list) else []:
+        for field in ("description", "notes", "title"):
+            for line in str(row.get(field) or "").splitlines():
+                # exact, structured, whole-token match: a longer id that merely
+                # CONTAINS ours must not reconcile (Henry, a209a305)
+                if line.strip() == needle or line.strip().startswith(needle + " "):
+                    return True
+    return False
 
 
 def read_quarantine():
@@ -189,6 +211,32 @@ def quarantine(mid, reason, md, ts):
     return q
 
 
+def read_gaps():
+    if not os.path.exists(GAPS):
+        return []
+    with open(GAPS) as f:
+        return json.load(f)
+
+
+def record_gap(watermark, oldest, n):
+    """A saturated window whose oldest row is newer than our mark may hide rows.
+    Record it visibly and bounded; never report the window as drained."""
+    gaps = read_gaps()
+    if gaps and gaps[-1].get("oldest") == oldest and gaps[-1].get("watermark") == watermark:
+        return gaps
+    gaps.append({"at": now(), "watermark": watermark, "oldest": oldest, "window": n})
+    gaps = gaps[-GAPS_MAX:]
+    tmp = GAPS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(gaps, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, GAPS)
+    log(f"GAP window saturated at {n}; oldest {oldest} is newer than the mark {watermark}. "
+        f"Coverage is INCOMPLETE; not claiming drained.")
+    return gaps
+
+
 def classify(m):
     """-> ('actionable'|'informational'|'ignore'|'quarantine', reason).
 
@@ -217,6 +265,18 @@ def classify(m):
     return "quarantine", "unsupported kind: " + (kind or "(none)")
 
 
+def check_post_envelope(d):
+    """An HTTP 200 carrying an application error is NOT success (Henry, a209a305)."""
+    if not isinstance(d, dict):
+        raise RuntimeError(f"post returned a non-object envelope: {type(d).__name__}")
+    for key in ("errors", "error"):
+        if d.get(key):
+            raise RuntimeError(f"application error in post envelope: {str(d[key])[:200]}")
+    if "data" not in d and "operation" not in d:
+        raise RuntimeError(f"post envelope has neither data nor operation: {list(d)[:5]}")
+    return d
+
+
 def post_ack(env, m):
     """Durable-receipt ACK. Receipt only: never acceptance, never completion."""
     md = meta(m)
@@ -232,8 +292,8 @@ def post_ack(env, m):
     req = urllib.request.Request(env["LIVEOP_API_URL"], data=body_bytes, method="POST",
                                  headers={"content-type": "application/json",
                                           "x-api-key": env["LIVEOP_API_KEY"]})
-    with urllib.request.urlopen(req, timeout=45) as r:
-        json.load(r)
+    with urllib.request.urlopen(req, timeout=45) as r:      # raises on 5xx
+        check_post_envelope(json.load(r))
 
 
 def summarize(text):
@@ -328,6 +388,8 @@ def main():
     new = [m for m in henry if m["timestamp"] > last
            or (m["timestamp"] == last and m["id"] not in seen)]
     overflow = bool(oldest) and len(msgs) >= 100 and oldest > last
+    if overflow:
+        record_gap(last, oldest, len(msgs))
     delivered = 0
     for m in new:
         mid = m["id"]
@@ -356,6 +418,8 @@ def main():
         if led.get(mid, {}).get("stage") != "delivered":
             mark(led, mid, "intent", m["timestamp"])   # fence BEFORE the side effect
             subject = deliver(m, overflow)
+            if kindclass == "actionable":
+                led.setdefault(mid, {})["ack"] = ack_payload(m)   # survives the window
             mark(led, mid, "delivered" if kindclass == "actionable" else "informational",
                  m["timestamp"])
             log(f"DELIVERED {mid} {m['timestamp']} [{kindclass}] :: {subject}")
@@ -373,14 +437,15 @@ def main():
     # Receipt-ACK pass: every delivered-but-unacked id, including earlier ticks.
     # A failed ACK is never recorded as sent; it simply retries next tick.
     acked = 0
-    for m in henry:
-        if led.get(m["id"], {}).get("stage") == "delivered":
-            try:
-                post_ack(env, m)
-                mark(led, m["id"], "acked")
-                acked += 1
-            except Exception as e:  # noqa: BLE001 - stays 'delivered', retried
-                log(f"WARN ACK failed for {m['id']}, will retry: {e!r}")
+    for mid in [k for k, v in led.items() if v.get("stage") == "delivered"]:
+        pending = led[mid].get("ack") or {"id": mid, "timestamp": led[mid].get("ts", ""),
+                                          "metadata": {}}
+        try:
+            post_ack(env, pending)
+            mark(led, mid, "acked")
+            acked += 1
+        except Exception as e:  # noqa: BLE001 - stays 'delivered', retried next tick
+            log(f"WARN ACK failed for {mid}, will retry: {e!r}")
     if acked:
         log(f"ACKED {acked}")
     if overflow and not new:
