@@ -39,6 +39,9 @@ RECIPIENTS = {"gastown", "agent:gas-new", "gas new", "mayor", "gastown/mayor"}
 # C2: only these authenticated identities may create work here. Anything else
 # addressed to us becomes a visible quarantine record, never a delivery.
 ALLOWED_SENDERS = {"agent:henry"}
+# Only this EXACT recipient makes a message actionable. Aliases are accepted as
+# addressed-to-us for delivery, but never confer actionability (Henry, C2R2).
+PROTECTED_RECIPIENT = "agent:gas-new"
 # C2: only these kinds enter the ACTIONABLE inbox (they get mail + nudge + ACK).
 ACTIONABLE_KINDS = {"request", "review_request", "review-handoff", "decision",
                     "agree", "amend", "blocked", "result", "correction"}
@@ -84,8 +87,8 @@ def poll(env):
     req = urllib.request.Request(env["LIVEOP_API_URL"], data=body, method="POST",
                                  headers={"content-type": "application/json",
                                           "x-api-key": env["LIVEOP_API_KEY"]})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)["data"]["messages"]
+    with urllib.request.urlopen(req, timeout=60) as r:      # raises on 5xx
+        return check_poll_envelope(json.load(r))["data"]["messages"]
 
 
 def meta(m):
@@ -189,6 +192,10 @@ def read_quarantine():
         return json.load(f)
 
 
+class QuarantineUnavailable(RuntimeError):
+    """Raised when a refusal could not be durably recorded: fail closed."""
+
+
 def quarantine(mid, reason, md, ts):
     """A visible, durable, bounded record of a message we refused. It carries the
     REASON and the correlation, never the payload, and is never dispatched."""
@@ -196,8 +203,9 @@ def quarantine(mid, reason, md, ts):
     if mid in q:
         return q
     if len(q) >= QUARANTINE_MAX:
-        log(f"ERROR quarantine at capacity ({len(q)}); refusing {mid} without a record")
-        return q
+        raise QuarantineUnavailable(
+            f"quarantine at capacity ({len(q)}/{QUARANTINE_MAX}); refusing to mark {mid} "
+            f"handled without a durable record")
     q[mid] = {"reason": reason, "at": int(datetime.now(timezone.utc).timestamp()),
               "ts": ts, "sender": md.get("authenticatedAgentId"),
               "kind": md.get("kind"), "correlationId": md.get("correlationId")}
@@ -261,8 +269,25 @@ def classify(m):
     if kind in INFORMATIONAL_KINDS:
         return "informational", kind
     if kind in ACTIONABLE_KINDS:
+        if rcpt != PROTECTED_RECIPIENT:
+            # unaddressed, or addressed by an alias: deliver for information only
+            return "informational", kind + " (recipient " + (rcpt or "absent") + ")"
         return "actionable", kind
     return "quarantine", "unsupported kind: " + (kind or "(none)")
+
+
+def check_poll_envelope(d):
+    """A 200 carrying errors is a FAILED read even when data is populated: it may
+    be a partial page. Never process it, never advance on it (Henry, C2R2)."""
+    if not isinstance(d, dict):
+        raise RuntimeError(f"poll returned a non-object envelope: {type(d).__name__}")
+    for key in ("errors", "error"):
+        if d.get(key):
+            raise RuntimeError(f"application error in poll envelope: {str(d[key])[:200]}")
+    data = d.get("data")
+    if not isinstance(data, dict) or "messages" not in data:
+        raise RuntimeError("poll envelope carries no data.messages")
+    return d
 
 
 def check_post_envelope(d):
@@ -272,8 +297,11 @@ def check_post_envelope(d):
     for key in ("errors", "error"):
         if d.get(key):
             raise RuntimeError(f"application error in post envelope: {str(d[key])[:200]}")
-    if "data" not in d and "operation" not in d:
-        raise RuntimeError(f"post envelope has neither data nor operation: {list(d)[:5]}")
+    data = d.get("data")
+    # A 200 with an empty data object is not proof the post was stored: require
+    # the server-assigned identity back (Henry, C2R2).
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError(f"post envelope carries no stored identity: {str(data)[:120]}")
     return d
 
 
@@ -371,7 +399,11 @@ def main():
         log(f"ERROR ledger at capacity ({len(led)}); stopping rather than evicting fences")
         return 3
     env = load_env()
-    msgs = poll(env)
+    try:
+        msgs = poll(env)
+    except Exception as e:  # noqa: BLE001 - a failed read is not an empty inbox
+        log(f"ERROR poll failed, holding the cursor and dispatching nothing: {e!r}")
+        return 6
     oldest = min((m["timestamp"] for m in msgs), default="")
 
     henry = sorted((m for m in msgs if wanted(m) and not m.get("isDeleted")),
@@ -389,7 +421,14 @@ def main():
            or (m["timestamp"] == last and m["id"] not in seen)]
     overflow = bool(oldest) and len(msgs) >= 100 and oldest > last
     if overflow:
+        # The window is saturated and its oldest row is newer than our mark, so
+        # rows may be hidden between them. Record the gap, HOLD the cursor and
+        # dispatch NOTHING from this window until pagination or reconciliation
+        # makes coverage authoritative (Henry, C2R2).
         record_gap(last, oldest, len(msgs))
+        log(f"BLOCKED window={len(msgs)} oldest={oldest} mark={last}; holding the cursor, "
+            f"no dispatch and no ACK from a gapped window")
+        return 4
     delivered = 0
     for m in new:
         mid = m["id"]
@@ -397,7 +436,11 @@ def main():
         if kindclass == "ignore":
             continue
         if kindclass == "quarantine":
-            quarantine(mid, reason, meta(m), m["timestamp"])
+            try:
+                quarantine(mid, reason, meta(m), m["timestamp"])
+            except Exception as e:  # noqa: BLE001 - no record means no 'handled'
+                log(f"ERROR quarantine unavailable for {mid}: {e!r}; holding the cursor")
+                return 5
             mark(led, mid, "quarantined", m["timestamp"])   # never dispatched later
             seen = (seen if m["timestamp"] == last else []) + [mid]
             last = m["timestamp"]
@@ -418,10 +461,12 @@ def main():
         if led.get(mid, {}).get("stage") != "delivered":
             mark(led, mid, "intent", m["timestamp"])   # fence BEFORE the side effect
             subject = deliver(m, overflow)
-            if kindclass == "actionable":
+            if kindclass == "actionable" and meta(m).get("requiresAck") is True:
+                # ACK only what explicitly asks for one, literal true (Henry, C2R2)
                 led.setdefault(mid, {})["ack"] = ack_payload(m)   # survives the window
-            mark(led, mid, "delivered" if kindclass == "actionable" else "informational",
-                 m["timestamp"])
+            stage = "delivered" if (kindclass == "actionable"
+                                    and led.get(mid, {}).get("ack")) else "informational"
+            mark(led, mid, stage, m["timestamp"])
             log(f"DELIVERED {mid} {m['timestamp']} [{kindclass}] :: {subject}")
         # The watermark advances only after the inbox write is durable.
         seen = (seen if m["timestamp"] == last else []) + [mid]
@@ -437,9 +482,9 @@ def main():
     # Receipt-ACK pass: every delivered-but-unacked id, including earlier ticks.
     # A failed ACK is never recorded as sent; it simply retries next tick.
     acked = 0
-    for mid in [k for k, v in led.items() if v.get("stage") == "delivered"]:
-        pending = led[mid].get("ack") or {"id": mid, "timestamp": led[mid].get("ts", ""),
-                                          "metadata": {}}
+    for mid in [k for k, v in led.items()
+                if v.get("stage") == "delivered" and v.get("ack")]:
+        pending = led[mid]["ack"]
         try:
             post_ack(env, pending)
             mark(led, mid, "acked")

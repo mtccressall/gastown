@@ -31,8 +31,10 @@ def load(home):
     return m
 
 
-def msg(mid, ts, auth="agent:henry", recipient=None, kind="review-handoff", content="body", meta=True):
-    md = {"authenticatedAgentId": auth, "kind": kind}
+def msg(mid, ts, auth="agent:henry", recipient=None, kind="review-handoff", content="body",
+        meta=True, requires_ack=True):
+    # requiresAck defaults to literal true: Henry ACKs only what asks for one.
+    md = {"authenticatedAgentId": auth, "kind": kind, "requiresAck": requires_ack}
     if recipient:
         md["recipient"] = recipient
     return {"id": mid, "timestamp": ts, "sender": "henry", "content": content,
@@ -125,7 +127,7 @@ class TestIntake(Harness):
     # ---- the RED set ---------------------------------------------------
     def test_receipt_ack_is_posted_after_persistence(self):
         self.seed()
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z")]
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]
         self.run_tick()
         self.assertEqual(len(self.mail), 1, "message should be persisted to the inbox")
         self.assertTrue(hasattr(self.m, "post_ack"), "adapter must have a receipt-ACK path")
@@ -133,7 +135,7 @@ class TestIntake(Harness):
 
     def test_failed_ack_is_not_recorded_as_sent_and_retries(self):
         self.seed()
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z")]
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]
         self.fail_post = True
         self.run_tick()
         self.fail_post = False
@@ -144,7 +146,7 @@ class TestIntake(Harness):
 
     def test_restart_replay_does_not_duplicate_the_inbox_write(self):
         self.seed()
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z")]
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]
         self.fail_state_write = True
         orig = self.m.write_state
 
@@ -164,23 +166,23 @@ class TestIntake(Harness):
 
     def test_duplicate_delivery_of_same_id_is_idempotent(self):
         self.seed()
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z")]
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]
         self.run_tick()
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z"),
-                       msg("m2", "2026-09-23T01:00:00.000Z")]  # identical timestamp
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new"),
+                       msg("m2", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]  # identical timestamp
         self.run_tick()
         self.assertEqual(len(self.mail), 2, "m1 must not be delivered twice; m2 must be delivered once")
 
     def test_corrupt_state_is_not_read_as_first_run(self):
         open(self.m.STATE, "w").write("{ this is not json")
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z")]
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]
         rc = self.run_tick()
         self.assertEqual(self.mail, [], "corrupt state must stop the tick, not replay history")
         self.assertNotEqual(rc, 0, "a corrupt state file must fail loudly")
 
     def test_disk_write_failure_does_not_ack(self):
         self.seed()
-        self.window = [msg("m1", "2026-09-23T01:00:00.000Z")]
+        self.window = [msg("m1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new")]
         self.m.write_state = lambda ts, ids: (_ for _ in ()).throw(OSError("read-only fs"))
         try:
             self.run_tick()
@@ -343,3 +345,87 @@ class TestC2Henry(Harness):
         self.assertTrue(gaps, "a saturated window past the watermark must record a visible gap")
         self.assertIn("2026-09-20T00:00:00.000Z", json.dumps(gaps),
                       "the gap record must carry the watermark it could not reach")
+
+
+class TestC2R3(Harness):
+    """Henry's C2R2 adjudication (ekqqzhw): four remaining repairs."""
+
+    def test_poll_envelope_with_errors_is_not_processed(self):
+        """(1) HTTP 200 carrying errors AND data must not dispatch anything.
+
+        Drives the REAL poll() through a faked urlopen, so bypassing the
+        validator is detectable."""
+        import contextlib, importlib.machinery, importlib.util, io
+        self.seed()
+        ld = importlib.machinery.SourceFileLoader("reload_p1", TARGET)
+        spec = importlib.util.spec_from_loader(ld.name, ld)
+        fresh = importlib.util.module_from_spec(spec)
+        ld.exec_module(fresh)
+        fresh.summarize = lambda t: "S"
+        fresh.load_env = self.m.load_env
+        fresh.run = self.m.run
+        payload = {"errors": [{"message": "PartialFailure"}],
+                   "data": {"messages": [msg("p1", "2026-09-23T01:00:00.000Z",
+                                             recipient="agent:gas-new", kind="REQUEST")]}}
+
+        @contextlib.contextmanager
+        def fake_urlopen(req, timeout=0):
+            yield io.StringIO(json.dumps(payload))
+        fresh.urllib.request.urlopen = fake_urlopen
+        rc = fresh.main()
+        self.assertEqual(self.mail, [], "a poll envelope carrying errors must dispatch nothing")
+        self.assertNotEqual(rc, 0, "and the tick must fail loudly")
+
+    def test_ack_response_must_carry_the_posted_identity(self):
+        """(1b) A 200 with data={} is not proof the ACK was stored."""
+        with self.assertRaises(Exception):
+            self.m.check_post_envelope({"data": {}})
+        self.m.check_post_envelope({"data": {"id": "abc", "timestamp": "t"}})
+
+    def test_missing_recipient_is_not_actionable(self):
+        """(2) No recipient means not addressed to us: no ACK, no work."""
+        self.seed()
+        m = msg("n1", "2026-09-23T01:00:00.000Z", kind="REQUEST")   # no recipient
+        self.window = [m]
+        self.run_tick()
+        self.assertEqual(self.posts, [], "an unaddressed message must not be ACKed")
+        self.assertNotEqual(self.m.classify(m)[0], "actionable")
+
+    def test_receipt_ack_requires_literal_requires_ack_true(self):
+        """(2b) ACK only what explicitly asks for one."""
+        self.seed()
+        m = dict(msg("r1", "2026-09-23T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST"))
+        m["metadata"] = dict(m["metadata"]); m["metadata"]["requiresAck"] = False
+        self.window = [m]
+        self.run_tick()
+        self.assertEqual(len(self.mail), 1, "it is still delivered")
+        self.assertEqual(self.posts, [], "but requiresAck=false must not be ACKed")
+
+    def test_saturated_window_blocks_delivery_and_holds_the_cursor(self):
+        """(3) A gapped window must not deliver or advance past the gap."""
+        self.seed(ts="2026-09-20T00:00:00.000Z")
+        self.window = [msg(f"s{i}", f"2026-09-23T02:00:{i:02d}.000Z",
+                           recipient="agent:gas-new", kind="REQUEST") for i in range(60)] + \
+                      [msg(f"t{i}", f"2026-09-23T02:01:{i:02d}.000Z",
+                           recipient="agent:gas-new", kind="REQUEST") for i in range(40)]
+        before_ts, _ = self.m.read_state()
+        self.run_tick()
+        after_ts, _ = self.m.read_state()
+        self.assertEqual(self.mail, [], "a gapped window must not dispatch")
+        self.assertEqual(self.posts, [], "and must not ACK")
+        self.assertEqual(after_ts, before_ts, "the cursor must be held until reconciliation")
+        self.assertTrue(self.m.read_gaps(), "and the gap must be recorded")
+
+    def test_quarantine_write_failure_fails_closed(self):
+        """(4) No durable quarantine record means no 'handled' state and no advance."""
+        self.seed()
+        self.m.QUARANTINE_MAX = 0          # capacity exhausted
+        m = msg("q1", "2026-09-23T01:00:00.000Z", auth="agent:stranger",
+                recipient="agent:gas-new", kind="REQUEST")
+        self.window = [m]
+        before_ts, _ = self.m.read_state()
+        self.run_tick()
+        after_ts, _ = self.m.read_state()
+        self.assertEqual(self.m.read_ledger().get("q1", {}).get("stage"), None,
+                         "without a durable record it must not be marked quarantined")
+        self.assertEqual(after_ts, before_ts, "and the cursor must not advance")
