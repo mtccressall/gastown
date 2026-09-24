@@ -47,6 +47,16 @@ const (
 	TypeBoot    = "boot"
 	TypeHalt    = "halt"
 
+	// TypePolecatReclaimed records a DESTRUCTIVE reclaim of a broken idle
+	// polecat's worktree. It exists because that removal previously announced
+	// itself on stdout only: a worktree vanished with no feed event of any kind,
+	// and whether anyone could reconstruct it afterwards depended on how they
+	// happened to pipe their terminal. One investigation was lost exactly that
+	// way — the operator's own `grep -iE 'error|refus|limit|cannot|fail'` matched
+	// none of the reclaim's words and dropped them before they were ever seen
+	// (gt-kpiwr).
+	TypePolecatReclaimed = "polecat_reclaimed"
+
 	// Session events (for seance discovery)
 	TypeSessionStart = "session_start"
 	TypeSessionEnd   = "session_end"
@@ -206,6 +216,18 @@ func SpawnPayload(rig, polecat string) map[string]interface{} {
 	return map[string]interface{}{
 		"rig":     rig,
 		"polecat": polecat,
+	}
+}
+
+// PolecatReclaimedPayload creates a payload for a destructive polecat reclaim.
+// reason carries the verification failure that made the worktree eligible, so
+// the feed records WHY it was removed and not merely that it went.
+func PolecatReclaimedPayload(rig, polecat, path, reason string) map[string]interface{} {
+	return map[string]interface{}{
+		"rig":     rig,
+		"polecat": polecat,
+		"path":    path,
+		"reason":  reason,
 	}
 }
 

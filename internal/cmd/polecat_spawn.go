@@ -69,7 +69,21 @@ func effectivePolecatDirCap(configured int) int {
 	return configured
 }
 
-func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error) {
+// reclaimMgr is the slice of *polecat.Manager this needs, as an interface so a
+// test can drive the DECISION and the EMISSION without a real rig on disk.
+type reclaimMgr interface {
+	List() ([]*polecat.Polecat, error)
+	ReclaimBrokenIdlePolecat(name string) error
+}
+
+// reclaimBrokenIdlePolecatForSling removes a structurally broken idle polecat so
+// its slot can be reused, and reports the removal through emit.
+//
+// emit is INJECTED rather than called directly, so a test can assert that a
+// deletion is actually announced. Testing the payload struct alone does not do
+// that: deleting the emit call outright left every payload test green, which is
+// the same wiring gap this town caught on my --stale guard (gt-kpiwr).
+func reclaimBrokenIdlePolecatForSling(polecatMgr reclaimMgr, rigName string, emit func(rig, name, path, reason string)) (bool, error) {
 	polecats, err := polecatMgr.List()
 	if err != nil {
 		return false, err
@@ -90,6 +104,11 @@ func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error)
 			continue
 		}
 		fmt.Printf("  %s Broken idle polecat %s reclaimed before assigning new work\n", style.Bold.Render("✓"), candidate.Name)
+		// A worktree has just been DELETED. Record it in the feed: stdout is not
+		// a record — it is whatever survived the operator's pipeline (gt-kpiwr).
+		if emit != nil {
+			emit(rigName, candidate.Name, candidate.ClonePath, verifyErr.Error())
+		}
 		return true, nil
 	}
 
@@ -200,7 +219,9 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (info *Spawned
 		witness.RecordBeadRespawn(townRoot, opts.HookBead)
 	}
 
-	if reclaimed, err := reclaimBrokenIdlePolecatForSling(polecatMgr); err != nil {
+	if reclaimed, err := reclaimBrokenIdlePolecatForSling(polecatMgr, rigName, func(rig, name, path, reason string) {
+		_ = events.LogFeed(events.TypePolecatReclaimed, "gt", events.PolecatReclaimedPayload(rig, name, path, reason))
+	}); err != nil {
 		style.PrintWarning("could not reclaim broken idle polecat before allocation: %v", err)
 	} else if reclaimed {
 		fmt.Println("  Allocating fresh polecat after reclaiming broken idle sandbox...")
