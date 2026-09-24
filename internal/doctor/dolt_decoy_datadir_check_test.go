@@ -47,3 +47,41 @@ func TestNonRepositoriesAreNeitherScannedNorReported(t *testing.T) {
 		t.Fatalf("unaccounted = %v (scanned %d), want none scanned", un, scanned)
 	}
 }
+
+// bd honours BEADS_DIR and BEADS_DB from the inherited environment EVEN WITH
+// cmd.Dir at the town root. With BEADS_DB=<townRoot>/.beads/dolt exported, the
+// unpinned check blessed the DECOY as the real store and reported the actual
+// 44,988-issue store as unaccounted — exactly inverted, on the one question it
+// exists to answer (gastown/refinery, PR 65 round 2).
+//
+// This also covers the acquisition half, which the previous tests never reached:
+// they drove the pure enumeration and passed with bdReportedStore returning a
+// bogus path.
+func TestInheritedBeadsSelectorsCannotSurviveIntoTheBdSubprocess(t *testing.T) {
+	hostile := []string{
+		"PATH=/usr/bin",
+		"BEADS_DB=/town/.beads/dolt",       // the decoy
+		"BEADS_DIR=/somewhere/else/.beads", // a different store entirely
+		"BD_DB=/third/place",
+	}
+
+	got := pinnedBDEnv(hostile, "/town")
+
+	for _, e := range got {
+		for _, bad := range []string{"BEADS_DB=/town/.beads/dolt", "BEADS_DIR=/somewhere/else/.beads", "BD_DB=/third/place"} {
+			if e == bad {
+				t.Errorf("inherited selector survived: %q — bd would report the wrong store", e)
+			}
+		}
+	}
+
+	var pinned bool
+	for _, e := range got {
+		if e == "BEADS_DIR=/town/.beads" {
+			pinned = true
+		}
+	}
+	if !pinned {
+		t.Errorf("BEADS_DIR was not pinned to the town beads dir; env=%v", got)
+	}
+}

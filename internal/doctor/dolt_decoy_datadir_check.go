@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // DoltDecoyDataDirCheck reports a Dolt repository that bd's SERVER-mode
@@ -67,6 +69,21 @@ func NewDoltDecoyDataDirCheck() *DoltDecoyDataDirCheck {
 func bdReportedStore(townRoot string) (string, error) {
 	cmd := exec.Command("bd", "info")
 	cmd.Dir = townRoot
+	// PIN THE ROUTING, because cmd.Dir does NOT win. bd honours BEADS_DIR and
+	// BEADS_DB from the inherited environment even with cmd.Dir at the town
+	// root, so an operator with BEADS_DB=<townRoot>/.beads/dolt exported would
+	// have this check bless the DECOY as the real store and report the actual
+	// 44,988-issue store as unaccounted — exactly inverted, on the one question
+	// it exists to answer. Measured with this invocation shape
+	// (gastown/refinery, PR 65 round 2):
+	//
+	//   baseline                       .beads/embeddeddolt   44,988 issues
+	//   BEADS_DB=<townRoot>/.beads/dolt .beads/dolt          <- the decoy
+	//   BEADS_DIR=<rig>/.beads          <rig>/mayor/rig/.beads/dolt
+	//
+	// BuildPinnedBDEnv strips inherited target selectors first, which is why it
+	// is the in-tree answer rather than appending one more variable.
+	cmd.Env = pinnedBDEnv(os.Environ(), townRoot)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -77,6 +94,12 @@ func bdReportedStore(townRoot string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("bd info printed no Database: line")
+}
+
+// pinnedBDEnv is the environment for the bd subprocess, extracted so a test can
+// assert that an inherited selector cannot survive into it.
+func pinnedBDEnv(base []string, townRoot string) []string {
+	return beads.BuildPinnedBDEnv(base, filepath.Join(townRoot, ".beads"))
 }
 
 // isDoltRepo reports whether dir is a real Dolt repository rather than a stub.
