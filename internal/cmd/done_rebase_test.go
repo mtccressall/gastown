@@ -10,6 +10,12 @@ import (
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 )
 
+// notMerged is the default forge answer: this branch's PR was not merged.
+func notMerged() (int, bool, error) { return 0, false, nil }
+
+// wasMerged stands in for a squash-merged PR.
+func wasMerged() (int, bool, error) { return 49, true, nil }
+
 // fakeRebaseGit lets us drive autoRebaseOnTarget without a real git repo for
 // the gating-decision tests.
 type fakeRebaseGit struct {
@@ -92,7 +98,7 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeRebaseGit{}
-			rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", tt.behind, tt.preVerified, tt.alreadyPushed)
+			rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", tt.behind, tt.preVerified, tt.alreadyPushed, notMerged)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -115,9 +121,16 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 // TestAutoRebaseOnTarget_ConflictAborts verifies that a rebase failure causes
 // AbortRebase to fire and the returned error includes remediation guidance.
 func TestAutoRebaseOnTarget_ConflictAborts(t *testing.T) {
-	fake := &fakeRebaseGit{rebaseErr: errors.New("CONFLICT (content): merge conflict in foo.txt")}
+	// diffFiles must name foo.txt: this fixture already claims a conflict IN
+	// foo.txt, so the trees necessarily differ. Without it the fake describes an
+	// impossible state — a content conflict between identical trees — which is
+	// precisely the squash-merge signature, and autoRebaseOnTarget now
+	// classifies it as such (gt-jokpn).
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("CONFLICT (content): merge conflict in foo.txt"),
+	}
 
-	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false, notMerged)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -176,7 +189,7 @@ func TestAutoRebaseOnTarget_RealRepoSuccess(t *testing.T) {
 	testRunGit(t, repo, "checkout", "feature")
 
 	g := gitpkg.NewGit(repo)
-	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false, notMerged)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -224,7 +237,7 @@ func TestAutoRebaseOnTarget_RealRepoConflictAborts(t *testing.T) {
 	testRunGit(t, repo, "checkout", "feature")
 
 	g := gitpkg.NewGit(repo)
-	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false, notMerged)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
 	}
@@ -250,5 +263,156 @@ func writeRepoFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+// THE CONFLICT FALLBACK, which is retained for the multi-commit case: the
+// pre-rebase query says not-merged, the rebase then conflicts, and a second
+// query finds the merge that landed in between. Without the fallback the
+// polecat would get "resolve conflicts manually" for work that had just landed.
+func TestAutoRebaseFallsBackToTheForgeAfterAConflict(t *testing.T) {
+	fake := &fakeRebaseGit{rebaseErr: errors.New("could not apply abc123... the commit")}
+
+	calls := 0
+	mergedLate := func() (int, bool, error) {
+		calls++
+		if calls == 1 {
+			return 0, false, nil // pre-rebase: not merged yet
+		}
+		return 49, true, nil // landed while we were rebasing
+	}
+
+	rebased, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, mergedLate)
+
+	if err == nil {
+		t.Fatal("the conflict fallback did not report the merge, so runDone would continue into push")
+	}
+	if !strings.Contains(err.Error(), "PR #49") {
+		t.Errorf("error does not name the merging PR: %v", err)
+	}
+	if rebased {
+		t.Error("rebased = true for work that already landed")
+	}
+	if fake.abortCalls != 1 {
+		t.Errorf("abortCalls = %d, want 1 — a failed rebase must still be cleaned up", fake.abortCalls)
+	}
+	if calls != 2 {
+		t.Errorf("forge consulted %d time(s), want 2 — before the rebase and again after the conflict", calls)
+	}
+}
+
+// NEGATIVE CONTROL. A real conflict — trees still differ — must keep the
+// original error and its advice. Without this, a function that always claimed
+// "already merged" would pass the test above.
+func TestAutoRebaseKeepsConflictAdviceWhenTreesStillDiffer(t *testing.T) {
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("could not apply abc123... the commit"),
+	}
+
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, notMerged)
+
+	if err == nil {
+		t.Fatal("no error for a genuine conflict — the polecat loses the advice it needs")
+	}
+	if !strings.Contains(err.Error(), "Resolve conflicts manually") {
+		t.Errorf("error lost the conflict advice: %v", err)
+	}
+}
+
+// A failure to REACH THE FORGE must not be read as "merged". Fail toward the
+// ordinary advice: wrongly claiming a merge would have the polecat walk away
+// from work that never landed.
+func TestAutoRebaseTreatsForgeFailureAsNotMerged(t *testing.T) {
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("could not apply abc123... the commit"),
+	}
+
+	forgeDown := func() (int, bool, error) { return 0, false, errors.New("gh: could not reach api.github.com") }
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, forgeDown)
+
+	if err == nil {
+		t.Fatal("an unreachable forge was treated as proof the work had merged")
+	}
+}
+
+// A merged PR at a DIFFERENT revision is not this work. The live case:
+// polecat/deacon/gt-mnnx+reply-reminder had PR 49 merged at e68f0088 and was
+// then pushed to 2f9e7ed1 — the stranded commit. Matching the branch NAME alone
+// would tell that polecat its unmerged work had landed.
+func TestAutoRebaseDoesNotTrustAMergeAtAnotherRevision(t *testing.T) {
+	fake := &fakeRebaseGit{rebaseErr: errors.New("could not apply abc123")}
+
+	mergedElsewhere := func() (int, bool, error) { return 0, false, nil } // revision did not match
+
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, mergedElsewhere)
+
+	if err == nil {
+		t.Fatal("no error: a branch whose merged PR was at another revision was treated as merged")
+	}
+	if !strings.Contains(err.Error(), "Resolve conflicts manually") {
+		t.Errorf("lost the ordinary conflict advice: %v", err)
+	}
+}
+
+// THE LIVE STRANDING CASE, driven directly. polecat/deacon/gt-mnnx+reply-reminder
+// had PR 49 merged at e68f0088; the branch was then pushed to 2f9e7ed1, which
+// never merged. Matching the branch NAME alone would tell a polecat sitting on
+// 2f9e7ed1 that its work had landed.
+func TestMergedPRAtRevisionRequiresTheRevisionToMatch(t *testing.T) {
+	rows := []mergedPRRow{{Number: 49, MergedAt: "2026-09-16T05:08:08Z", HeadRefOid: "e68f0088"}}
+
+	if pr, ok := mergedPRAtRevision(rows, "e68f0088"); !ok || pr != 49 {
+		t.Errorf("the merged revision was not recognised: pr=%d ok=%v", pr, ok)
+	}
+	if pr, ok := mergedPRAtRevision(rows, "2f9e7ed1"); ok {
+		t.Errorf("the STRANDED revision was reported as merged by PR %d — this is the gt-mnnx sequence", pr)
+	}
+}
+
+// An unmerged row must never satisfy it, whatever its head.
+func TestMergedPRAtRevisionIgnoresUnmergedRows(t *testing.T) {
+	rows := []mergedPRRow{{Number: 70, MergedAt: "", HeadRefOid: "deadbeef"}}
+	if _, ok := mergedPRAtRevision(rows, "deadbeef"); ok {
+		t.Error("an unmerged PR was treated as a merge")
+	}
+}
+
+// THE CLEAN-REBASE PATH, which the first two rounds never exercised. A
+// SINGLE-COMMIT squash-merged branch rebases successfully — git skips the
+// already-applied patch — so a check that only runs after a conflict is never
+// consulted, and runDone proceeds into push and MR creation, recreating the
+// branch deleted at merge. Reproduced from scratch before this test was written
+// (gastown/refinery, PR 66 round 3).
+func TestAutoRebaseRefusesAMergedBranchEvenWhenTheRebaseWouldSucceed(t *testing.T) {
+	fake := &fakeRebaseGit{} // Rebase returns nil: a CLEAN rebase
+
+	rebased, _, err := autoRebaseOnTarget(fake, "origin/main", 2, false, false, wasMerged)
+
+	if err == nil {
+		t.Fatal("a clean rebase of an already-merged branch returned no error, so runDone would push and enqueue landed work")
+	}
+	if rebased {
+		t.Error("rebased = true for work that already landed")
+	}
+	if fake.rebaseCalls != 0 {
+		t.Errorf("rebase ran %d time(s) — the forge must be asked BEFORE rebasing, or the clean path skips the check", fake.rebaseCalls)
+	}
+	if !strings.Contains(err.Error(), "PR #49") {
+		t.Errorf("error does not name the merging PR: %v", err)
+	}
+}
+
+// NEGATIVE CONTROL: an unmerged branch must still rebase normally, or the check
+// above would pass for a function that refuses everything.
+func TestAutoRebaseStillRebasesAnUnmergedBranch(t *testing.T) {
+	fake := &fakeRebaseGit{}
+
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 2, false, false, notMerged)
+
+	if err != nil || !rebased || skipReason != "" {
+		t.Fatalf("an unmerged branch was not rebased: rebased=%v skip=%q err=%v", rebased, skipReason, err)
+	}
+	if fake.rebaseCalls != 1 {
+		t.Errorf("rebaseCalls = %d, want 1", fake.rebaseCalls)
 	}
 }

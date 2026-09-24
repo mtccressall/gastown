@@ -1156,7 +1156,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// gh#3400: Auto-rebase the polecat branch onto the latest target before
 			// push, so the resulting MR/PR has a current base.
 			alreadyPushed := checkpoints[CheckpointPushed] == branch
-			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed)
+			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed,
+				func() (int, bool, error) {
+					headSHA, revErr := g.Rev("HEAD")
+					if revErr != nil {
+						return 0, false, revErr
+					}
+					return prMergedForBranch(branch, headSHA)
+				})
 			if rebaseErr != nil {
 				return rebaseErr
 			}
