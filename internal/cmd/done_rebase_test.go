@@ -11,10 +11,10 @@ import (
 )
 
 // notMerged is the default forge answer: this branch's PR was not merged.
-func notMerged() (bool, error) { return false, nil }
+func notMerged() (int, bool, error) { return 0, false, nil }
 
 // wasMerged stands in for a squash-merged PR.
-func wasMerged() (bool, error) { return true, nil }
+func wasMerged() (int, bool, error) { return 49, true, nil }
 
 // fakeRebaseGit lets us drive autoRebaseOnTarget without a real git repo for
 // the gating-decision tests.
@@ -274,16 +274,22 @@ func TestAutoRebaseReportsSquashMergeInsteadOfConflictAdvice(t *testing.T) {
 		rebaseErr: errors.New("could not apply abc123... the commit"),
 	}
 
-	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, wasMerged)
+	rebased, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, wasMerged)
 
-	if err != nil {
-		t.Fatalf("returned an error for an already-merged branch: %v", err)
+	// AN ERROR, NOT A SKIP: done.go treats skipReason as advisory and carries on
+	// into push and MR creation, which for a squash-merged branch whose remote
+	// was deleted would recreate it and enqueue landed work.
+	if err == nil {
+		t.Fatal("an already-merged branch returned no error, so runDone would continue into push and MR creation")
+	}
+	if !strings.Contains(err.Error(), "PR #49") {
+		t.Errorf("error does not name the PR that merged it: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Do NOT rerun gt done") {
+		t.Errorf("error does not warn against rerunning: %v", err)
 	}
 	if rebased {
 		t.Errorf("rebased = true, want false — nothing to rebase, the work is in base")
-	}
-	if skipReason != "already merged (squash)" {
-		t.Errorf("skipReason = %q, want \"already merged (squash)\"", skipReason)
 	}
 	if fake.abortCalls != 1 {
 		t.Errorf("abortCalls = %d, want 1 — the failed rebase must still be cleaned up", fake.abortCalls)
@@ -316,10 +322,52 @@ func TestAutoRebaseTreatsForgeFailureAsNotMerged(t *testing.T) {
 		rebaseErr: errors.New("could not apply abc123... the commit"),
 	}
 
-	forgeDown := func() (bool, error) { return false, errors.New("gh: could not reach api.github.com") }
+	forgeDown := func() (int, bool, error) { return 0, false, errors.New("gh: could not reach api.github.com") }
 	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, forgeDown)
 
 	if err == nil {
 		t.Fatal("an unreachable forge was treated as proof the work had merged")
+	}
+}
+
+// A merged PR at a DIFFERENT revision is not this work. The live case:
+// polecat/deacon/gt-mnnx+reply-reminder had PR 49 merged at e68f0088 and was
+// then pushed to 2f9e7ed1 — the stranded commit. Matching the branch NAME alone
+// would tell that polecat its unmerged work had landed.
+func TestAutoRebaseDoesNotTrustAMergeAtAnotherRevision(t *testing.T) {
+	fake := &fakeRebaseGit{rebaseErr: errors.New("could not apply abc123")}
+
+	mergedElsewhere := func() (int, bool, error) { return 0, false, nil } // revision did not match
+
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, mergedElsewhere)
+
+	if err == nil {
+		t.Fatal("no error: a branch whose merged PR was at another revision was treated as merged")
+	}
+	if !strings.Contains(err.Error(), "Resolve conflicts manually") {
+		t.Errorf("lost the ordinary conflict advice: %v", err)
+	}
+}
+
+// THE LIVE STRANDING CASE, driven directly. polecat/deacon/gt-mnnx+reply-reminder
+// had PR 49 merged at e68f0088; the branch was then pushed to 2f9e7ed1, which
+// never merged. Matching the branch NAME alone would tell a polecat sitting on
+// 2f9e7ed1 that its work had landed.
+func TestMergedPRAtRevisionRequiresTheRevisionToMatch(t *testing.T) {
+	rows := []mergedPRRow{{Number: 49, MergedAt: "2026-09-16T05:08:08Z", HeadRefOid: "e68f0088"}}
+
+	if pr, ok := mergedPRAtRevision(rows, "e68f0088"); !ok || pr != 49 {
+		t.Errorf("the merged revision was not recognised: pr=%d ok=%v", pr, ok)
+	}
+	if pr, ok := mergedPRAtRevision(rows, "2f9e7ed1"); ok {
+		t.Errorf("the STRANDED revision was reported as merged by PR %d — this is the gt-mnnx sequence", pr)
+	}
+}
+
+// An unmerged row must never satisfy it, whatever its head.
+func TestMergedPRAtRevisionIgnoresUnmergedRows(t *testing.T) {
+	rows := []mergedPRRow{{Number: 70, MergedAt: "", HeadRefOid: "deadbeef"}}
+	if _, ok := mergedPRAtRevision(rows, "deadbeef"); ok {
+		t.Error("an unmerged PR was treated as a merge")
 	}
 }

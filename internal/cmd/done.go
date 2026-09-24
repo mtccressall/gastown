@@ -1157,7 +1157,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// push, so the resulting MR/PR has a current base.
 			alreadyPushed := checkpoints[CheckpointPushed] == branch
 			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed,
-				func() (bool, error) { return prMergedForBranch(branch) })
+				func() (int, bool, error) {
+					headSHA, revErr := g.Rev("HEAD")
+					if revErr != nil {
+						return 0, false, revErr
+					}
+					return prMergedForBranch(branch, headSHA)
+				})
 			if rebaseErr != nil {
 				return rebaseErr
 			}

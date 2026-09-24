@@ -13,28 +13,58 @@ import (
 // and an older PR then reads as ABSENT at rc=0, which here would mean silently
 // telling a polecat its merged work is not merged. That truncation cost a wrong
 // published finding earlier this week at --limit 100 on a busy repo.
-func prMergedForBranch(branch string) (bool, error) {
-	if branch == "" {
-		return false, fmt.Errorf("no branch")
+func prMergedForBranch(branch, headSHA string) (int, bool, error) {
+	if branch == "" || headSHA == "" {
+		return 0, false, fmt.Errorf("no branch or head sha")
 	}
 	out, err := exec.Command("gh", "pr", "list", "--head", branch,
-		"--state", "merged", "--json", "number,mergedAt", "--limit", "10").Output()
+		"--state", "merged", "--json", "number,mergedAt,headRefOid", "--limit", "10").Output()
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
-	var rows []struct {
-		Number   int    `json:"number"`
-		MergedAt string `json:"mergedAt"`
-	}
+	var rows []mergedPRRow
 	if err := json.Unmarshal(out, &rows); err != nil {
-		return false, err
+		return 0, false, err
 	}
+	pr, ok := mergedPRAtRevision(rows, headSHA)
+	return pr, ok, nil
+}
+
+// mergedPRRow is one row of `gh pr list --json number,mergedAt,headRefOid`.
+type mergedPRRow struct {
+	Number     int    `json:"number"`
+	MergedAt   string `json:"mergedAt"`
+	HeadRefOid string `json:"headRefOid"`
+}
+
+// mergedPRAtRevision returns the PR that merged THIS revision, if any.
+//
+// Split out so a test drives the comparison rather than a copy of it: with the
+// match inlined in the gh wrapper, replacing the revision check with `if true`
+// passed every test, because the tests inject the outer closure and never reach
+// it. The revision check IS the fix, so leaving it undriven would ship the one
+// line that matters untested.
+// THE REVISION MUST MATCH, NOT JUST THE NAME. Branch names are reused and
+// pushed to after their PR merges, so "a merged PR exists with this name"
+// does not mean THIS WORK merged. Live instance in this repo:
+//
+//	polecat/deacon/gt-mnnx+reply-reminder
+//	  PR 49 merged 2026-09-16 at head e68f0088
+//	  the branch was then pushed to 2f9e7ed1 — the STRANDED commit
+//
+// A polecat sitting on 2f9e7ed1 with genuinely unmerged work would be told
+// "merged" and skip the rebase. Not a hypothetical collision: it is last
+// week's stranding sequence, automated (gastown/refinery, PR 66 round 2).
+func mergedPRAtRevision(rows []mergedPRRow, headSHA string) (int, bool) {
 	for _, r := range rows {
-		if strings.TrimSpace(r.MergedAt) != "" {
-			return true, nil
+		if strings.TrimSpace(r.MergedAt) == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(r.HeadRefOid), strings.TrimSpace(headSHA)) {
+			return r.Number, true
 		}
 	}
-	return false, nil
+	return 0, false
 }
 
 // rebaseGit is the subset of *git.Git that autoRebaseOnTarget needs. Defined as
@@ -48,7 +78,7 @@ type rebaseGit interface {
 // alreadyMergedFn reports whether this branch's PR has been merged. It is a
 // parameter rather than a call so a test can drive the decision, and because
 // the only authority on "was this merged" is the forge.
-type alreadyMergedFn func() (bool, error)
+type alreadyMergedFn func() (prNumber int, merged bool, err error)
 
 // autoRebaseOnTarget rebases the current branch onto base when the branch is
 // behind the target. It is a no-op when there is nothing to rebase, when the
@@ -94,8 +124,21 @@ func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alrea
 		//
 		// The forge is the only authority on whether a PR was merged.
 		if merged != nil {
-			if ok, mErr := merged(); mErr == nil && ok {
-				return false, "already merged (squash)", nil
+			if pr, ok, mErr := merged(); mErr == nil && ok {
+				// AN ERROR, NOT A SKIP. done.go treats skipReason as ADVISORY —
+				// it PrintWarnings and carries on into push and MR creation. For
+				// the squash case this targets, where the remote branch is
+				// normally DELETED at merge, continuing would recreate the
+				// branch and enqueue work that has already landed: gt-rsj9's
+				// resurrection shape, reached through this new path.
+				//
+				// A correct oracle wired into a caller that ignores its verdict
+				// is still wrong, and harder to see than the original bug
+				// because the oracle is sound (gastown/refinery, PR 66 r2).
+				return false, "", fmt.Errorf(
+					"this branch was already merged as PR #%d AT THIS EXACT REVISION: there is nothing to rebase and nothing to push.\n"+
+						"Do NOT rerun gt done. The remote branch is normally deleted at merge, so pushing would recreate it and enqueue work that has already landed.\n"+
+						"Check the bead records the merge, then let the witness close it out.", pr)
 			}
 		}
 		return false, "", fmt.Errorf("auto-rebase onto %s failed: %w\n"+
