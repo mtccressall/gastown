@@ -1,10 +1,11 @@
 package doctor
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // DoltDecoyDataDirCheck reports a Dolt repository that bd's SERVER-mode
@@ -51,100 +52,121 @@ func NewDoltDecoyDataDirCheck() *DoltDecoyDataDirCheck {
 	}
 }
 
-// bdServerModeDoltDir reproduces bd's projectDoltDirPath for a beads dir.
+// bdReportedStore asks bd which store it actually reads.
 //
-// Deliberately a REIMPLEMENTATION rather than a call into bd: bd is a separate,
-// module-proxy-built binary whose source is not in this tree, so there is
-// nothing to call. That makes this check a model of another program's
-// behaviour, and it can drift — which is why it reports what it resolved and
-// why, rather than asserting bd will do the same.
-func bdServerModeDoltDir(beadsDir string) (string, string) {
-	if env := os.Getenv("BEADS_DOLT_DATA_DIR"); env != "" {
-		return env, "BEADS_DOLT_DATA_DIR"
-	}
-
-	metaPath := filepath.Join(beadsDir, "metadata.json")
-	data, err := os.ReadFile(metaPath)
+// THIS REPLACES A MODEL OF bd's RESOLUTION, AND THE MODEL WAS WRONG WHERE IT
+// RAN. The first version of this check reimplemented projectDoltDirPath and
+// concluded this town's bd resolves <townRoot>/.beads/dolt. It does not: bd
+// info reports .beads/embeddeddolt with 44,988 issues, while .beads/dolt is a
+// separate 4.7M repo. Both are real Dolt directories, so a "is it a repo" test
+// cannot tell them apart. For a check that exists to catch stores reading zero,
+// a wrong resolution model gives a confident wrong answer about exactly the
+// question it is asked (gastown/refinery on PR 65).
+//
+// bd info prints the resolved path and cannot drift from bd, because it IS bd.
+func bdReportedStore(townRoot string) (string, error) {
+	cmd := exec.Command("bd", "info")
+	cmd.Dir = townRoot
+	out, err := cmd.Output()
 	if err != nil {
-		// No readable metadata: bd falls back to <beadsDir>/dolt.
-		return filepath.Join(beadsDir, "dolt"), "fallback (metadata.json unreadable)"
+		return "", err
 	}
-
-	var meta struct {
-		Database    string `json:"database"`
-		DoltDataDir string `json:"dolt_data_dir"`
+	for _, line := range strings.Split(string(out), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Database:"); ok {
+			return strings.TrimSpace(rest), nil
+		}
 	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return filepath.Join(beadsDir, "dolt"), "fallback (metadata.json unparseable)"
-	}
-	if meta.DoltDataDir != "" {
-		return meta.DoltDataDir, "metadata.json dolt_data_dir"
-	}
-	if meta.Database != "" {
-		return filepath.Join(beadsDir, meta.Database), "metadata.json database"
-	}
-	return filepath.Join(beadsDir, "dolt"), "fallback (no database key)"
+	return "", fmt.Errorf("bd info printed no Database: line")
 }
 
-// isDoltRepo reports whether dir is a real Dolt repository rather than an empty
-// stub. A stub serves nothing and is not the hazard; a populated repo is.
+// isDoltRepo reports whether dir is a real Dolt repository rather than a stub.
 func isDoltRepo(dir string) bool {
 	info, err := os.Stat(filepath.Join(dir, ".dolt"))
 	return err == nil && info.IsDir()
 }
 
+// candidateStores are the places a Dolt repository turns up in a town. This is
+// an ENUMERATION, not a prediction: the check reports which real repositories
+// exist and which of them nothing accounts for, rather than claiming to know
+// what bd would serve if somebody started a server.
+func candidateStores(townRoot string) []string {
+	return []string{
+		filepath.Join(townRoot, ".beads", "dolt"),
+		filepath.Join(townRoot, ".beads", "embeddeddolt"),
+		filepath.Join(townRoot, ".dolt-data"),
+	}
+}
+
+// unaccountedStores returns the real Dolt repositories that are neither the
+// store bd reads nor the daemon's data dir, plus how many were scanned.
+//
+// isRepo is injected so a test drives THIS function rather than a copy of its
+// logic, and so the scan can be exercised without Dolt directories on disk.
+func unaccountedStores(store, daemonDir string, candidates []string, isRepo func(string) bool) (unaccounted []string, scanned int) {
+	for _, dir := range candidates {
+		if !isRepo(dir) {
+			continue
+		}
+		scanned++
+		if filepath.Clean(dir) == filepath.Clean(store) || filepath.Clean(dir) == filepath.Clean(daemonDir) {
+			continue
+		}
+		unaccounted = append(unaccounted, dir)
+	}
+	return unaccounted, scanned
+}
+
 func (c *DoltDecoyDataDirCheck) Run(ctx *CheckContext) *CheckResult {
 	beadsDir := filepath.Join(ctx.TownRoot, ".beads")
 	if _, err := os.Stat(beadsDir); err != nil {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "No town .beads directory to check",
-		}
+		return &CheckResult{Name: c.Name(), Status: StatusOK, Message: "No town .beads directory to check"}
 	}
 
-	resolved, why := bdServerModeDoltDir(beadsDir)
-	realDataDir := filepath.Join(ctx.TownRoot, ".dolt-data")
-
-	// The safe case: bd's resolution and the daemon's data dir agree, so a bd
-	// start-class command would serve the same rows the daemon does.
-	if filepath.Clean(resolved) == filepath.Clean(realDataDir) {
+	store, err := bdReportedStore(ctx.TownRoot)
+	if err != nil {
+		// Without bd's own answer this check has no ground truth, and guessing
+		// one is what the previous version did wrong. Say so instead.
 		return &CheckResult{
 			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: fmt.Sprintf("bd server-mode resolution matches the daemon data dir (%s, via %s)", realDataDir, why),
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Could not ask bd which store it reads: %v", err),
+			FixHint: "Run `bd info` from the town root; this check needs its Database: line as ground truth.",
 		}
 	}
+	daemonDir := filepath.Join(ctx.TownRoot, ".dolt-data")
 
-	if !isDoltRepo(resolved) {
-		// It resolves elsewhere, but there is no repository there to serve.
-		// Report it rather than passing silently: the directory can appear later.
+	unaccounted, scanned := unaccountedStores(store, daemonDir, candidateStores(ctx.TownRoot), isDoltRepo)
+
+	if len(unaccounted) == 0 {
+		// State the denominator: a clean zero from a scan that found nothing and
+		// one from a scan that looked nowhere are otherwise identical.
 		return &CheckResult{
 			Name:   c.Name(),
 			Status: StatusOK,
-			Message: fmt.Sprintf("bd would resolve %s (via %s), which is not a Dolt repository — nothing to serve",
-				resolved, why),
+			Message: fmt.Sprintf("Every Dolt repository is accounted for (%d scanned; bd reads %s)",
+				scanned, store),
 		}
 	}
 
-	rel, err := filepath.Rel(ctx.TownRoot, resolved)
-	if err != nil {
-		rel = resolved
+	var details []string
+	for _, dir := range unaccounted {
+		rel, relErr := filepath.Rel(ctx.TownRoot, dir)
+		if relErr != nil {
+			rel = dir
+		}
+		details = append(details, fmt.Sprintf("%s is a real Dolt repository that is neither the store bd reads (%s) nor the daemon's data dir (%s)", rel, store, daemonDir))
 	}
+	details = append(details,
+		"A bd start-class command run from the town root resolves its data dir from the beads dir, so an unaccounted repository beside it can be served on the configured port",
+		"While it is served, every server-mode store reads rc=0 with 0 rows and 0 bytes on stderr — the silent zero of gt-zpnz, which blinded three rig merge queues on 2026-09-09",
+		"gt's own paths are NOT affected: the daemon and `gt dolt start` both resolve .dolt-data explicitly")
 
 	return &CheckResult{
-		Name:   c.Name(),
-		Status: StatusWarning,
-		Message: fmt.Sprintf("bd server-mode would serve %s, NOT the daemon's %s",
-			rel, filepath.Base(realDataDir)),
-		Details: []string{
-			fmt.Sprintf("resolved via %s", why),
-			fmt.Sprintf("%s is a real Dolt repository, so a bd start-class command run from the town root would serve it on the configured port", rel),
-			"While it is served, every server-mode store reads rc=0 with 0 rows and 0 bytes on stderr — the silent zero of gt-zpnz, which blinded three rig merge queues on 2026-09-09",
-			"gt's own paths are NOT affected: the daemon and `gt dolt start` both resolve .dolt-data explicitly",
-		},
-		FixHint: "Do NOT delete it — removing a Dolt directory is Marc-reserved (gt-tfr) and this one may hold history. " +
-			"Until bd refuses to serve a data dir that disagrees with the town's, treat `bd dolt start` and `bd init` from the town root as unsafe and use `gt dolt start`, which resolves .dolt-data. " +
-			"If a server is already serving it, `gt dolt kill-imposters` reports and clears it.",
+		Name:    c.Name(),
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("%d of %d Dolt repositories are unaccounted for", len(unaccounted), scanned),
+		Details: details,
+		FixHint: "Do NOT delete it — removing a Dolt directory is Marc-reserved (gt-tfr) and it may hold history. " +
+			"Confirm with `bd info` which store bd reads, and prefer `gt dolt start`, which resolves .dolt-data explicitly.",
 	}
 }
