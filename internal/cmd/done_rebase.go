@@ -18,7 +18,7 @@ func prMergedForBranch(branch, headSHA string) (int, bool, error) {
 		return 0, false, fmt.Errorf("no branch or head sha")
 	}
 	out, err := exec.Command("gh", "pr", "list", "--head", branch,
-		"--state", "merged", "--json", "number,mergedAt,headRefOid", "--limit", "10").Output()
+		"--state", "merged", "--json", "number,mergedAt,headRefOid", "--limit", "100").Output()
 	if err != nil {
 		return 0, false, err
 	}
@@ -28,6 +28,15 @@ func prMergedForBranch(branch, headSHA string) (int, bool, error) {
 	}
 	pr, ok := mergedPRAtRevision(rows, headSHA)
 	return pr, ok, nil
+}
+
+// alreadyMergedError is the single message for "this work already landed", used
+// by both the pre-rebase check and the conflict fallback so they cannot drift.
+func alreadyMergedError(pr int) error {
+	return fmt.Errorf(
+		"this branch was already merged as PR #%d AT THIS EXACT REVISION: there is nothing to rebase and nothing to push.\n"+
+			"Do NOT rerun gt done. The remote branch is normally deleted at merge, so pushing would recreate it and enqueue work that has already landed.\n"+
+			"Check the bead records the merge, then let the witness close it out.", pr)
 }
 
 // mergedPRRow is one row of `gh pr list --json number,mergedAt,headRefOid`.
@@ -104,6 +113,24 @@ func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alrea
 		return false, "prior push checkpoint exists", nil
 	}
 
+	// ASK BEFORE REBASING, NOT ONLY AFTER A CONFLICT. A SINGLE-COMMIT
+	// squash-merged branch rebases CLEANLY: git recognises the already-applied
+	// patch and skips it (skippedCherryPicks), so the rebase succeeds, leaves
+	// ZERO commits ahead, and a check that only runs in the conflict branch is
+	// never consulted. runDone then proceeds into push and MR creation —
+	// recreating the branch deleted at merge and enqueueing an MR for zero
+	// commits of landed work. Reproduced from scratch; two of the seven branches
+	// merged here last week were single-commit, so it is the common case rather
+	// than an edge (gastown/refinery, PR 66 round 3).
+	//
+	// The caller resolves HEAD when this runs, so the revision compared is the
+	// PRE-REBASE head — the one the forge would have recorded.
+	if merged != nil {
+		if pr, ok, mErr := merged(); mErr == nil && ok {
+			return false, "", alreadyMergedError(pr)
+		}
+	}
+
 	fmt.Printf("→ Auto-rebasing onto %s (%d commits behind)\n", base, behind)
 	if rebaseErr := g.Rebase(base); rebaseErr != nil {
 		_ = g.AbortRebase()
@@ -123,6 +150,8 @@ func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alrea
 		// (gastown/refinery on PR 66).
 		//
 		// The forge is the only authority on whether a PR was merged.
+		// Retained as a fallback for the multi-commit case, where the pre-rebase
+		// query may miss a merge that landed between the two calls.
 		if merged != nil {
 			if pr, ok, mErr := merged(); mErr == nil && ok {
 				// AN ERROR, NOT A SKIP. done.go treats skipReason as ADVISORY —
@@ -135,10 +164,7 @@ func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alrea
 				// A correct oracle wired into a caller that ignores its verdict
 				// is still wrong, and harder to see than the original bug
 				// because the oracle is sound (gastown/refinery, PR 66 r2).
-				return false, "", fmt.Errorf(
-					"this branch was already merged as PR #%d AT THIS EXACT REVISION: there is nothing to rebase and nothing to push.\n"+
-						"Do NOT rerun gt done. The remote branch is normally deleted at merge, so pushing would recreate it and enqueue work that has already landed.\n"+
-						"Check the bead records the merge, then let the witness close it out.", pr)
+				return false, "", alreadyMergedError(pr)
 			}
 		}
 		return false, "", fmt.Errorf("auto-rebase onto %s failed: %w\n"+

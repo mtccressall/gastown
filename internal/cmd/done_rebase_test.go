@@ -266,33 +266,38 @@ func writeRepoFile(t *testing.T, dir, name, content string) {
 	}
 }
 
-// A squash-merged branch conflicts with a SQUASHED COPY OF ITSELF. The old
-// advice told the polecat to resolve those conflicts, which cannot be done and
-// did not need doing: the work had already landed. gt-jokpn.
-func TestAutoRebaseReportsSquashMergeInsteadOfConflictAdvice(t *testing.T) {
-	fake := &fakeRebaseGit{
-		rebaseErr: errors.New("could not apply abc123... the commit"),
+// THE CONFLICT FALLBACK, which is retained for the multi-commit case: the
+// pre-rebase query says not-merged, the rebase then conflicts, and a second
+// query finds the merge that landed in between. Without the fallback the
+// polecat would get "resolve conflicts manually" for work that had just landed.
+func TestAutoRebaseFallsBackToTheForgeAfterAConflict(t *testing.T) {
+	fake := &fakeRebaseGit{rebaseErr: errors.New("could not apply abc123... the commit")}
+
+	calls := 0
+	mergedLate := func() (int, bool, error) {
+		calls++
+		if calls == 1 {
+			return 0, false, nil // pre-rebase: not merged yet
+		}
+		return 49, true, nil // landed while we were rebasing
 	}
 
-	rebased, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, wasMerged)
+	rebased, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, mergedLate)
 
-	// AN ERROR, NOT A SKIP: done.go treats skipReason as advisory and carries on
-	// into push and MR creation, which for a squash-merged branch whose remote
-	// was deleted would recreate it and enqueue landed work.
 	if err == nil {
-		t.Fatal("an already-merged branch returned no error, so runDone would continue into push and MR creation")
+		t.Fatal("the conflict fallback did not report the merge, so runDone would continue into push")
 	}
 	if !strings.Contains(err.Error(), "PR #49") {
-		t.Errorf("error does not name the PR that merged it: %v", err)
-	}
-	if !strings.Contains(err.Error(), "Do NOT rerun gt done") {
-		t.Errorf("error does not warn against rerunning: %v", err)
+		t.Errorf("error does not name the merging PR: %v", err)
 	}
 	if rebased {
-		t.Errorf("rebased = true, want false — nothing to rebase, the work is in base")
+		t.Error("rebased = true for work that already landed")
 	}
 	if fake.abortCalls != 1 {
-		t.Errorf("abortCalls = %d, want 1 — the failed rebase must still be cleaned up", fake.abortCalls)
+		t.Errorf("abortCalls = %d, want 1 — a failed rebase must still be cleaned up", fake.abortCalls)
+	}
+	if calls != 2 {
+		t.Errorf("forge consulted %d time(s), want 2 — before the rebase and again after the conflict", calls)
 	}
 }
 
@@ -369,5 +374,45 @@ func TestMergedPRAtRevisionIgnoresUnmergedRows(t *testing.T) {
 	rows := []mergedPRRow{{Number: 70, MergedAt: "", HeadRefOid: "deadbeef"}}
 	if _, ok := mergedPRAtRevision(rows, "deadbeef"); ok {
 		t.Error("an unmerged PR was treated as a merge")
+	}
+}
+
+// THE CLEAN-REBASE PATH, which the first two rounds never exercised. A
+// SINGLE-COMMIT squash-merged branch rebases successfully — git skips the
+// already-applied patch — so a check that only runs after a conflict is never
+// consulted, and runDone proceeds into push and MR creation, recreating the
+// branch deleted at merge. Reproduced from scratch before this test was written
+// (gastown/refinery, PR 66 round 3).
+func TestAutoRebaseRefusesAMergedBranchEvenWhenTheRebaseWouldSucceed(t *testing.T) {
+	fake := &fakeRebaseGit{} // Rebase returns nil: a CLEAN rebase
+
+	rebased, _, err := autoRebaseOnTarget(fake, "origin/main", 2, false, false, wasMerged)
+
+	if err == nil {
+		t.Fatal("a clean rebase of an already-merged branch returned no error, so runDone would push and enqueue landed work")
+	}
+	if rebased {
+		t.Error("rebased = true for work that already landed")
+	}
+	if fake.rebaseCalls != 0 {
+		t.Errorf("rebase ran %d time(s) — the forge must be asked BEFORE rebasing, or the clean path skips the check", fake.rebaseCalls)
+	}
+	if !strings.Contains(err.Error(), "PR #49") {
+		t.Errorf("error does not name the merging PR: %v", err)
+	}
+}
+
+// NEGATIVE CONTROL: an unmerged branch must still rebase normally, or the check
+// above would pass for a function that refuses everything.
+func TestAutoRebaseStillRebasesAnUnmergedBranch(t *testing.T) {
+	fake := &fakeRebaseGit{}
+
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 2, false, false, notMerged)
+
+	if err != nil || !rebased || skipReason != "" {
+		t.Fatalf("an unmerged branch was not rebased: rebased=%v skip=%q err=%v", rebased, skipReason, err)
+	}
+	if fake.rebaseCalls != 1 {
+		t.Errorf("rebaseCalls = %d, want 1", fake.rebaseCalls)
 	}
 }
