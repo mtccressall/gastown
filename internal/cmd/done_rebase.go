@@ -1,8 +1,41 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"os/exec"
+	"strings"
 )
+
+// prMergedForBranch asks the forge whether this branch's PR was merged.
+//
+// A TARGETED --head QUERY, never a listing: `gh pr list` returns a bounded page
+// and an older PR then reads as ABSENT at rc=0, which here would mean silently
+// telling a polecat its merged work is not merged. That truncation cost a wrong
+// published finding earlier this week at --limit 100 on a busy repo.
+func prMergedForBranch(branch string) (bool, error) {
+	if branch == "" {
+		return false, fmt.Errorf("no branch")
+	}
+	out, err := exec.Command("gh", "pr", "list", "--head", branch,
+		"--state", "merged", "--json", "number,mergedAt", "--limit", "10").Output()
+	if err != nil {
+		return false, err
+	}
+	var rows []struct {
+		Number   int    `json:"number"`
+		MergedAt string `json:"mergedAt"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if strings.TrimSpace(r.MergedAt) != "" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 // rebaseGit is the subset of *git.Git that autoRebaseOnTarget needs. Defined as
 // an interface so tests can drive the decision logic without standing up a full
@@ -10,35 +43,12 @@ import (
 type rebaseGit interface {
 	Rebase(onto string) error
 	AbortRebase() error
-	// DiffNameOnly reports the files differing between two refs. An empty
-	// result means the trees are identical, which is how a squash merge is
-	// detected here — see alreadyLandedAsSquash.
-	DiffNameOnly(base, head string) ([]string, error)
 }
 
-// alreadyLandedAsSquash reports whether this branch's work is already in base,
-// by comparing TREES rather than ancestry.
-//
-// ANCESTRY CANNOT BE THIS TEST, and that is the whole reason the function
-// exists. A squash merge replays the branch as ONE NEW COMMIT on base, so the
-// reviewed head is not an ancestor of base afterwards even though every line of
-// it has landed. Verified three times in one week on this town's PRs. Patch-id
-// (git cherry) is no better: a branch cut before another PR touched the same
-// file carries different hunk context, so identical content produces a
-// different patch-id (gt-u76h).
-//
-// An empty diff between base and HEAD means the branch introduces nothing base
-// does not already have. That is sufficient, not necessary: if other work
-// landed on base in the meantime the trees differ and this returns false, which
-// is the safe direction — the caller falls back to the ordinary conflict
-// advice rather than wrongly claiming the work is merged.
-func alreadyLandedAsSquash(g rebaseGit, base string) bool {
-	changed, err := g.DiffNameOnly(base, "HEAD")
-	if err != nil {
-		return false
-	}
-	return len(changed) == 0
-}
+// alreadyMergedFn reports whether this branch's PR has been merged. It is a
+// parameter rather than a call so a test can drive the decision, and because
+// the only authority on "was this merged" is the forge.
+type alreadyMergedFn func() (bool, error)
 
 // autoRebaseOnTarget rebases the current branch onto base when the branch is
 // behind the target. It is a no-op when there is nothing to rebase, when the
@@ -53,7 +63,7 @@ func alreadyLandedAsSquash(g rebaseGit, base string) bool {
 //   - err: rebase failure, after AbortRebase has been attempted to clean up.
 //
 // gh#3400.
-func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alreadyPushed bool) (rebased bool, skipReason string, err error) {
+func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alreadyPushed bool, merged alreadyMergedFn) (rebased bool, skipReason string, err error) {
 	if behind <= 0 {
 		return false, "", nil
 	}
@@ -71,8 +81,22 @@ func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alrea
 		// the old advice sent the polecat to resolve conflicts against its own
 		// merged work — which cannot be done and did not need doing. Every
 		// polecat whose PR is squash-merged reaches this state (gt-jokpn).
-		if alreadyLandedAsSquash(g, base) {
-			return false, "already merged (squash)", nil
+		// A TREE COMPARISON CANNOT ANSWER THIS, and the first version of this
+		// fix used one. DiffNameOnly runs `git diff --name-only base...head` —
+		// TRIPLE dot, i.e. merge-base..head, the branch's OWN changes. A squash
+		// creates a new commit, so the branch's commits never enter main's
+		// history, the merge base stays at the branch point, and that diff is
+		// NEVER empty. Measured on real squash-merged branches: gt-745z0
+		// triple=6 two=16, gt-sglq triple=4 two=18. Two-dot does not rescue it
+		// either, because main moves after a branch is cut. So the detection
+		// could not fire for any squash merge that will ever exist
+		// (gastown/refinery on PR 66).
+		//
+		// The forge is the only authority on whether a PR was merged.
+		if merged != nil {
+			if ok, mErr := merged(); mErr == nil && ok {
+				return false, "already merged (squash)", nil
+			}
 		}
 		return false, "", fmt.Errorf("auto-rebase onto %s failed: %w\n"+
 			"Resolve conflicts manually (git fetch origin && git rebase %s), commit the resolution, then rerun gt done.",

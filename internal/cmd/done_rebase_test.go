@@ -10,20 +10,18 @@ import (
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 )
 
+// notMerged is the default forge answer: this branch's PR was not merged.
+func notMerged() (bool, error) { return false, nil }
+
+// wasMerged stands in for a squash-merged PR.
+func wasMerged() (bool, error) { return true, nil }
+
 // fakeRebaseGit lets us drive autoRebaseOnTarget without a real git repo for
 // the gating-decision tests.
 type fakeRebaseGit struct {
 	rebaseErr   error
 	rebaseCalls int
 	abortCalls  int
-	// diffFiles is what DiffNameOnly returns: empty means the trees are
-	// identical, i.e. the branch is already in base (a squash merge).
-	diffFiles []string
-	diffErr   error
-}
-
-func (f *fakeRebaseGit) DiffNameOnly(base, head string) ([]string, error) {
-	return f.diffFiles, f.diffErr
 }
 
 func (f *fakeRebaseGit) Rebase(onto string) error {
@@ -100,7 +98,7 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeRebaseGit{}
-			rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", tt.behind, tt.preVerified, tt.alreadyPushed)
+			rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", tt.behind, tt.preVerified, tt.alreadyPushed, notMerged)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -130,10 +128,9 @@ func TestAutoRebaseOnTarget_ConflictAborts(t *testing.T) {
 	// classifies it as such (gt-jokpn).
 	fake := &fakeRebaseGit{
 		rebaseErr: errors.New("CONFLICT (content): merge conflict in foo.txt"),
-		diffFiles: []string{"foo.txt"},
 	}
 
-	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false, notMerged)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -192,7 +189,7 @@ func TestAutoRebaseOnTarget_RealRepoSuccess(t *testing.T) {
 	testRunGit(t, repo, "checkout", "feature")
 
 	g := gitpkg.NewGit(repo)
-	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false, notMerged)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -240,7 +237,7 @@ func TestAutoRebaseOnTarget_RealRepoConflictAborts(t *testing.T) {
 	testRunGit(t, repo, "checkout", "feature")
 
 	g := gitpkg.NewGit(repo)
-	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false, notMerged)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
 	}
@@ -275,10 +272,9 @@ func writeRepoFile(t *testing.T, dir, name, content string) {
 func TestAutoRebaseReportsSquashMergeInsteadOfConflictAdvice(t *testing.T) {
 	fake := &fakeRebaseGit{
 		rebaseErr: errors.New("could not apply abc123... the commit"),
-		diffFiles: nil, // identical trees: everything on this branch is in base
 	}
 
-	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, wasMerged)
 
 	if err != nil {
 		t.Fatalf("returned an error for an already-merged branch: %v", err)
@@ -300,10 +296,9 @@ func TestAutoRebaseReportsSquashMergeInsteadOfConflictAdvice(t *testing.T) {
 func TestAutoRebaseKeepsConflictAdviceWhenTreesStillDiffer(t *testing.T) {
 	fake := &fakeRebaseGit{
 		rebaseErr: errors.New("could not apply abc123... the commit"),
-		diffFiles: []string{"services/JournalService.ts"},
 	}
 
-	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false)
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, notMerged)
 
 	if err == nil {
 		t.Fatal("no error for a genuine conflict — the polecat loses the advice it needs")
@@ -313,18 +308,18 @@ func TestAutoRebaseKeepsConflictAdviceWhenTreesStillDiffer(t *testing.T) {
 	}
 }
 
-// A failure to compare trees must not be read as "identical". Fail toward the
-// ordinary advice: wrongly claiming a branch is merged would have the polecat
-// walk away from work that never landed.
-func TestAutoRebaseTreatsDiffFailureAsNotMerged(t *testing.T) {
+// A failure to REACH THE FORGE must not be read as "merged". Fail toward the
+// ordinary advice: wrongly claiming a merge would have the polecat walk away
+// from work that never landed.
+func TestAutoRebaseTreatsForgeFailureAsNotMerged(t *testing.T) {
 	fake := &fakeRebaseGit{
 		rebaseErr: errors.New("could not apply abc123... the commit"),
-		diffErr:   errors.New("fatal: bad revision"),
 	}
 
-	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false)
+	forgeDown := func() (bool, error) { return false, errors.New("gh: could not reach api.github.com") }
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false, forgeDown)
 
 	if err == nil {
-		t.Fatal("a failed tree comparison was treated as proof the work had merged")
+		t.Fatal("an unreachable forge was treated as proof the work had merged")
 	}
 }
