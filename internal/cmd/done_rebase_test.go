@@ -16,6 +16,14 @@ type fakeRebaseGit struct {
 	rebaseErr   error
 	rebaseCalls int
 	abortCalls  int
+	// diffFiles is what DiffNameOnly returns: empty means the trees are
+	// identical, i.e. the branch is already in base (a squash merge).
+	diffFiles []string
+	diffErr   error
+}
+
+func (f *fakeRebaseGit) DiffNameOnly(base, head string) ([]string, error) {
+	return f.diffFiles, f.diffErr
 }
 
 func (f *fakeRebaseGit) Rebase(onto string) error {
@@ -115,7 +123,15 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 // TestAutoRebaseOnTarget_ConflictAborts verifies that a rebase failure causes
 // AbortRebase to fire and the returned error includes remediation guidance.
 func TestAutoRebaseOnTarget_ConflictAborts(t *testing.T) {
-	fake := &fakeRebaseGit{rebaseErr: errors.New("CONFLICT (content): merge conflict in foo.txt")}
+	// diffFiles must name foo.txt: this fixture already claims a conflict IN
+	// foo.txt, so the trees necessarily differ. Without it the fake describes an
+	// impossible state — a content conflict between identical trees — which is
+	// precisely the squash-merge signature, and autoRebaseOnTarget now
+	// classifies it as such (gt-jokpn).
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("CONFLICT (content): merge conflict in foo.txt"),
+		diffFiles: []string{"foo.txt"},
+	}
 
 	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false)
 	if err == nil {
@@ -250,5 +266,65 @@ func writeRepoFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+// A squash-merged branch conflicts with a SQUASHED COPY OF ITSELF. The old
+// advice told the polecat to resolve those conflicts, which cannot be done and
+// did not need doing: the work had already landed. gt-jokpn.
+func TestAutoRebaseReportsSquashMergeInsteadOfConflictAdvice(t *testing.T) {
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("could not apply abc123... the commit"),
+		diffFiles: nil, // identical trees: everything on this branch is in base
+	}
+
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false)
+
+	if err != nil {
+		t.Fatalf("returned an error for an already-merged branch: %v", err)
+	}
+	if rebased {
+		t.Errorf("rebased = true, want false — nothing to rebase, the work is in base")
+	}
+	if skipReason != "already merged (squash)" {
+		t.Errorf("skipReason = %q, want \"already merged (squash)\"", skipReason)
+	}
+	if fake.abortCalls != 1 {
+		t.Errorf("abortCalls = %d, want 1 — the failed rebase must still be cleaned up", fake.abortCalls)
+	}
+}
+
+// NEGATIVE CONTROL. A real conflict — trees still differ — must keep the
+// original error and its advice. Without this, a function that always claimed
+// "already merged" would pass the test above.
+func TestAutoRebaseKeepsConflictAdviceWhenTreesStillDiffer(t *testing.T) {
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("could not apply abc123... the commit"),
+		diffFiles: []string{"services/JournalService.ts"},
+	}
+
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false)
+
+	if err == nil {
+		t.Fatal("no error for a genuine conflict — the polecat loses the advice it needs")
+	}
+	if !strings.Contains(err.Error(), "Resolve conflicts manually") {
+		t.Errorf("error lost the conflict advice: %v", err)
+	}
+}
+
+// A failure to compare trees must not be read as "identical". Fail toward the
+// ordinary advice: wrongly claiming a branch is merged would have the polecat
+// walk away from work that never landed.
+func TestAutoRebaseTreatsDiffFailureAsNotMerged(t *testing.T) {
+	fake := &fakeRebaseGit{
+		rebaseErr: errors.New("could not apply abc123... the commit"),
+		diffErr:   errors.New("fatal: bad revision"),
+	}
+
+	_, _, err := autoRebaseOnTarget(fake, "origin/main", 3, false, false)
+
+	if err == nil {
+		t.Fatal("a failed tree comparison was treated as proof the work had merged")
 	}
 }
