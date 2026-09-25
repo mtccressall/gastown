@@ -162,3 +162,27 @@ Isolated mocked controls:
 Live clean run at the top of census-output.txt: `lineage_panes_ok=15 lineage_unreadable=0 lineage_identity_changed=0`, `pane_complete=True`, `lineage_complete=True`, rc=0.
 
 **Acknowledged as author-reported, not independently remeasured by Henry:** the same-UID disk readability of the binding file. Principal and authority remain UNRESOLVED, installation remains unauthorised.
+
+## Census v4 — single-snapshot parent, and genuinely synthetic controls (Henry c2-census-b14e9688)
+
+| finding | correction |
+|---|---|
+| stale-parent attribution reproducible: `start_ticks` validation passed, then a SEPARATE `ppid` stat saw a recycled PID and attached its new parent to the OLD env sample | `stat_snapshot()` reads the stat ONCE and returns `(ppid, start_ticks)` together, so there is no window between them by construction. `ppid_validated(pid, sampled)` returns a parent ONLY if that single snapshot's ticks still equal the identity sampled with the environ; otherwise no parent is attached and the pane counts as identity-changed. Every ancestor hop advances the same way |
+| pane output line used fresh ticks rather than the sampled ones | the pane row now prints the SAMPLED ticks and the UTC derived from them |
+| `controls.py` was not isolated as labelled: 'clean' executed the live census and the others retained real binding/environ/tmux reads | census.py now takes `CENSUS_PROCFS`, `CENSUS_BINDING` and `CENSUS_TMUX`, and controls.py builds a FAKE procfs tree, a fake binding file and a stub tmux in a temp dir. No real /proc, no real binding, no tmux is read or executed |
+
+### Synthetic controls (exit codes captured from the process)
+```
+Synthetic controls (no real /proc, binding or tmux):
+  clean                  rc=0 expect=0 PASS  
+  tmux-failure           rc=2 expect=2 PASS  FATAL tmux enumeration failed rc=1: 
+  empty-enumeration      rc=2 expect=2 PASS  FATAL enumerated=0; an empty census is not a clean census
+  binding-unreadable     rc=3 expect=3 PASS  FATAL binding unreadable: FileNotFoundError
+  ancestor-unreadable    rc=5 expect=5 PASS  FATAL incomplete lineage: propagation UNKNOWN, refusing to report a cl
+Function-level synthetic controls for stale-parent validation:
+  matching identity -> parent returned         PASS
+  MISMATCHED identity -> refused, no parent    PASS
+  ppid and ticks from ONE snapshot             PASS
+```
+
+**LIMIT STATED RATHER THAN PAPERED OVER:** the END-TO-END recycle needs the stat to change BETWEEN two reads inside one run. A static synthetic file cannot express that, and a FIFO-backed stat deadlocked, so I do NOT claim an end-to-end control for it. What is proven: the validation refuses a mismatched identity, and parent plus start time now come from one read, which removes the window rather than detecting it.

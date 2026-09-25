@@ -16,18 +16,30 @@ changed under us). A vacuous run CANNOT exit 0 (Henry, c2-census review).
 """
 import datetime, os, subprocess, sys
 
+# I/O roots, overridable so the controls can drive SYNTHETIC input with no real
+# host reads at all (Henry: controls.py was not isolated as labelled).
+PROCFS = os.environ.get("CENSUS_PROCFS", "/proc")
+BINDING = os.environ.get("CENSUS_BINDING", os.path.expanduser("~/.config/liveop/e2e-staging.env"))
+TMUX = os.environ.get("CENSUS_TMUX", "")          # a command emitting "session pid" lines
 CLK = os.sysconf("SC_CLK_TCK")
-BOOT = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime"))
+BOOT = next(int(l.split()[1]) for l in open(f"{PROCFS}/stat") if l.startswith("btime"))
 NAMES = ["LIVEOP_API_KEY", "LIVEOP_API_URL", "LIVEOP_AGENT_ID", "LIVEOP_AGENT_INBOX_CHANNEL"]
 OBSERVED = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def start_ticks(pid):
+def stat_snapshot(pid):
+    """ONE read -> (ppid, start_ticks). Deriving them from separate reads let a
+    recycled PID attach a NEW parent to an OLD identity (Henry, b14e9688)."""
     try:
-        s = open(f"/proc/{pid}/stat").read()
-        return int(s[s.rindex(")") + 2:].split()[19])
+        s = open(f"{PROCFS}/{pid}/stat").read()
     except OSError:
-        return None
+        return None, None
+    f = s[s.rindex(")") + 2:].split()
+    return int(f[1]), int(f[19])
+
+
+def start_ticks(pid):
+    return stat_snapshot(pid)[1]
 
 
 def start_utc(ticks):
@@ -37,12 +49,13 @@ def start_utc(ticks):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def ppid(pid):
-    try:
-        s = open(f"/proc/{pid}/stat").read()
-        return int(s[s.rindex(")") + 2:].split()[1])
-    except OSError:
-        return None
+def ppid_validated(pid, sampled):
+    """Parent from the SAME snapshot as the identity check: returns the parent only
+    if this is still the process whose environ we sampled."""
+    parent, ticks = stat_snapshot(pid)
+    if ticks is None or ticks != sampled:
+        return None, False
+    return parent, True
 
 
 def read_env_bracketed(pid):
@@ -55,7 +68,7 @@ def read_env_bracketed(pid):
     sample)."""
     before = start_ticks(pid)
     try:
-        raw = open(f"/proc/{pid}/environ", "rb").read().decode("utf-8", "replace")
+        raw = open(f"{PROCFS}/{pid}/environ", "rb").read().decode("utf-8", "replace")
     except OSError:
         return None, before == start_ticks(pid), before
     after = start_ticks(pid)
@@ -67,7 +80,7 @@ print(f"# census_version=2  observed_at_utc={OBSERVED}  host={os.uname().nodenam
 
 ref = None
 try:
-    for line in open(os.path.expanduser("~/.config/liveop/e2e-staging.env")):
+    for line in open(BINDING):
         if line.startswith("LIVEOP_API_KEY="):
             ref = line.split("=", 1)[1].strip().strip("'\"")
 except OSError as e:
@@ -79,8 +92,9 @@ if not ref:
 print("# adapter_binding_readable=yes (value never emitted)")
 
 try:
-    proc = subprocess.run(["tmux", "-L", "gt-0016fa", "list-panes", "-a", "-F",
-                           "#{session_name} #{pane_pid}"], capture_output=True, text=True)
+    cmd = (TMUX.split() if TMUX else
+           ["tmux", "-L", "gt-0016fa", "list-panes", "-a", "-F", "#{session_name} #{pane_pid}"])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
 except OSError as e:
     # tmux absent entirely: an enumeration failure, not an empty town
     print(f"# FATAL tmux not executable: {e.__class__.__name__}: {e}")
@@ -111,9 +125,9 @@ for name, pid in panes:
     same = "n/a"
     if "LIVEOP_API_KEY" in env:
         same = "yes" if env["LIVEOP_API_KEY"] == ref else "NO"
-    t = start_ticks(pid)
     rows.append((name, pid, env, sampled))
-    print(f"{name} {pid} {t} {start_utc(t)} {stable} {presence} {same} {env.get('GT_ROLE','<unset>')}")
+    print(f"{name} {pid} {sampled} {start_utc(sampled)} {stable} {presence} {same} "
+          f"{env.get('GT_ROLE','<unset>')}")
 
 print(f"# enumerated={enumerated} examined={examined} unreadable={unreadable} "
       f"identity_changed={identity_changed}")
@@ -121,13 +135,14 @@ print(f"# enumerated={enumerated} examined={examined} unreadable={unreadable} "
 print("# PER-PANE LINEAGE: pane -> ancestors, with boolean key-equality at each hop")
 lineage_unreadable = lineage_identity_changed = lineage_panes_ok = 0
 for name, pid, env, sampled in rows:
-    # Validate the pane is STILL the process we sampled before trusting its ppid.
-    if start_ticks(int(pid)) != sampled:
+    # Parent and identity from ONE snapshot: no window between them.
+    parent, ok = ppid_validated(int(pid), sampled)
+    if not ok:
         lineage_identity_changed += 1
         print(f"#   {name} {pid} -> IDENTITY CHANGED since the environ sample; "
               f"refusing to attach a parent to a stale sample")
         continue
-    chain, p, hops, chain_ok = [], ppid(int(pid)), 0, False
+    chain, p, hops, chain_ok = [], parent, 0, False
     while p and p > 1 and hops < 8:
         aenv, astable, asampled = read_env_bracketed(p)
         if aenv is None:
@@ -150,7 +165,13 @@ for name, pid, env, sampled in rows:
         if has:
             chain_ok = True
             break
-        p = ppid(p); hops += 1
+        # advance using the ancestor's OWN sampled identity, validated
+        p, aok = ppid_validated(p, asampled)
+        if not aok:
+            chain.append("PARENT-IDENTITY-CHANGED")
+            lineage_identity_changed += 1
+            break
+        hops += 1
     if chain_ok:
         lineage_panes_ok += 1
     else:
