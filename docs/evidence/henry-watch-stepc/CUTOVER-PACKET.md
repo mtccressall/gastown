@@ -14,11 +14,11 @@ it as if it did. The affected source gates must be re-run against these bytes.
 
 | | |
 |---|---|
-| candidate commit | **SUPERSEDED — see the line below.** `27945966` was the source-PASS commit; the preflight gate changed production bytes, so identity is restated here (Henry, C2 preflight review) (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
+| candidate commit | **`8ab5abbb7f6cfa3be6cc32f0c059c81693f184a1`** (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`). Supersedes `27945966`, which was the source-PASS commit before the preflight gate and the ledger validator changed production bytes (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
 | candidate source path | `docs/evidence/henry-watch-stepc/watch_c.py` |
-| candidate git blob | restated below |
+| candidate git blob | **`c149d6f56ba2f72dbf7b74a20c28a8bbccf4e9c1`** (`git rev-parse 8ab5abbb7f6c:docs/evidence/henry-watch-stepc/watch_c.py`) |
 | candidate content SHA-256 | **`460478c3701cf5ef25cc05a7b1b76a2a4eb05ee9d26a70e313139fd807ab9e3a`** (supersedes `56e5bc35…`; that checksum described the source-PASS bytes, before the preflight gate and the ledger validator) |
-| candidate size | see the commit; the file grew by the preflight gate, the ledger validator and their tests |
+| candidate size | 605 lines |
 | INSTALLED path | `/home/marccressall/gt/bin/gt-henry-watch` |
 | INSTALLED SHA-256 | `8f386008ac3c300dcf4bfe34820825b5634cf2471ceae0408f26ddb79a01e76c` |
 | INSTALLED mtime | 2026-09-21T11:13:57Z |
