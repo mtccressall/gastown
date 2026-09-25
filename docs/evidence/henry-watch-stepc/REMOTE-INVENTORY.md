@@ -101,16 +101,23 @@ that I can offer, which matches the limit you hit on your side.
 | dedupe domain | the channel's server-assigned message id, globally unique. The ledger is keyed by it |
 | mail domain | appends to `mayor/` in the shared Dolt town store; every agent shares that store |
 
-## Explicit unknowns
+## Explicit unknowns (reconciled against finding 1, 2026-09-25T09:3xZ)
 
-1. **Propagation root of the credential** — unknown, as above. Consequence: I cannot say whether a new
-   session will inherit it, so the capability set may grow without anyone acting.
-2. **Process attribution of `agent:gas-new` posts** — impossible from the channel. Mitigation available if
-   you want it: a distinct identity for the adapter, so its posts are separable from the Mayor's. That is a
-   change to request, not something I will do unilaterally.
-3. **Whether any non-Mayor session has ever used the key** — not established, and not disprovable with
-   current evidence.
-4. **Henry-side consumers** — outside my scope, yours to enumerate.
+1. ~~Propagation root of the credential~~ — **RESOLVED by the census**: the tmux server (pid 3539834,
+   started 2026-09-12T00:56:09Z) carries a key and every pane inherits it. Consequence that remains: any
+   NEW session spawned by that server inherits it too, without anyone acting.
+2. **Whether the sessions' key resolves to `agent:gas-new`** — UNKNOWN, and this is now the material one.
+   Their value differs from the adapter's binding (0/15 equal), but a rotated or older key for the same
+   agent would still stamp the same identity. Resolvable by one read-only call with a session's key,
+   observing only the stamped `authenticatedAgentId`. **Not run: it uses a credential that is not the
+   adapter's, so Marc authorises it or it stays unknown.**
+3. **Process attribution of `agent:gas-new` posts** — impossible from the channel, because the identity IS
+   the key. Mitigation available: give the adapter its own distinct identity so its posts are separable
+   from the Mayor's. A change to request, not one I will make unilaterally, and Henry is right that it
+   improves attribution without proving confinement.
+4. **Whether any non-Mayor session has ever posted** — not established and not disprovable with current
+   evidence.
+5. **Henry-side consumers** — outside my scope, Henry-owned.
 
-**Under the packet's own rule, unknowns 1 and 2 block cutover** until you and Marc decide they are
+**Under the packet's own rule, unknowns 2 and 3 block cutover** until Henry and Marc decide they are
 acceptable or they are closed. I am not proposing to install over them.
