@@ -478,8 +478,6 @@ class TestC2R4(Harness):
         self.assertEqual(self.m.read_ledger()["c2"]["stage"], "intent", "and must stay intent")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestRollbackSafety(Harness):
@@ -520,3 +518,76 @@ class TestRollbackSafety(Harness):
         self.assertEqual(led["q1"]["stage"], "acked")
         self.assertEqual(self.m.unresolved_obligations(led), {}, "nothing owed")
         self.assertEqual(self.m.preflight(), 0, "preflight permits rollback when quiesced")
+
+
+class TestSuiteStructure(unittest.TestCase):
+    """The suite must not be able to under-report itself again.
+
+    Appending a class AFTER unittest.main() makes `python3 test_stepc.py` run only
+    the classes above it and print a clean pass over a subset. This happened twice
+    (Henry p1910gg, then again in the rollback-safety round), so it is now asserted
+    structurally rather than remembered.
+    """
+
+    def test_runner_block_is_last_and_all_classes_precede_it(self):
+        import ast
+        src = open(os.path.abspath(__file__)).read()
+        tree = ast.parse(src)
+        runner_line = None
+        for node in tree.body:
+            if isinstance(node, ast.If) and ast.unparse(node.test).replace(" ", "") == "__name__=='__main__'":
+                runner_line = node.lineno
+        self.assertIsNotNone(runner_line, "the file must have a __main__ runner block")
+        late = [n.name for n in tree.body
+                if isinstance(n, ast.ClassDef) and n.lineno > runner_line]
+        self.assertEqual(late, [], f"test classes defined AFTER the runner are invisible to direct "
+                                   f"invocation: {late}")
+
+    # NOTE: a subprocess test that re-invokes this file was REMOVED. It spawned
+    # itself recursively (808 processes before I killed them by PID), because the
+    # inner run lacked the recursion guard. The AST check above catches the actual
+    # defect - a class defined after the runner - without executing anything, and
+    # matching inventories are demonstrated in RESULTS by running both forms once.
+
+
+class TestPreflightFailsClosed(Harness):
+    """Henry's C2 preflight finding: malformed or unknown ledger data must NOT
+    certify zero obligations. Unknown data is an unknown obligation."""
+
+    def _write_raw(self, payload):
+        open(self.m.LEDGER, "w").write(json.dumps(payload))
+
+    def test_unknown_stage_refuses(self):
+        self.seed()
+        self._write_raw({"x": {"stage": "delivery-pending", "ts": "2026-09-25T01:00:00.000Z"}})
+        self.assertNotEqual(self.m.preflight(), 0, "an unknown stage must not certify rollback-safe")
+
+    def test_entry_without_a_stage_refuses(self):
+        self.seed()
+        self._write_raw({"x": {}})
+        self.assertNotEqual(self.m.preflight(), 0, "a stageless entry must not certify rollback-safe")
+
+    def test_ledger_that_is_not_an_object_refuses(self):
+        self.seed()
+        self._write_raw([])
+        self.assertNotEqual(self.m.preflight(), 0, "a list ledger must not certify rollback-safe")
+
+    def test_entry_that_is_not_an_object_refuses(self):
+        self.seed()
+        self._write_raw({"x": "delivered"})
+        self.assertNotEqual(self.m.preflight(), 0, "a string entry must not certify rollback-safe")
+
+    def test_stage_missing_its_required_ts_refuses(self):
+        self.seed()
+        self._write_raw({"x": {"stage": "delivered"}})
+        self.assertNotEqual(self.m.preflight(), 0, "a delivered entry with no ts must not certify")
+
+    def test_a_VALID_quiesced_ledger_still_certifies(self):
+        """Negative control: the validator must not refuse everything."""
+        self.seed()
+        self._write_raw({"x": {"stage": "acked", "ts": "2026-09-25T01:00:00.000Z", "at": 1}})
+        self.assertEqual(self.m.preflight(), 0, "a valid quiesced ledger must still certify")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

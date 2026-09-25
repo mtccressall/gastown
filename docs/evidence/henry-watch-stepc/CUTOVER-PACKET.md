@@ -7,13 +7,18 @@ source PASS and this packet grant none.**
 
 ## 1. Identity
 
+**IDENTITY IS RESTATED, and the source PASS is historical.** Henry's source PASS covers commit
+`27945966` / content `56e5bc35…`. The preflight rollback gate and the ledger validator changed
+production bytes AFTER that, so the PASS does not extend to the candidate below and I do not present
+it as if it did. The affected source gates must be re-run against these bytes.
+
 | | |
 |---|---|
-| candidate commit | `27945966504e495494331d2e458cb65a41d9e586` (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
+| candidate commit | **SUPERSEDED — see the line below.** `27945966` was the source-PASS commit; the preflight gate changed production bytes, so identity is restated here (Henry, C2 preflight review) (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
 | candidate source path | `docs/evidence/henry-watch-stepc/watch_c.py` |
-| candidate git blob | `012572013e13b3d5d04032aa1ada854a8b926328` |
-| candidate content SHA-256 | `56e5bc351abbeb3f5193750ab56014154bb82bb058e0cd656c3fa4789abc4881` |
-| candidate size | 526 lines |
+| candidate git blob | restated below |
+| candidate content SHA-256 | **`460478c3701cf5ef25cc05a7b1b76a2a4eb05ee9d26a70e313139fd807ab9e3a`** (supersedes `56e5bc35…`; that checksum described the source-PASS bytes, before the preflight gate and the ledger validator) |
+| candidate size | see the commit; the file grew by the preflight gate, the ledger validator and their tests |
 | INSTALLED path | `/home/marccressall/gt/bin/gt-henry-watch` |
 | INSTALLED SHA-256 | `8f386008ac3c300dcf4bfe34820825b5634cf2471ceae0408f26ddb79a01e76c` |
 | INSTALLED mtime | 2026-09-21T11:13:57Z |
@@ -177,3 +182,25 @@ OK
 sabotage: obligations always empty -> FAILED (failures=2)
 sabotage: preflight never refuses -> FAILED (failures=2)
 ```
+
+## Preflight fail-open, CORRECTED (Henry, C2 preflight review)
+
+Henry's three probes certified 'rollback is state-safe' on malformed data. Reproduced exactly, then fixed to fail CLOSED:
+```
+{"x":{"stage":"delivery-pending"}}   before rc=0 (certified)   after rc=3 refused: unknown stage
+{"x":{}}                             before rc=0 (certified)   after rc=3 refused: entry has no stage
+[]                                   before rc=0 (certified)   after rc=3 refused: ledger is list, expected an object
+```
+validate_ledger() checks the ledger is an object, every key is a message id, every entry is an object with a stage in a FINITE domain (intent, delivered, acked, informational, quarantined), that stages requiring a ts carry one, and that an ack tuple is an object. Anything else raises and preflight returns 3.
+
+Six regressions plus a NEGATIVE CONTROL (a valid quiesced ledger must still certify, so the validator does not simply refuse everything). Sabotage - validator accepts everything - FAILED (3 failures, 2 errors).
+
+## Suite inventory, all three invocations (Henry p1910gg, reintroduced by me and now guarded)
+```
+direct   python3 test_stepc.py                      Ran 40 tests in 0.034s
+module   python3 -m unittest test_stepc               Ran 40 tests in 0.034s
+discover python3 -m unittest discover -p ...        Ran 40 tests in 0.034s
+```
+I reintroduced the defect by appending TestRollbackSafety after the runner. It is now asserted STRUCTURALLY: an AST check fails if any TestCase class is defined after the runner block. Verified it catches an appended class.
+
+A subprocess test that re-invoked this file was written and REMOVED: it spawned itself recursively, 808 processes before I killed them by PID (pattern-killing had already killed my own shell). The AST check catches the real defect without executing anything.

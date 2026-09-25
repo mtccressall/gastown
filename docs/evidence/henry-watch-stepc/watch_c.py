@@ -124,6 +124,38 @@ def write_state(ts, ids):
     os.replace(tmp, STATE)
 
 
+KNOWN_STAGES = {"intent", "delivered", "acked", "informational", "quarantined"}
+
+
+class LedgerInvalid(RuntimeError):
+    """The ledger is not a shape this adapter wrote. Never certify on it."""
+
+
+def validate_ledger(led):
+    """Fail CLOSED on anything unrecognised (Henry, C2 preflight review).
+
+    An unknown stage, a missing stage, a malformed entry or a non-object ledger
+    must NOT be read as 'no obligations'. Unknown data is an unknown obligation.
+    """
+    if not isinstance(led, dict):
+        raise LedgerInvalid(f"ledger is {type(led).__name__}, expected an object")
+    for mid, e in led.items():
+        if not isinstance(mid, str) or not mid:
+            raise LedgerInvalid(f"ledger key is not a message id: {mid!r}")
+        if not isinstance(e, dict):
+            raise LedgerInvalid(f"{mid}: entry is {type(e).__name__}, expected an object")
+        stage = e.get("stage")
+        if stage is None:
+            raise LedgerInvalid(f"{mid}: entry has no stage")
+        if stage not in KNOWN_STAGES:
+            raise LedgerInvalid(f"{mid}: unknown stage {stage!r}; known: {sorted(KNOWN_STAGES)}")
+        if stage in ("intent", "delivered", "informational", "quarantined") and not e.get("ts"):
+            raise LedgerInvalid(f"{mid}: stage {stage} requires a ts")
+        if stage == "intent" and e.get("ack") is not None and not isinstance(e["ack"], dict):
+            raise LedgerInvalid(f"{mid}: ack tuple is {type(e['ack']).__name__}, expected an object")
+    return led
+
+
 def unresolved_obligations(led):
     """Ids this adapter still owes something on. ROLLBACK SAFETY GATE.
 
@@ -131,10 +163,11 @@ def unresolved_obligations(led):
     'delivered' id with an unsent ACK sits BEHIND the watermark. The previous
     adapter has no ledger, so it can neither see nor discharge that obligation:
     rolling back with obligations outstanding DROPS them silently. Rollback is
-    safe only when this returns empty (Henry, C2 packet review).
+    safe only when this returns empty AND validate_ledger() accepted the data.
     """
+    validate_ledger(led)
     out = {}
-    for mid, e in (led or {}).items():
+    for mid, e in led.items():
         stage = e.get("stage")
         if stage == "intent":
             out[mid] = "ambiguous intent: delivery unconfirmed, needs reconciliation"
@@ -545,7 +578,12 @@ def preflight():
     except Exception as e:  # noqa: BLE001
         log(f"PREFLIGHT ERROR unreadable ledger: {e!r}")
         return 2
-    pend = unresolved_obligations(led)
+    try:
+        pend = unresolved_obligations(led)
+    except LedgerInvalid as e:
+        log(f"PREFLIGHT INVALID LEDGER, refusing to certify: {e}")
+        log("PREFLIGHT NOT SAFE TO ROLL BACK: unknown data is an unknown obligation")
+        return 3
     ts, ids = read_state()
     log(f"PREFLIGHT cursor={ts} ledger={len(led)} unresolved={len(pend)}")
     for mid, why in sorted(pend.items()):
