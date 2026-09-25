@@ -180,14 +180,46 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 		return false
 	}
 
-	// Commit the checkpoint
-	if _, err := runGitCmd(workDir, "commit", "-m", "WIP: checkpoint (auto)"); err != nil {
+	// Commit the checkpoint UNDER THE POLECAT'S IDENTITY, not the ambient one.
+	//
+	// This commits work the AGENT wrote. With no -c override git uses whatever
+	// user.name the worktree inherits, which is frequently a human: measured
+	// 2026-09-25 across every branch in both repos, matching the SUBJECT line,
+	//
+	//     live-op   34 of 34 checkpoint commits authored "Marc Cressall"
+	//     gastown    4 of 183 (the rest carry "coder" and agent identities)
+	//
+	// so `git blame` names a person for code an agent wrote, and a reviewer
+	// reading the head of such a branch sees a near-empty diff because the real
+	// change sits in a checkpoint above it. The inverse of the problem this town
+	// already guards: we stop an agent's WORDS being read as the human's, while
+	// its CODE was being committed as the human's automatically (gt-kb3ry).
+	//
+	// None of these has reached main — they live on polecat branches — so the
+	// permanent record is not yet wrong, which is why this is a fix and not a
+	// cleanup.
+	name, email := checkpointCommitIdentity(rigName, polecatName)
+	if _, err := runGitCmdAs(workDir, name, email, "commit", "-m", "WIP: checkpoint (auto)"); err != nil {
 		d.logger.Printf("checkpoint_dog: git commit failed in %s/%s: %v", rigName, polecatName, err)
 		return false
 	}
 
 	d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
 	return true
+}
+
+// checkpointCommitIdentity returns the git author for an auto-checkpoint.
+//
+// MIRRORS internal/cmd/commit.go's identityToEmail, which is the source of
+// truth for agent git identity — "gastown/crew/jack" becomes
+// "gastown.crew.jack@gastown.local". It is duplicated rather than imported
+// because internal/cmd imports internal/daemon, so the daemon cannot import
+// back without a cycle. checkpoint_dog_identity_test.go pins the format so the
+// two cannot drift silently.
+func checkpointCommitIdentity(rigName, polecatName string) (name, email string) {
+	name = rigName + "/polecats/" + polecatName
+	email = strings.ReplaceAll(name, "/", ".") + "@gastown.local"
+	return name, email
 }
 
 // isGitWorktree reports whether the given directory is the root of a git
@@ -229,9 +261,36 @@ func runGitCmd(workDir string, args ...string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// runGitCmdAs runs git with an explicit author AND committer.
+//
+// `-c user.name=` IS NOT ENOUGH, and a test caught that rather than a review:
+// GIT_AUTHOR_NAME outranks config, gastown itself exports it (handoff.go:923),
+// and the daemon inherits whatever its own environment carries. The first
+// version of this fix passed -c and produced
+//
+//	deacon <liveop.polecats.atom@gastown.local>
+//
+// the email applied, the NAME taken from an inherited GIT_AUTHOR_NAME. Setting
+// all four variables puts the identity at the precedence level that wins.
+func runGitCmdAs(workDir, name, email string, args ...string) (string, error) {
+	return runGitCmdRawEnv(workDir, []string{
+		"GIT_AUTHOR_NAME=" + name,
+		"GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name,
+		"GIT_COMMITTER_EMAIL=" + email,
+	}, args...)
+}
+
 func runGitCmdRaw(workDir string, args ...string) (string, error) {
+	return runGitCmdRawEnv(workDir, nil, args...)
+}
+
+func runGitCmdRawEnv(workDir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = workDir
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	util.SetDetachedProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
