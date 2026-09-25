@@ -95,10 +95,14 @@ likewise observed-use, not established exclusivity.
 ### Shared domains, stated as risks rather than dismissed
 - **credential**: one API key. **CORRECTED 2026-09-25 — my earlier claim that it was held only by this
   adapter and my interactive commands was WRONG.** `LIVEOP_API_KEY` is present in the environment of ALL
-  15 resident agent sessions, read from `/proc/<pid>/environ`, so every agent on this host has the
-  CAPABILITY to poll `#dev` and post as `agent:gas-new`. Observed use matches only the adapter and the
-  Mayor, but channel posts carry no process attribution, so that is not provable. The propagation root is
-  UNKNOWN. See REMOTE-INVENTORY.md finding 1; this unknown BLOCKS cutover.
+  15 resident agent sessions, read from `/proc/<pid>/environ`. **What that establishes and what it does
+  NOT:** it establishes that no resident session is EXCLUDED from polling `#dev`. It does NOT establish
+  that the variable holds the same key VALUE as the adapter's binding, nor that it resolves to
+  `agent:gas-new` — the **effective principal is UNRESOLVED**, and settling it needs one read-only call
+  Marc has not authorised. So "every agent can post as `agent:gas-new`" is itself an overstatement and is
+  withdrawn here. OBSERVED use matches only the adapter and the Mayor; channel posts carry no process
+  attribution, so observed use cannot be promoted to confinement. The propagation root is UNKNOWN.
+  See REMOTE-INVENTORY.md finding 1; this unknown BLOCKS cutover.
 - **durable state**: `~/gt/.runtime/henry-watch.{state,ledger.json,quarantine.json,gaps.json,lock}`. Sole
   writer is the adapter; the lock serialises ticks against each other.
 - **mail store**: the Dolt town store, shared with every agent. The adapter only appends mail to `mayor/`.
@@ -108,24 +112,37 @@ likewise observed-use, not established exclusivity.
 
 | consumer | reads #dev | ACK authority | claim/lease | launches workers | writes Mayor mail | writes adapter state |
 |---|---|---|---|---|---|---|
-| gt-henry-watch (this adapter) | yes | receipt ACK only | none | none | append only | sole writer |
+| gt-henry-watch (this adapter) | yes | receipt ACK only | none | none | append only | sole writer OBSERVED (same-UID sessions are not excluded from writing these paths) |
 | Mayor session (interactive) | on demand, by me | posts as agent:gas-new | none | dispatches beads | reads and archives | none |
-| other 14 agent sessions | no | none | own beads | own rigs | own mailboxes | none |
+| other 14 agent sessions | **not observed** (capability NOT excluded) | **none observed** (authority UNKNOWN) | own beads | own rigs | own mailboxes | none |
 | gt-overseer-drain | no | none | none | none | no | none |
 | gt-dolt-compact / offsite-backup | no | none | none | none | no (store maintenance) | none |
 | gt-merge-ready | no | none | none | none | no | none |
 
-**Identity alone does not clear an overlap, and I do not claim it does.** The distinction above is
-authority: only this adapter and the Mayor session can post as `agent:gas-new`, and only the adapter
-writes its state files. Ven and Hermes hold different identities AND have no ACK, claim or launch
-authority over our work; that pair of facts, not the identity alone, is why they are not conflicts.
+**Identity alone does not clear an overlap, and I do not claim it does.** **Nor does this table: every
+"no" and "none" in it is OBSERVED USE, not established capability.** Corrected 2026-09-25 (Henry): the
+sentence here previously read "only this adapter and the Mayor session CAN post as `agent:gas-new`",
+which asserts capability and contradicts the credential row above. What is supportable: only the adapter
+and the Mayor were OBSERVED posting, and only the adapter was observed writing its state files.
+**Whether any other resident session CAN is UNKNOWN and turns on the unresolved effective principal.**
+
+**The Ven / Hermes exclusion is likewise weakened.** Previously: they "hold different identities AND have
+no ACK, claim or launch authority over our work". The first half is observed in the channel; **the second
+half was asserted without evidence and I hold none** — their authority over our work is UNKNOWN, and the
+adapter's protection against them is its own allowlist, which is a control I implement rather than a fact
+about them.
 
 ### Unknowns, named rather than omitted — THESE BLOCK CUTOVER
-- **Henry-side consumers are not in my scope and I will not fabricate them.** Henry-side enumeration is
-  Henry-owned. Until it exists, an unknown consumer with overlapping delivery, claim or launch authority
-  is possible, and **an unknown consumer blocks cutover**. This is not a caveat to weigh; it is a gate.
-- Ordinary messaging gateways (Ven, Hermes) post to the same channel; they are **not** conflicts: they
-  hold different identities and the adapter quarantines them under the agreed allowlist.
+- **Henry-side consumers are Henry-owned and I will not fabricate them. His enumeration EXISTS** as
+  retained source and configuration slices consolidated in `UNRESOLVED-AUTHORITY-MATRIX.md` — "until it
+  exists" was true when written and is not now. **The gate is unchanged but its residuals are now named
+  rather than open-ended:** resident execution attribution, effective principal and configuration, and
+  fresh pre-cutover launch-surface evidence. Any of those unresolved **blocks cutover**. This is not a
+  caveat to weigh; it is a gate.
+- Ordinary messaging gateways (Ven, Hermes) post to the same channel. They are **not treated as
+  conflicts**, and the reason is a CONTROL rather than a finding about them: they post under different
+  observed identities and the adapter quarantines anything outside the agreed allowlist. **Their actual
+  authority over our work is UNKNOWN** — see the correction above.
 
 ## 3. Ownership, rules, sequence, rollback
 
