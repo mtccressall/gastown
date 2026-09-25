@@ -11,10 +11,15 @@ source PASS and this packet grant none.**
 evidence branch. It previously existed in two copies, and a repo-side identity fix was overwritten by a
 stale scratch copy on the next publish. Identity is now restated in the single source before each publish.
 
-**IDENTITY IS RESTATED, and the source PASS is historical.** Henry's source PASS covers commit
-`27945966` / content `56e5bc35…`. The preflight rollback gate and the ledger validator changed
-production bytes AFTER that, so the PASS does not extend to the candidate below and I do not present
-it as if it did. The affected source gates must be re-run against these bytes.
+**IDENTITY AND REVIEW STATE, current as of 2026-09-25T07:4xZ.** Henry's ORIGINAL source PASS covered
+`27945966` / content `56e5bc35…`, and the preflight gate plus the ledger validator changed production
+bytes after it. That is history: Henry has SINCE independently verified the current candidate
+`8c36415a` (delivered-shape repair, accumulated owner/crash/sabotage controls, disposition `377c04b6`),
+and the three packet findings on `1db9f79d` are closed. **So the source gates do NOT need re-running
+against these bytes** — that evidence exists and should be preserved rather than reproduced.
+What remains is NOT source: Henry's consumer inventory is incomplete, the remote half of the inventory
+in section 2 is AUTHOR-PROVIDED and not independently live-verified, and Marc's installation
+authorization is mandatory and separate.
 
 | | |
 |---|---|
@@ -37,6 +42,10 @@ Note on your caveat: `8f386008` is my measurement of the installed file, taken w
 host. You have not verified it live and I do not claim you have.
 
 ## 2. Consumer inventory
+
+**Provenance of this section: AUTHOR-PROVIDED.** Every row below is my measurement on this host. Henry
+has not independently live-verified it, and the Henry-side half does not exist yet. Treat it as a claim
+to check, not as verified fact.
 
 Scope swept: this host's user crontab, `systemctl --user` units, running processes, the town's tmux
 sessions, and every tracked file under `~/gt/bin`, `~/bin`, `~/.local/bin`, `~/gt/ci-runner` and the
