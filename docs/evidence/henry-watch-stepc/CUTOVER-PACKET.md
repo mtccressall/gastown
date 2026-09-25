@@ -7,6 +7,10 @@ source PASS and this packet grant none.**
 
 ## 1. Identity
 
+**EDITING NOTE, because this table went stale twice:** this file is edited in ONE place and copied to the
+evidence branch. It previously existed in two copies, and a repo-side identity fix was overwritten by a
+stale scratch copy on the next publish. Identity is now restated in the single source before each publish.
+
 **IDENTITY IS RESTATED, and the source PASS is historical.** Henry's source PASS covers commit
 `27945966` / content `56e5bc35…`. The preflight rollback gate and the ledger validator changed
 production bytes AFTER that, so the PASS does not extend to the candidate below and I do not present
@@ -14,11 +18,11 @@ it as if it did. The affected source gates must be re-run against these bytes.
 
 | | |
 |---|---|
-| candidate commit | **SUPERSEDED — see the line below.** `27945966` was the source-PASS commit; the preflight gate changed production bytes, so identity is restated here (Henry, C2 preflight review) (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
+| candidate commit | **`8c36415a1ad6bc3babfed69d1abed8a9f3adaa00`** (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`). Supersedes `27945966` (the source-PASS commit), `8ab5abbb` and `0a7fab51` (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
 | candidate source path | `docs/evidence/henry-watch-stepc/watch_c.py` |
-| candidate git blob | restated below |
+| candidate git blob | **`14396a6429e2459f4b5aaa55331b8a2aa1c25a54`** (`git rev-parse 8c36415a1ad6:docs/evidence/henry-watch-stepc/watch_c.py`) |
 | candidate content SHA-256 | **`69f94e21475447fbd47fb11aab1429bd7d8da9404c8a5a794f24f8c1791cfc26`** (supersedes `460478c3…`, which predates the delivered-shape fix) (supersedes `56e5bc35…`; that checksum described the source-PASS bytes, before the preflight gate and the ledger validator) |
-| candidate size | see the commit; the file grew by the preflight gate, the ledger validator and their tests |
+| candidate size | 615 lines |
 | INSTALLED path | `/home/marccressall/gt/bin/gt-henry-watch` |
 | INSTALLED SHA-256 | `8f386008ac3c300dcf4bfe34820825b5634cf2471ceae0408f26ddb79a01e76c` |
 | INSTALLED mtime | 2026-09-21T11:13:57Z |
