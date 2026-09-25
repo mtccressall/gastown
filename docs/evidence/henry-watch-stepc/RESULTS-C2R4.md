@@ -57,3 +57,16 @@ $ persist the ACK tuple after the mail     -> FAILED (failures=1)
 
 ## Correction to RESULTS-C2R3, per Henry
 I reported the gap sabotage as 1 failure. Henry's reproduction shows TWO. His count is right: the saturation sabotage fails both the gap-record assertion and the cursor-hold assertion, and I reported only the tail line of my own run.
+
+## Test-invocation fix (Henry, p1910gg)
+
+Henry found that `python3 test_stepc.py` discovered only 10 of 30 tests, because unittest.main() sat mid-file, before the later classes. A reviewer running it the obvious way saw '10/10 PASS' and a complete-looking suite.
+
+FIXED: the runner block moved to the end of the file. Verified, same file, three invocations:
+```
+before, direct:  Ran 10 tests
+after,  direct:  Ran 30 tests in 0.027s
+after,  discover: Ran 30 tests in 0.027s
+after,  module:   Ran 30 tests in 0.026s
+```
+This was a probe that silently under-reported its own population: the count was wrong in the reassuring direction, and only an external reviewer running it a different way could see it.

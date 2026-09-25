@@ -191,8 +191,6 @@ class TestIntake(Harness):
         self.assertEqual(self.posts, [], "no ACK may be posted when durable state could not be written")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestC2Allowlist(Harness):
@@ -478,3 +476,7 @@ class TestC2R4(Harness):
         self.run_tick()
         self.assertEqual(self.posts, [], "an unreconciled intent must not be ACKed")
         self.assertEqual(self.m.read_ledger()["c2"]["stage"], "intent", "and must stay intent")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
