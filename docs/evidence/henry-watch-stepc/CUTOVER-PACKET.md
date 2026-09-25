@@ -132,6 +132,21 @@ half was asserted without evidence and I hold none** — their authority over ou
 adapter's protection against them is its own allowlist, which is a control I implement rather than a fact
 about them.
 
+### What the shorthand in this section does NOT certify (Henry, 116d1495 disposition)
+
+**Accepted 2026-09-25 and recorded here rather than only in the channel, because this file is what
+someone reads at cutover.** The phrases `one API key`, `sole writer` and `not treated as conflicts` are
+SHORTHAND. **None of them is certified confinement or consumer clearance.** In particular:
+
+**A CHANNEL ALLOWLIST CANNOT ESTABLISH THAT ANOTHER CONSUMER IS UNABLE TO CLAIM OR LAUNCH THE SAME WORK
+INDEPENDENTLY.** The allowlist governs what THIS adapter will act on. It says nothing about what another
+consumer can do on its own initiative, through any path, including paths that never touch this channel.
+Treating it as clearance confuses a control I implement with a property of the world.
+
+The explicit unknown-capability and cutover-blocked statements above GOVERN this section; where the
+shorthand and those statements appear to disagree, the statements win. Retained and unclosed:
+attribution, effective configuration, effective principal, and freshness of the launch-surface evidence.
+
 ### Unknowns, named rather than omitted — THESE BLOCK CUTOVER
 - **Henry-side consumers are Henry-owned and I will not fabricate them. His enumeration EXISTS** as
   retained source and configuration slices consolidated in `UNRESOLVED-AUTHORITY-MATRIX.md` — "until it
