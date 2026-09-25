@@ -480,3 +480,43 @@ class TestC2R4(Harness):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRollbackSafety(Harness):
+    """Henry's C2 packet finding: the cursor advances BEFORE the ACK, so a
+    rollback with outstanding obligations drops them silently. Proven in
+    isolation, and gated by a preflight that must refuse."""
+
+    def test_delivered_but_unacked_is_an_unresolved_obligation(self):
+        self.seed()
+        self.window = [msg("d1", "2026-09-25T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST")]
+        self.fail_post = True                      # ACK fails, stays owed
+        self.run_tick()
+        led = self.m.read_ledger()
+        self.assertEqual(led["d1"]["stage"], "delivered")
+        # the cursor has ALREADY advanced past it, which is the hazard
+        ts, _ = self.m.read_state()
+        self.assertEqual(ts, "2026-09-25T01:00:00.000Z", "cursor advanced before the ACK")
+        pend = self.m.unresolved_obligations(led)
+        self.assertIn("d1", pend, "a delivered-but-unacked id is an obligation")
+        self.assertIn("behind the cursor", pend["d1"])
+        self.assertEqual(self.m.preflight(), 1, "preflight must REFUSE rollback")
+
+    def test_ambiguous_intent_is_an_unresolved_obligation(self):
+        self.seed()
+        led = {"i1": {"stage": "intent", "ts": "2026-09-25T01:00:00.000Z",
+                      "ack": {"id": "i1", "timestamp": "2026-09-25T01:00:00.000Z", "metadata": {}}}}
+        self.m.write_ledger(led)
+        pend = self.m.unresolved_obligations(led)
+        self.assertIn("i1", pend, "an unreconciled intent is an obligation")
+        self.assertIn("ambiguous", pend["i1"])
+        self.assertEqual(self.m.preflight(), 1, "preflight must REFUSE rollback")
+
+    def test_quiesced_ledger_permits_rollback(self):
+        self.seed()
+        self.window = [msg("q1", "2026-09-25T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST")]
+        self.run_tick()                            # delivered AND acked
+        led = self.m.read_ledger()
+        self.assertEqual(led["q1"]["stage"], "acked")
+        self.assertEqual(self.m.unresolved_obligations(led), {}, "nothing owed")
+        self.assertEqual(self.m.preflight(), 0, "preflight permits rollback when quiesced")

@@ -62,9 +62,26 @@ recipient of everything this adapter delivers.
 - **mail store**: the Dolt town store, shared with every agent. The adapter only appends mail to `mayor/`.
 - **dedupe domain**: the ledger is keyed by the channel's server-assigned message id, globally unique.
 
-### Unknowns, named rather than omitted
-- **Henry-side consumers are not in my scope** and I have not enumerated them. If any Henry-side process
-  also ACKs on `#dev` as `agent:gas-new`, that is a conflict I cannot see from here.
+### Authority matrix (overlap classified by WORK and STATE authority, not by identity)
+
+| consumer | reads #dev | ACK authority | claim/lease | launches workers | writes Mayor mail | writes adapter state |
+|---|---|---|---|---|---|---|
+| gt-henry-watch (this adapter) | yes | receipt ACK only | none | none | append only | sole writer |
+| Mayor session (interactive) | on demand, by me | posts as agent:gas-new | none | dispatches beads | reads and archives | none |
+| other 14 agent sessions | no | none | own beads | own rigs | own mailboxes | none |
+| gt-overseer-drain | no | none | none | none | no | none |
+| gt-dolt-compact / offsite-backup | no | none | none | none | no (store maintenance) | none |
+| gt-merge-ready | no | none | none | none | no | none |
+
+**Identity alone does not clear an overlap, and I do not claim it does.** The distinction above is
+authority: only this adapter and the Mayor session can post as `agent:gas-new`, and only the adapter
+writes its state files. Ven and Hermes hold different identities AND have no ACK, claim or launch
+authority over our work; that pair of facts, not the identity alone, is why they are not conflicts.
+
+### Unknowns, named rather than omitted — THESE BLOCK CUTOVER
+- **Henry-side consumers are not in my scope and I will not fabricate them.** Henry-side enumeration is
+  Henry-owned. Until it exists, an unknown consumer with overlapping delivery, claim or launch authority
+  is possible, and **an unknown consumer blocks cutover**. This is not a caveat to weigh; it is a gate.
 - Ordinary messaging gateways (Ven, Hermes) post to the same channel; they are **not** conflicts: they
   hold different identities and the adapter quarantines them under the agreed allowlist.
 
@@ -89,11 +106,27 @@ recipient of everything this adapter delivers.
   `gt-henry-watch.bak-<UTC>`; 4. candidate written by atomic rename; 5. checksum verified to equal
   `56e5bc35…`; 6. one manual run with output captured UNFILTERED to a file; 7. cron restored; 8. first
   natural tick observed.
-- **Rollback**: restore the backup by atomic rename and restore the cron line. **State-compatible**: the
-  installed copy ignores the three new files and reads the same `{ts, ids}` state, so rollback loses no
-  cursor and causes no replay. Pending intents and unsent ACKs recorded by the candidate would remain in
-  `ledger.json`, unread by the old copy and still there if the candidate is reinstated — that is the one
-  asymmetry, and it loses nothing.
+- **Rollback — CORRECTED, my earlier claim was WRONG (Henry, C2 packet review).** I wrote that rollback
+  is state-compatible and "loses nothing". False. The cursor advances INSIDE the delivery loop, BEFORE
+  the ACK pass (`write_state` at the end of each delivered message; the ACK pass runs after the loop).
+  So a **delivered-but-unacked** id sits BEHIND the watermark, and the previous adapter has no ledger,
+  so it can neither see nor discharge that obligation: rolling back with obligations outstanding **drops
+  them silently**. Preserved bytes are not recovery.
+- **Rollback is therefore GATED, not promised.** `gt-henry-watch --preflight` is read-only and
+  enumerates unresolved obligations:
+  - `intent` — delivery unconfirmed, needs reconciliation;
+  - `delivered` with an ACK owed — the ACK is behind the cursor.
+  It exits 1 and prints `NOT SAFE TO ROLL BACK` while any exist, 0 only when quiesced. **Rollback
+  proceeds only on a 0.** If obligations exist the options are: let the candidate run until it
+  quiesces, then snapshot and roll back; or hand recovery to a separately reviewed owner. Neither is
+  "restore the file and hope".
+- **Proven in isolation, not asserted** (3 tests, both sabotages caught):
+  - delivered-but-unacked: cursor demonstrably already past it, listed as an obligation, preflight refuses;
+  - ambiguous intent: listed as an obligation, preflight refuses;
+  - quiesced ledger: nothing owed, preflight permits.
+- **Live preflight against the current installed state**: `cursor=2026-09-25T06:24:49.176Z ledger=0
+  unresolved=0`, quiesced — because the installed copy keeps no ledger, which is exactly why a rollback
+  AFTER the candidate has run is the case that needs the gate.
 
 ## 4. Proposed post-authorization proof (bounded, not yet run)
 
@@ -112,8 +145,35 @@ recipient of everything this adapter delivers.
 - **Stop conditions**: any duplicate delivery, any ACK for a message not addressed to `agent:gas-new`, any
   advance past an unread row, any quarantine miss, or any write outside the four state files → revert
   immediately by the rollback above and report.
-- **Evidence paths**: `~/gt/.runtime/henry-watch.log` (unfiltered), the three state files, the delivered
-  bead ids, and the ACK post ids, published to the evidence branch.
+- **Evidence handling — CORRECTED (Henry, C2 packet review). Raw logs and runtime files are NOT
+  published.** The log records message subjects and exception text, and the state files record message
+  ids and correlation; none of it is mine to publish to a branch. Raw evidence stays LOCAL and
+  protected at the paths below; what gets published is an allowlisted, sanitized extract: message ids,
+  bead ids, ACK post ids, checksums, counts and pass/fail results, each checked for secrets and private
+  content before it leaves this host.
+- **Exact paths, enumerated**:
+  - state `~/gt/.runtime/henry-watch.state` — cursor `{ts, ids}`
+  - ledger `~/gt/.runtime/henry-watch.ledger.json` — per-id stage and ACK tuple
+  - quarantine `~/gt/.runtime/henry-watch.quarantine.json` — refusals, reasons, NO payloads
+  - gaps `~/gt/.runtime/henry-watch.gaps.json` — saturation records
+  - lock `~/gt/.runtime/henry-watch.lock` — tick serialisation, zero bytes
+  - log `~/gt/.runtime/henry-watch.log` — append only, LOCAL
+- **Writes classified**: PERMITTED are the six paths above, one Gastown mail bead per delivered message
+  to `mayor/`, one nudge to `mayor`, and one receipt ACK post per actionable message. ANY other write —
+  to the repo, to another agent's mailbox, to the channel beyond receipt ACKs, or to any file outside
+  those six — is UNEXPECTED and is a stop condition.
 
 **Refresh before cutover**: this inventory is a snapshot of 2026-09-25T06:1xZ and will be re-run
 immediately before any installation, because a new consumer could appear in between.
+
+## Rollback-safety evidence (Henry C2 packet review, finding 1)
+
+```
+$ python3 -m unittest test_stepc   # 33 tests incl. 3 rollback-safety
+Ran 33 tests in 0.030s
+
+OK
+
+sabotage: obligations always empty -> FAILED (failures=2)
+sabotage: preflight never refuses -> FAILED (failures=2)
+```

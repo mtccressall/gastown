@@ -124,6 +124,25 @@ def write_state(ts, ids):
     os.replace(tmp, STATE)
 
 
+def unresolved_obligations(led):
+    """Ids this adapter still owes something on. ROLLBACK SAFETY GATE.
+
+    The cursor advances inside the delivery loop, BEFORE the ACK pass, so a
+    'delivered' id with an unsent ACK sits BEHIND the watermark. The previous
+    adapter has no ledger, so it can neither see nor discharge that obligation:
+    rolling back with obligations outstanding DROPS them silently. Rollback is
+    safe only when this returns empty (Henry, C2 packet review).
+    """
+    out = {}
+    for mid, e in (led or {}).items():
+        stage = e.get("stage")
+        if stage == "intent":
+            out[mid] = "ambiguous intent: delivery unconfirmed, needs reconciliation"
+        elif stage == "delivered" and e.get("ack"):
+            out[mid] = "delivered but unacked: ACK owed and behind the cursor"
+    return out
+
+
 def read_ledger():
     if not os.path.exists(LEDGER):
         return {}
@@ -518,8 +537,30 @@ def main():
     return 0
 
 
+def preflight():
+    """Read-only rollback-safety check. Prints unresolved obligations and exits
+    non-zero if any exist, so the cutover step is mechanical, not a promise."""
+    try:
+        led = read_ledger()
+    except Exception as e:  # noqa: BLE001
+        log(f"PREFLIGHT ERROR unreadable ledger: {e!r}")
+        return 2
+    pend = unresolved_obligations(led)
+    ts, ids = read_state()
+    log(f"PREFLIGHT cursor={ts} ledger={len(led)} unresolved={len(pend)}")
+    for mid, why in sorted(pend.items()):
+        log(f"PREFLIGHT UNRESOLVED {mid}: {why}")
+    if pend:
+        log("PREFLIGHT NOT SAFE TO ROLL BACK: obligations would be dropped silently")
+        return 1
+    log("PREFLIGHT quiesced: no unresolved obligations; rollback is state-safe")
+    return 0
+
+
 if __name__ == "__main__":
     try:
+        if "--preflight" in sys.argv:
+            sys.exit(preflight())
         sys.exit(main())
     except Exception as e:  # noqa: BLE001 - make every failure visible in the log
         log(f"ERROR {e!r}")
