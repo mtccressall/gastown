@@ -112,8 +112,7 @@ authority over our work; that pair of facts, not the identity alone, is why they
   ledger, so the first candidate tick inherits the installed cursor and replays nothing.
 - **Cutover sequence** (proposed, not executed): 1. `gt mail inbox` count and last-seen recorded; 2. cron
   line commented out and the absence of a running tick confirmed; 3. current file copied to
-  `gt-henry-watch.bak-<UTC>`; 4. candidate written by atomic rename; 5. checksum verified to equal
-  `56e5bc35…`; 6. one manual run with output captured UNFILTERED to a file; 7. cron restored; 8. first
+  `gt-henry-watch.bak-<UTC>`; 4. candidate written by atomic rename; 5. `sha256sum` of the installed file verified to equal **the candidate content SHA-256 in section 1 of this packet** (a literal is deliberately NOT repeated here: it went stale twice already); 6. one manual run with output captured UNFILTERED to a file; 7. cron restored; 8. first
   natural tick observed.
 - **Rollback — CORRECTED, my earlier claim was WRONG (Henry, C2 packet review).** I wrote that rollback
   is state-compatible and "loses nothing". False. The cursor advances INSIDE the delivery loop, BEFORE
@@ -149,11 +148,23 @@ authority over our work; that pair of facts, not the identity alone, is why they
 4. **Delivery is not execution**: the proof asserts only that a message was delivered and acknowledged. It
    does NOT claim the Mayor acted on it. Worker execution evidence, where it matters, is the bead trail,
    not the ACK.
-- **Allowed side effects**: channel reads; ONE receipt ACK per actionable message; Gastown mail to `mayor/`;
-  a nudge to `mayor`; writes to the four runtime files. Nothing else.
+- **Allowed side effects**, one consistent scope used everywhere in this packet: channel reads; ONE receipt
+  ACK per actionable message; one Gastown mail bead to `mayor/` per delivered message; one nudge to
+  `mayor`; and writes to the **SIX** paths enumerated below (state, ledger, quarantine, gaps, lock, log).
+  Nothing else. (An earlier draft said "four runtime files" in one place and six in another; six is correct
+  — the lock and the log are written every tick.)
 - **Stop conditions**: any duplicate delivery, any ACK for a message not addressed to `agent:gas-new`, any
-  advance past an unread row, any quarantine miss, or any write outside the four state files → revert
-  immediately by the rollback above and report.
+  advance past an unread row, any quarantine miss, or any write outside those six paths and three side
+  effects.
+- **On a stop condition the order is FIXED, and it does NOT bypass the rollback gate:**
+  1. **Stop scheduling and stop new intake first** — comment out the cron line, confirm no tick is running.
+     This halts the bleeding without touching state.
+  2. **Then run `--preflight`.**
+  3. **Roll the binary back only on preflight 0**, or hand obligation recovery to a separately reviewed
+     owner first. Rolling back with obligations outstanding is the exact failure this packet documents:
+     the previous copy has no ledger and drops them silently. **"Revert immediately" is withdrawn as a
+     procedure; it contradicted the gate in section 3.**
+  4. Report, with the evidence paths below.
 - **Evidence handling — CORRECTED (Henry, C2 packet review). Raw logs and runtime files are NOT
   published.** The log records message subjects and exception text, and the state files record message
   ids and correlation; none of it is mine to publish to a branch. Raw evidence stays LOCAL and
