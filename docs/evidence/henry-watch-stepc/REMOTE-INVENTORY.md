@@ -8,7 +8,7 @@ finding 1.**
 |---|---|
 | host | `amd-halo` |
 | UID | `marccressall` (single UID for every surface below) |
-| measured at | **2026-09-25T09:35:59Z** exactly (census.py emits its own observation time; the earlier `09:3xZ` is replaced) |
+| measured at | **2026-09-25T09:46:53Z** — ONE run, and the document and the raw output now come from THAT run. An earlier version quoted 09:35:59Z in prose against a 09:36:56Z raw capture: two separate runs, which Henry caught. Every figure below is from the single run at 2026-09-25T09:46:53Z|
 
 ## FINDING 1 — CORRECTED TWICE. Read all three versions; the third is the measured one.
 
@@ -18,7 +18,7 @@ commands run by me."
 **v2 (my first correction, OVERSTATED):** every agent session holds the key, so every agent "has the
 capability to post as `agent:gas-new`". Presence was right; the capability conclusion was not measured.
 
-**v3, MEASURED 2026-09-25T09:35:59Z, boolean-only comparison, no value or hash emitted:**
+**v3, MEASURED 2026-09-25T09:46:53Z, boolean-only comparison, no value or hash emitted:**
 
 | fact | status |
 |---|---|
@@ -26,14 +26,18 @@ capability to post as `agent:gas-new`". Presence was right; the capability concl
 | that value **differs from the adapter's binding** in all 15 (`same=NO`, 15/15) | ESTABLISHED |
 | the sessions carry **only** `LIVEOP_API_KEY`, and none of `LIVEOP_API_URL`, `LIVEOP_AGENT_ID`, `LIVEOP_AGENT_INBOX_CHANNEL` | ESTABLISHED |
 | whether the sessions' key resolves to `agent:gas-new` | **UNKNOWN** — deciding it means USING another credential to see what identity the server stamps, which I have not done and am not authorised to do |
-| propagation root | **FOUND**: the tmux server process (pid 3539834, comm `tmux: server`, started 2026-09-12T00:56:09Z) carries a key; every pane inherits it. Server key == Mayor session key, and both differ from the adapter's binding |
+| propagation root | **MEASURED PER PANE, no longer an inference**: for all 15 panes the parent is pid 3539834 (`tmux: server`, started 2026-09-12T00:56:09Z) with `key=True same_as_pane=True same_as_adapter=False`. The equality is emitted per pane rather than asserted once, and the earlier version proved only PRESENCE at a deduplicated ancestor |
 
 So Henry's caution was exactly right: **environment presence alone establishes neither an equal
 credential value nor effective permissions.** Presence is 15/15; equality with the adapter's binding is
 0/15. My v2 conclusion is withdrawn.
 
-**What this does and does not mean.** The sessions cannot post using the adapter's binding, because they
-do not have it. Whether their own key grants the same *identity* is unknown, and an older or rotated key
+**WHAT THIS DOES NOT MEAN, and Henry's point 4 is decisive.** Unequal values in the measured ENVIRONMENTS
+do NOT establish that a session cannot obtain the adapter's binding by another route. Measured: the
+binding file is mode `-rw-------` owned by `marccressall`, and every agent session runs as
+`marccressall`. **So any session can simply READ the adapter's credential from disk.** Capability is
+therefore NOT excluded by this census; only environment inheritance is. The sessions do not HOLD the
+adapter binding in their environment, which is a much narrower claim than the one I made. Whether their own key grants the same *identity* is unknown, and an older or rotated key
 for the same agent would still stamp `agent:gas-new`. Until that is resolved it stays an unknown, and
 under the packet's rule an unknown consumer authority blocks cutover.
 
@@ -101,7 +105,7 @@ that I can offer, which matches the limit you hit on your side.
 | dedupe domain | the channel's server-assigned message id, globally unique. The ledger is keyed by it |
 | mail domain | appends to `mayor/` in the shared Dolt town store; every agent shares that store |
 
-## Explicit unknowns (reconciled against finding 1, 2026-09-25T09:3xZ)
+## Explicit unknowns (reconciled against finding 1, 2026-09-25T09:46:53Z)
 
 1. ~~Propagation root of the credential~~ — **RESOLVED by the census**: the tmux server (pid 3539834,
    started 2026-09-12T00:56:09Z) carries a key and every pane inherits it. Consequence that remains: any
@@ -121,3 +125,21 @@ that I can offer, which matches the limit you hit on your side.
 
 **Under the packet's own rule, unknowns 2 and 3 block cutover** until Henry and Marc decide they are
 acceptable or they are closed. I am not proposing to install over them.
+
+## Census v2 — completeness defects corrected (Henry c2-census review)
+
+| Henry's finding | correction |
+|---|---|
+| (1) document said 09:35:59Z, raw output 09:36:56Z — two runs | ONE run; the document quotes the run's own emitted timestamp, and all residual `09:3xZ` placeholders are gone |
+| (2) ancestor loop proved presence only, deduplicated by PID, emitted no equality or per-pane linkage | PER-PANE lineage for all 15: parent pid, comm, `key=`, `same_as_pane=`, `same_as_adapter=`, start time and identity stability. Presence booleans for API_URL / AGENT_ID / AGENT_INBOX_CHANNEL are now EMITTED per pane rather than asserted in prose |
+| (3) tmux exit 1 plus unreadable binding returned normally with sessions_examined=0 | counts emitted (`enumerated`, `examined`, `unreadable`, `identity_changed`), `census_complete=` stated, and the script FAILS LOUD: rc=2 enumeration, rc=3 binding unreadable, rc=4 incomplete. PID identity is bracketed before AND after each environ read so a recycled pid is reported, not attributed |
+| (4) unequal binding in measured environments does not prove same-UID sessions cannot access it elsewhere | ACCEPTED AND DECISIVE: the binding file is `-rw-------` owned by the same UID every session runs as, so any session can READ it. Capability is NOT excluded; only environment inheritance is |
+
+### Failure controls, exit code captured directly (not through a pipe)
+```
+tmux absent from PATH      rc=2  FATAL tmux not executable
+binding unreadable         rc=3  FATAL binding unreadable
+a pane that cannot be read rc=4  FATAL incomplete census
+clean run                  rc=0  census_complete=True
+```
+Two of my own controls were invalid on the first attempt and are reported rather than quietly redone: one ran without `python3` on PATH so it tested nothing, and one read `$?` after a pipe, which reports `tail`'s status. The tmux-absent case then exposed a real gap — a missing binary raised an uncaught error and exited 1 instead of the documented 2 — now fixed.

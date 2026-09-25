@@ -1,21 +1,36 @@
-# observed_at_utc=2026-09-25T09:36:56Z host=amd-halo uid=1001
-# adapter_binding_readable=yes  (value never emitted)
-session                 pane_pid  start_ticks             start_utc  key  same  role
-be-witness               3592198     15871000  2026-09-12T00:57:25Z True    NO  beadsrig/witness
-gastown-citrine          1150325     18391944  2026-09-12T07:57:34Z True    NO  gastown/polecats/citrine
-gastown-refinery         3592434     15871029  2026-09-12T00:57:25Z True    NO  gastown/refinery
-gastown-witness          3592187     15870999  2026-09-12T00:57:24Z True    NO  gastown/witness
-hq-boot                  1019692     53877770  2026-09-16T10:31:52Z True    NO  deacon/boot
-hq-deacon                3020863     42056108  2026-09-15T01:41:36Z True    NO  deacon
-hq-mayor                  612458     98681143  2026-09-21T14:59:06Z True    NO  mayor
-liveop-atom              3111079     75321255  2026-09-18T22:05:47Z True    NO  liveop/polecats/atom
-liveop-foundation        3733790     99533270  2026-09-21T17:21:07Z True    NO  liveop/polecats/foundation
-liveop-guzzle            2671802    100353209  2026-09-21T19:37:47Z True    NO  liveop/polecats/guzzle
-liveop-institute         3055700     49305845  2026-09-15T21:49:53Z True    NO  liveop/polecats/institute
-liveop-refinery          3559011     15866215  2026-09-12T00:56:37Z True    NO  liveop/refinery
-liveop-synth             2785101    100377676  2026-09-21T19:41:51Z True    NO  liveop/polecats/synth
-liveop-witness           3550527     15864890  2026-09-12T00:56:23Z True    NO  liveop/witness
-steward-witness          3592210     15871000  2026-09-12T00:57:25Z True    NO  steward/witness
-# sessions_examined=15
-# launcher inheritance probe (nearest ancestor carrying the key):
-#   ancestor pid=3539834 comm=tmux: server role=<unset> started=2026-09-12T00:56:09Z HAS key
+# census_version=2  observed_at_utc=2026-09-25T09:46:53Z  host=amd-halo  uid=1001
+# adapter_binding_readable=yes (value never emitted)
+# columns: session pane_pid start_ticks start_utc identity_stable API_KEY API_URL AGENT_ID AGENT_INBOX_CHANNEL same_as_adapter role
+be-witness 3592198 15871000 2026-09-12T00:57:25Z True True False False False NO beadsrig/witness
+gastown-citrine 1150325 18391944 2026-09-12T07:57:34Z True True False False False NO gastown/polecats/citrine
+gastown-refinery 3592434 15871029 2026-09-12T00:57:25Z True True False False False NO gastown/refinery
+gastown-witness 3592187 15870999 2026-09-12T00:57:24Z True True False False False NO gastown/witness
+hq-boot 1019692 53877770 2026-09-16T10:31:52Z True True False False False NO deacon/boot
+hq-deacon 3020863 42056108 2026-09-15T01:41:36Z True True False False False NO deacon
+hq-mayor 612458 98681143 2026-09-21T14:59:06Z True True False False False NO mayor
+liveop-atom 3111079 75321255 2026-09-18T22:05:47Z True True False False False NO liveop/polecats/atom
+liveop-foundation 3733790 99533270 2026-09-21T17:21:07Z True True False False False NO liveop/polecats/foundation
+liveop-guzzle 2671802 100353209 2026-09-21T19:37:47Z True True False False False NO liveop/polecats/guzzle
+liveop-institute 3055700 49305845 2026-09-15T21:49:53Z True True False False False NO liveop/polecats/institute
+liveop-refinery 3559011 15866215 2026-09-12T00:56:37Z True True False False False NO liveop/refinery
+liveop-synth 2785101 100377676 2026-09-21T19:41:51Z True True False False False NO liveop/polecats/synth
+liveop-witness 3550527 15864890 2026-09-12T00:56:23Z True True False False False NO liveop/witness
+steward-witness 3592210 15871000 2026-09-12T00:57:25Z True True False False False NO steward/witness
+# enumerated=15 examined=15 unreadable=0 identity_changed=0
+# PER-PANE LINEAGE: pane -> ancestors, with boolean key-equality at each hop
+#   be-witness 3592198 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   gastown-citrine 1150325 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   gastown-refinery 3592434 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   gastown-witness 3592187 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   hq-boot 1019692 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   hq-deacon 3020863 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   hq-mayor 612458 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-atom 3111079 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-foundation 3733790 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-guzzle 2671802 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-institute 3055700 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-refinery 3559011 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-synth 2785101 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   liveop-witness 3550527 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+#   steward-witness 3592210 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+# census_complete=True
