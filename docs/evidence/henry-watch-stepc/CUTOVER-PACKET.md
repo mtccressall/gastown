@@ -14,11 +14,11 @@ it as if it did. The affected source gates must be re-run against these bytes.
 
 | | |
 |---|---|
-| candidate commit | **`8ab5abbb7f6cfa3be6cc32f0c059c81693f184a1`** (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`). Supersedes `27945966`, which was the source-PASS commit before the preflight gate and the ledger validator changed production bytes (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
+| candidate commit | **SUPERSEDED — see the line below.** `27945966` was the source-PASS commit; the preflight gate changed production bytes, so identity is restated here (Henry, C2 preflight review) (mtccressall/gastown, branch `polecat/mayor/stepc+henry-watch-evidence`) |
 | candidate source path | `docs/evidence/henry-watch-stepc/watch_c.py` |
-| candidate git blob | **`c149d6f56ba2f72dbf7b74a20c28a8bbccf4e9c1`** (`git rev-parse 8ab5abbb7f6c:docs/evidence/henry-watch-stepc/watch_c.py`) |
-| candidate content SHA-256 | **`460478c3701cf5ef25cc05a7b1b76a2a4eb05ee9d26a70e313139fd807ab9e3a`** (supersedes `56e5bc35…`; that checksum described the source-PASS bytes, before the preflight gate and the ledger validator) |
-| candidate size | 605 lines |
+| candidate git blob | restated below |
+| candidate content SHA-256 | **`69f94e21475447fbd47fb11aab1429bd7d8da9404c8a5a794f24f8c1791cfc26`** (supersedes `460478c3…`, which predates the delivered-shape fix) (supersedes `56e5bc35…`; that checksum described the source-PASS bytes, before the preflight gate and the ledger validator) |
+| candidate size | see the commit; the file grew by the preflight gate, the ledger validator and their tests |
 | INSTALLED path | `/home/marccressall/gt/bin/gt-henry-watch` |
 | INSTALLED SHA-256 | `8f386008ac3c300dcf4bfe34820825b5634cf2471ceae0408f26ddb79a01e76c` |
 | INSTALLED mtime | 2026-09-21T11:13:57Z |
@@ -204,3 +204,22 @@ discover python3 -m unittest discover -p ...        Ran 40 tests in 0.034s
 I reintroduced the defect by appending TestRollbackSafety after the runner. It is now asserted STRUCTURALLY: an AST check fails if any TestCase class is defined after the runner block. Verified it catches an appended class.
 
 A subprocess test that re-invoked this file was written and REMOVED: it spawned itself recursively, 808 processes before I killed them by PID (pattern-killing had already killed my own shell). The AST check catches the real defect without executing anything.
+
+## Delivered-shape residual, CORRECTED (Henry, delivered-shape probe)
+
+Reproduced first: a 'delivered' entry with no ACK tuple, or ack {} or ack [], all returned rc=0 and certified rollback state-safe. Production only reaches 'delivered' for an actionable entry carrying a real ACK tuple, so those are malformed, not quiescent.
+
+BOTH repairs applied, as Henry allowed either: (a) a 'delivered' entry is ALWAYS an obligation until it reaches 'acked' - the old code keyed that on the ack tuple being truthy, which is what let a malformed entry pass; (b) validate_ledger REJECTS a delivered entry whose ACK tuple is missing, empty, a non-object, or lacks an id.
+
+```
+probe                  before   after
+delivered, no ack      rc=0     rc=3  rejected as malformed
+delivered, ack {}      rc=0     rc=3  rejected as malformed
+delivered, ack []      rc=0     rc=3  rejected as malformed
+delivered, valid ack   rc=1     rc=1  blocked as an obligation (control)
+acked                  rc=0     rc=0  certifies (negative control)
+```
+
+Suite 45/45. Sabotages, each caught: 'delivered never an obligation' and 'accept any ACK shape'.
+
+A WEAKNESS IN MY OWN TESTS, found by sabotage and worth recording: the three malformed cases first asserted only 'not 0'. Both rc=3 (rejected) and rc=1 (blocked) are non-zero, so removing the shape check still passed. They now assert rc=3 EXACTLY, which is what distinguishes rejection from blocking.

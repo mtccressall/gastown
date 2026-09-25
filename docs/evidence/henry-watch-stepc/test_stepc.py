@@ -589,5 +589,43 @@ class TestPreflightFailsClosed(Harness):
         self.assertEqual(self.m.preflight(), 0, "a valid quiesced ledger must still certify")
 
 
+class TestDeliveredShape(Harness):
+    """Henry's delivered-shape probe: a 'delivered' entry must block rollback
+    until it is acked, and a malformed ACK tuple must be rejected outright."""
+
+    def _raw(self, entry):
+        open(self.m.LEDGER, "w").write(json.dumps({"x": entry}))
+
+    def test_delivered_without_an_ack_tuple_refuses(self):
+        self.seed()
+        self._raw({"stage": "delivered", "ts": "2026-09-25T01:00:00.000Z"})
+        # rc=3 specifically: REJECTED AS MALFORMED, not merely blocked as an
+        # obligation (rc=1). Asserting "not 0" cannot tell those apart, and a
+        # sabotage removing the shape check then passes.
+        self.assertEqual(self.m.preflight(), 3, "delivered with no ACK tuple must be REJECTED as malformed")
+
+    def test_delivered_with_an_empty_ack_refuses(self):
+        self.seed()
+        self._raw({"stage": "delivered", "ts": "2026-09-25T01:00:00.000Z", "ack": {}})
+        self.assertEqual(self.m.preflight(), 3, "an empty ACK tuple must be REJECTED as malformed")
+
+    def test_delivered_with_a_list_ack_refuses(self):
+        self.seed()
+        self._raw({"stage": "delivered", "ts": "2026-09-25T01:00:00.000Z", "ack": []})
+        self.assertEqual(self.m.preflight(), 3, "a list ACK tuple must be REJECTED as malformed")
+
+    def test_valid_delivered_blocks_until_acked(self):
+        self.seed()
+        self._raw({"stage": "delivered", "ts": "2026-09-25T01:00:00.000Z",
+                   "ack": {"id": "x", "timestamp": "2026-09-25T01:00:00.000Z", "metadata": {}}})
+        self.assertEqual(self.m.preflight(), 1, "a well-formed delivered entry is still an obligation")
+
+    def test_acked_entry_still_certifies(self):
+        """Negative control: the gate must not refuse everything."""
+        self.seed()
+        self._raw({"stage": "acked", "ts": "2026-09-25T01:00:00.000Z", "at": 1})
+        self.assertEqual(self.m.preflight(), 0, "a valid acked entry must still certify")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -151,8 +151,16 @@ def validate_ledger(led):
             raise LedgerInvalid(f"{mid}: unknown stage {stage!r}; known: {sorted(KNOWN_STAGES)}")
         if stage in ("intent", "delivered", "informational", "quarantined") and not e.get("ts"):
             raise LedgerInvalid(f"{mid}: stage {stage} requires a ts")
-        if stage == "intent" and e.get("ack") is not None and not isinstance(e["ack"], dict):
+        if stage in ("intent", "delivered") and e.get("ack") is not None and not isinstance(e["ack"], dict):
             raise LedgerInvalid(f"{mid}: ack tuple is {type(e['ack']).__name__}, expected an object")
+        if stage == "delivered":
+            # Production only reaches 'delivered' for an actionable entry that
+            # carries a real ACK tuple, so a delivered entry WITHOUT one is
+            # malformed, not quiescent (Henry, delivered-shape probe).
+            ack = e.get("ack")
+            if not isinstance(ack, dict) or not ack.get("id"):
+                raise LedgerInvalid(
+                    f"{mid}: stage delivered requires an ACK tuple carrying an id; got {ack!r}")
     return led
 
 
@@ -171,7 +179,9 @@ def unresolved_obligations(led):
         stage = e.get("stage")
         if stage == "intent":
             out[mid] = "ambiguous intent: delivery unconfirmed, needs reconciliation"
-        elif stage == "delivered" and e.get("ack"):
+        elif stage == "delivered":
+            # ALWAYS an obligation until it reaches 'acked'. Keying this on the
+            # presence of an ack tuple let a malformed entry certify quiescence.
             out[mid] = "delivered but unacked: ACK owed and behind the cursor"
     return out
 
