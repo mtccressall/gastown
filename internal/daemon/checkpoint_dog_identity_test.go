@@ -75,7 +75,13 @@ func TestCheckpointWorktreeCommitsUnderThePolecatIdentity(t *testing.T) {
 		t.Fatal("checkpointWorktree reported no checkpoint; the fixture no longer exercises the path")
 	}
 
-	author, err := runGitCmd(repo, "log", "-1", "--format=%an <%ae>")
+	// Read the checkpoint from its REF: it is deliberately not on the branch.
+	br, err := runGitCmd(repo, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := strings.TrimSpace(br)
+	author, err := runGitCmd(repo, "log", "-1", "--format=%an <%ae>", checkpointRef(branch))
 	if err != nil {
 		t.Fatal(err)
 	}

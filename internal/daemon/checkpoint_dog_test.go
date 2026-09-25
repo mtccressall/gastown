@@ -241,8 +241,16 @@ func TestCheckpointWorktreeExcludesNestedRuntimeArtifacts(t *testing.T) {
 		t.Fatal("checkpointWorktree did not create a checkpoint commit")
 	}
 
-	if got := strings.TrimSpace(mustRunGit(t, workDir, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")); got != "src/app.go" {
-		t.Fatalf("checkpoint commit changed %q, want only src/app.go", got)
+	// The checkpoint now lives OFF the branch, so this reads the ref rather
+	// than HEAD. The INTENT is unchanged and is the reason this test exists:
+	// the checkpoint carries the source change and NOT the runtime artifact.
+	ref := checkpointRef(strings.TrimSpace(mustRunGit(t, workDir, "rev-parse", "--abbrev-ref", "HEAD")))
+	if got := strings.TrimSpace(mustRunGit(t, workDir, "diff-tree", "--no-commit-id", "--name-only", "-r", ref)); got != "src/app.go" {
+		t.Fatalf("checkpoint changed %q, want only src/app.go", got)
+	}
+	// And the BRANCH must not have moved at all — that is the whole point.
+	if got := strings.TrimSpace(mustRunGit(t, workDir, "log", "--format=%s", "-1")); got == checkpointMessage {
+		t.Fatal("checkpoint landed on the branch; it must live only under refs/checkpoints/")
 	}
 	if got := strings.TrimSpace(mustRunGit(t, workDir, "diff", "--cached", "--name-only")); got != "" {
 		t.Fatalf("runtime artifact remained staged: %q", got)
