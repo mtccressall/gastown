@@ -1,12 +1,12 @@
 package cmd
 
 import (
-	"github.com/steveyegge/gastown/internal/refinery"
-	"sync"
-	"time"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -101,7 +101,6 @@ func polecatSessionKey(rigName, polecatName string) string {
 	return rigName + polecatSessionKeySep + polecatName
 }
 
-
 // WorkingActivityWindow is how recently a session must have produced output for
 // its polecat to count as WORKING rather than blocked.
 //
@@ -116,7 +115,6 @@ func polecatSessionKey(rigName, polecatName string) string {
 // same error in the other direction. This is meant to catch the agent that will
 // NEVER move again without a human, not the one that is merely slow.
 const WorkingActivityWindow = 15 * time.Minute
-
 
 type mrStatus int
 
@@ -159,7 +157,7 @@ func (s openMRSet) statusOf(mr string) mrStatus {
 // something will eventually be called from somewhere that did not. Resolving on
 // demand removes the requirement instead of documenting it.
 var openMRCache = struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	byRig map[string]openMRSet
 }{byRig: map[string]openMRSet{}}
 

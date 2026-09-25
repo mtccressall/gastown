@@ -139,55 +139,132 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	}
 
 	// Stage everything
-	if _, err := runGitCmd(workDir, "add", "-A"); err != nil {
-		d.logger.Printf("checkpoint_dog: git add -A failed in %s/%s: %v", rigName, polecatName, err)
+	branch, err := runGitCmd(workDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil || strings.TrimSpace(branch) == "" || strings.TrimSpace(branch) == "HEAD" {
+		// Detached or unreadable: a checkpoint keyed on a branch name would be
+		// unfindable, and an unfindable checkpoint is not a safety net.
+		d.logger.Printf("checkpoint_dog: no branch in %s/%s, skipping checkpoint", rigName, polecatName)
 		return false
 	}
+	branch = strings.TrimSpace(branch)
 
-	// Unstage runtime/ephemeral artifacts using the same centralized policy as
-	// gt done. Scanning staged paths catches tracked nested runtime dirs that
-	// git add -A can restage despite ignore rules.
-	stagedOut, err := runGitCmdRaw(workDir, "diff", "--cached", "--name-only", "-z")
+	commit, ok := d.writeCheckpointToRef(workDir, branch, rigName, polecatName)
+	if !ok {
+		return false
+	}
+	// SAY WHERE IT WENT. A checkpoint nobody can find is not draft recovery —
+	// the ref is invisible in `git log` and in the branch, so this line is the
+	// only thing standing between "preserved" and "indistinguishable from lost".
+	d.logger.Printf("checkpoint_dog: checkpoint %s saved OFF-BRANCH for %s/%s at %s — recover with: git -C <worktree> checkout %s -- .",
+		commit[:min(len(commit), 12)], rigName, polecatName, checkpointRef(branch), checkpointRef(branch))
+	d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
+	return true
+}
+
+// checkpointRef is where a worktree's auto-checkpoint lives: OFF the branch.
+//
+// A checkpoint commit ON the branch is permanent, travels with any push, and
+// cannot be collapsed afterwards — measured on one live review candidate,
+// 28 checkpoints among 100 commits, in 26 separate runs. That last number is
+// the one that matters: 24 were SINGLETONS, because this dog fires every 10
+// minutes and the agent commits real work in between, so checkpoints are
+// isolated BY CONSTRUCTION. Every adjacency-based remedy therefore reaches
+// ~2 of 28, and dropping them and replaying FAILS with conflicts because the
+// replay depends on intermediate state (gt-hgwls).
+//
+// So the checkpoint is not put on the branch at all. refs/checkpoints/<branch>
+// holds a commit object that no branch references: it is never pushed, never
+// reviewed, never needs collapsing, and no history is ever rewritten.
+const checkpointMessage = "WIP: checkpoint (auto)"
+
+func checkpointRef(branch string) string { return "refs/checkpoints/" + branch }
+
+// writeCheckpointToRef builds the checkpoint in a TEMPORARY index and stores it
+// as a commit object under refs/checkpoints/<branch>.
+//
+// Nothing on the branch moves, and — unlike the version this replaces — the
+// agent's OWN INDEX is not touched either. The old path ran `git add -A`
+// against the real index, so a checkpoint silently staged the agent's work
+// underneath it. Untracked files are still captured, which `git stash create`
+// would have dropped.
+func (d *Daemon) writeCheckpointToRef(workDir, branch, rigName, polecatName string) (string, bool) {
+	idx := filepath.Join(workDir, ".git", "gt-checkpoint-index")
+	_ = os.Remove(idx)
+	defer func() { _ = os.Remove(idx) }()
+	idxEnv := []string{"GIT_INDEX_FILE=" + idx}
+
+	run := func(args ...string) (string, bool) {
+		out, err := runGitCmdRawEnv(workDir, idxEnv, args...)
+		if err != nil {
+			d.logger.Printf("checkpoint_dog: git %s failed in %s/%s: %v", args[0], rigName, polecatName, err)
+			return "", false
+		}
+		return strings.TrimSpace(out), true
+	}
+
+	if _, ok := run("read-tree", "HEAD"); !ok {
+		return "", false
+	}
+	if _, ok := run("add", "-A"); !ok {
+		return "", false
+	}
+
+	stagedOut, err := runGitCmdRawEnv(workDir, idxEnv, "diff", "--cached", "--name-only", "-z")
 	if err != nil {
 		d.logger.Printf("checkpoint_dog: git diff --cached failed in %s/%s: %v", rigName, polecatName, err)
-		return false
+		return "", false
 	}
 	for _, pathspec := range gtgit.RuntimeArtifactPathspecs(splitNullSeparatedPaths(stagedOut)) {
-		if _, err := runGitCmd(workDir, "reset", "HEAD", "--", pathspec); err != nil {
-			d.logger.Printf("checkpoint_dog: git reset runtime artifact %q failed in %s/%s: %v", pathspec, rigName, polecatName, err)
-			return false
+		if _, ok := run("reset", "HEAD", "--", pathspec); !ok {
+			return "", false
 		}
 	}
-
-	// Unstage deletions of tracked files. A checkpoint should preserve work
-	// (additions + modifications), never commit deletions of tracked files.
-	// This prevents the bug where a polecat's working tree has a missing
-	// tracked file and the checkpoint commits the deletion (gt-pvx fix).
-	if delOut, err := runGitCmd(workDir, "diff", "--cached", "--name-only", "--diff-filter=D"); err == nil {
-		if dels := strings.TrimSpace(delOut); dels != "" {
-			for _, f := range strings.Split(dels, "\n") {
-				if f != "" {
-					_, _ = runGitCmd(workDir, "reset", "HEAD", "--", f)
-				}
+	if delOut, err := runGitCmdRawEnv(workDir, idxEnv, "diff", "--cached", "--name-only", "--diff-filter=D"); err == nil {
+		for _, f := range strings.Split(strings.TrimSpace(delOut), "\n") {
+			if f != "" {
+				_, _ = run("reset", "HEAD", "--", f)
 			}
 		}
 	}
 
-	// Check if anything is staged after exclusions
-	diffOut, err := runGitCmd(workDir, "diff", "--cached", "--quiet")
-	if err == nil && strings.TrimSpace(diffOut) == "" {
-		// --quiet exits 0 if no diff → nothing staged
-		return false
+	tree, ok := run("write-tree")
+	if !ok {
+		return "", false
+	}
+	headTree, err := runGitCmd(workDir, "rev-parse", "HEAD^{tree}")
+	if err == nil && strings.TrimSpace(headTree) == tree {
+		return "", false // nothing but excluded runtime noise
 	}
 
-	// Commit the checkpoint
-	if _, err := runGitCmd(workDir, "commit", "-m", "WIP: checkpoint (auto)"); err != nil {
-		d.logger.Printf("checkpoint_dog: git commit failed in %s/%s: %v", rigName, polecatName, err)
-		return false
+	// commit-tree, not commit: this produces a commit object that NO branch
+	// points at. The identity is the polecat's, for the same reason the branch
+	// version needed it — the object carries an author either way.
+	name, email := checkpointCommitIdentity(rigName, polecatName)
+	commit, err := runGitCmdAs(workDir, name, email, "commit-tree", tree, "-p", "HEAD", "-m", checkpointMessage)
+	if err != nil {
+		d.logger.Printf("checkpoint_dog: git commit-tree failed in %s/%s: %v", rigName, polecatName, err)
+		return "", false
 	}
+	commit = strings.TrimSpace(commit)
+	if _, err := runGitCmd(workDir, "update-ref", checkpointRef(branch), commit); err != nil {
+		d.logger.Printf("checkpoint_dog: update-ref failed in %s/%s: %v", rigName, polecatName, err)
+		return "", false
+	}
+	return commit, true
+}
 
-	d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
-	return true
+// checkpointCommitIdentity returns the git author for an auto-checkpoint.
+//
+// MIRRORS internal/cmd/commit.go's identityToEmail, which is the source of
+// truth for agent git identity — "gastown/crew/jack" becomes
+// "gastown.crew.jack@gastown.local". It is duplicated rather than imported
+// because internal/cmd imports internal/daemon, so the daemon cannot import
+// back without a cycle. checkpoint_dog_identity_test.go pins the format so the
+// two cannot drift silently.
+func checkpointCommitIdentity(rigName, polecatName string) (name, email string) {
+	name = rigName + "/polecats/" + polecatName
+	email = strings.ReplaceAll(name, "/", ".") + "@gastown.local"
+	return name, email
 }
 
 // isGitWorktree reports whether the given directory is the root of a git
@@ -229,9 +306,36 @@ func runGitCmd(workDir string, args ...string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// runGitCmdAs runs git with an explicit author AND committer.
+//
+// `-c user.name=` IS NOT ENOUGH, and a test caught that rather than a review:
+// GIT_AUTHOR_NAME outranks config, gastown itself exports it (handoff.go:923),
+// and the daemon inherits whatever its own environment carries. The first
+// version of this fix passed -c and produced
+//
+//	deacon <liveop.polecats.atom@gastown.local>
+//
+// the email applied, the NAME taken from an inherited GIT_AUTHOR_NAME. Setting
+// all four variables puts the identity at the precedence level that wins.
+func runGitCmdAs(workDir, name, email string, args ...string) (string, error) {
+	return runGitCmdRawEnv(workDir, []string{
+		"GIT_AUTHOR_NAME=" + name,
+		"GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name,
+		"GIT_COMMITTER_EMAIL=" + email,
+	}, args...)
+}
+
 func runGitCmdRaw(workDir string, args ...string) (string, error) {
+	return runGitCmdRawEnv(workDir, nil, args...)
+}
+
+func runGitCmdRawEnv(workDir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = workDir
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	util.SetDetachedProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer

@@ -231,6 +231,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 
 	outputMoleculeContext(ctx)
 	outputCheckpointContext(ctx)
+	outputUncommittedCheckpointRef(ctx)
 	runPrimeExternalTools(ctx, cwd)
 
 	if ctx.Role == RoleMayor {
