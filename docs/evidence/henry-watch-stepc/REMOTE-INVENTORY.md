@@ -211,3 +211,17 @@ Function-level synthetic controls for stale-parent validation:
   MISMATCHED identity -> refused, no parent    PASS
   ppid and ticks from ONE snapshot             PASS
 ```
+
+## Census v6 — import now reads NOTHING (Henry's caveat made true, not narrowed)
+
+Henry's precise caveat: `BOOT` still read `/proc/stat` at import, so my literal 'runs nothing on import' was broader than proven. Boot time is now resolved LAZILY inside `boot_time()`. Proven with an `open()` hook: **files opened during import = 0**, stdout empty, all functions available, live run and all controls unchanged.
+
+## Inventory scope I CANNOT supply — named exactly, not hedged
+
+| scope | status | why |
+|---|---|---|
+| this host's launch surfaces, sessions, roles, start identities, queue/recipient selection, authority, state and dedupe domains | SUPPLIED | measured, reproducible via census.py |
+| whether the 15 sessions' key resolves to `agent:gas-new` (the PRINCIPAL question) | **UNAVAILABLE TO ME** | needs one read-only call with a credential that is NOT the adapter's. That is a credential use Marc reserves. Decided by him, not by evidence I can gather |
+| process attribution of any past `agent:gas-new` post | **PERMANENTLY UNAVAILABLE** from the channel: the identity IS the shared key, so no post carries a process. Only a distinct adapter identity changes this, going forward and not retrospectively |
+| Henry-side / cross-host consumers, their authority and session mapping | **NOT MINE** | Henry-owned; I hold no access to that host and will not infer it |
+| whether a same-UID session has ever READ the binding file | **UNAVAILABLE** | no audit trail exists for reads of that file on this host; I checked for one rather than assuming |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sanitized, reproducible credential-capability census. READ ONLY, FAILS LOUD.
 
-IMPORTING THIS MODULE HAS NO SIDE EFFECTS: the executable body lives in main(),
+IMPORTING THIS MODULE READS NOTHING: the executable body lives in main(),
 guarded by __main__. An earlier version ran enumeration at import time, so a
 control that imported it to test one function fell back to the REAL tmux
 (Henry, c2-census-1b16a787). Definitions are now isolated from execution.
@@ -26,8 +26,18 @@ import datetime, os, subprocess, sys
 PROCFS = os.environ.get("CENSUS_PROCFS", "/proc")
 BINDING = os.environ.get("CENSUS_BINDING", os.path.expanduser("~/.config/liveop/e2e-staging.env"))
 TMUX = os.environ.get("CENSUS_TMUX", "")          # a command emitting "session pid" lines
-CLK = os.sysconf("SC_CLK_TCK")
-BOOT = next(int(l.split()[1]) for l in open(f"{PROCFS}/stat") if l.startswith("btime"))
+CLK = os.sysconf("SC_CLK_TCK")   # a libc constant, no filesystem read
+_BOOT = None
+
+
+def boot_time():
+    """Lazy: import must touch NOTHING, not even /proc/stat. Henry noted the
+    literal 'runs nothing on import' claim was broader than proven while BOOT was
+    read at module level; this makes the claim true rather than narrowing it."""
+    global _BOOT
+    if _BOOT is None:
+        _BOOT = next(int(l.split()[1]) for l in open(f"{PROCFS}/stat") if l.startswith("btime"))
+    return _BOOT
 NAMES = ["LIVEOP_API_KEY", "LIVEOP_API_URL", "LIVEOP_AGENT_ID", "LIVEOP_AGENT_INBOX_CHANNEL"]
 OBSERVED = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -50,7 +60,7 @@ def start_ticks(pid):
 def start_utc(ticks):
     if ticks is None:
         return None
-    t = BOOT + ticks / CLK
+    t = boot_time() + ticks / CLK
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
