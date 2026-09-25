@@ -1,4 +1,4 @@
-# census_version=2  observed_at_utc=2026-09-25T09:46:53Z  host=amd-halo  uid=1001
+# census_version=2  observed_at_utc=2026-09-25T09:56:51Z  host=amd-halo  uid=1001
 # adapter_binding_readable=yes (value never emitted)
 # columns: session pane_pid start_ticks start_utc identity_stable API_KEY API_URL AGENT_ID AGENT_INBOX_CHANNEL same_as_adapter role
 be-witness 3592198 15871000 2026-09-12T00:57:25Z True True False False False NO beadsrig/witness
@@ -33,4 +33,7 @@ steward-witness 3592210 15871000 2026-09-12T00:57:25Z True True False False Fals
 #   liveop-synth 2785101 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
 #   liveop-witness 3550527 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
 #   steward-witness 3592210 -> 3539834(tmux: server) key=True same_as_pane=True same_as_adapter=False started=2026-09-12T00:56:09Z stable=True
+# lineage_panes_ok=15 lineage_unreadable=0 lineage_identity_changed=0
+# lineage_complete=True
+# pane_complete=True
 # census_complete=True

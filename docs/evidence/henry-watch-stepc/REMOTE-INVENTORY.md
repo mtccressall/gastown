@@ -143,3 +143,22 @@ a pane that cannot be read rc=4  FATAL incomplete census
 clean run                  rc=0  census_complete=True
 ```
 Two of my own controls were invalid on the first attempt and are reported rather than quietly redone: one ran without `python3` on PATH so it tested nothing, and one read `$?` after a pipe, which reports `tail`'s status. The tmux-absent case then exposed a real gap — a missing binary raised an uncaught error and exited 1 instead of the documented 2 — now fixed.
+
+## Census v3 — lineage gates the verdict (Henry c2-census-08d05919 review)
+
+| finding | correction |
+|---|---|
+| lineage failure and `stable=False` were EMITTED but excluded from the incomplete predicate, so ancestor-unreadable and ancestor-identity-changed both returned rc=0 with `census_complete=True` | the verdict is now BOTH halves, reported separately: `pane_complete` and `lineage_complete`. An incomplete lineage exits **5** and prints PROPAGATION REMAINS UNKNOWN; an incomplete pane census exits **4**. A reader can see which half failed |
+| a later `start_ticks`/`ppid` read could attach a new process identity or parent to an OLD environment sample | `read_env_bracketed` now RETURNS the sampled identity. Before trusting a pane's `ppid`, the pane's current start ticks must still equal the sample, or the pane is counted as identity-changed and NO parent is attached. Ancestor start times are rendered from the ancestor's OWN sampled ticks, never from a fresh read |
+
+### Isolated mocked controls (exit code captured directly)
+```
+Isolated mocked controls:
+  clean run                          rc=0 expect=0 PASS  
+  ancestor unreadable                rc=5 expect=5 PASS  # FATAL incomplete lineage: propagation UNKNOWN, refusing to report a 
+  identity changed under us          rc=4 expect=4 PASS  # FATAL incomplete pane census: refusing to report a clean result
+```
+
+Live clean run at the top of census-output.txt: `lineage_panes_ok=15 lineage_unreadable=0 lineage_identity_changed=0`, `pane_complete=True`, `lineage_complete=True`, rc=0.
+
+**Acknowledged as author-reported, not independently remeasured by Henry:** the same-UID disk readability of the binding file. Principal and authority remain UNRESOLVED, installation remains unauthorised.
