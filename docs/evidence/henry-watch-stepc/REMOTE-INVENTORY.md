@@ -8,31 +8,45 @@ finding 1.**
 |---|---|
 | host | `amd-halo` |
 | UID | `marccressall` (single UID for every surface below) |
-| measured at | 2026-09-25T09:31Z, with the credential check at 09:3xZ |
+| measured at | **2026-09-25T09:35:59Z** exactly (census.py emits its own observation time; the earlier `09:3xZ` is replaced) |
 
-## FINDING 1 — I MUST CORRECT MY OWN PACKET. The credential is NOT confined to the adapter.
+## FINDING 1 — CORRECTED TWICE. Read all three versions; the third is the measured one.
 
-Section 2 of the cutover packet said: *"one API key, held only by this adapter and by interactive Mayor
-commands run by me."* **That is wrong.** Read directly from `/proc/<pid>/environ` for every resident
-agent pane:
+**v1 (my cutover packet, WRONG):** "one API key, held only by this adapter and by interactive Mayor
+commands run by me."
 
-**`LIVEOP_API_KEY` is present in the environment of ALL 15 resident agent sessions.**
+**v2 (my first correction, OVERSTATED):** every agent session holds the key, so every agent "has the
+capability to post as `agent:gas-new`". Presence was right; the capability conclusion was not measured.
 
-So every agent on this host has the *capability* to poll `#dev` and to post as `agent:gas-new`. That is
-the conflict class you asked about, and it is broader than I reported.
+**v3, MEASURED 2026-09-25T09:35:59Z, boolean-only comparison, no value or hash emitted:**
 
-**Capability is not observed use, and I am keeping those separate** (this town has a standing rule that an
-environment census measures environment, not exposure):
-- **Established**: 15 sessions hold the key; the cron adapter holds it by reading the env file.
-- **Observed use**: 19 posts as `agent:gas-new` in the current 100-message window, kinds ACK, RESULT,
-  REVIEW_REQUEST, STATUS — all consistent with the adapter's receipt ACKs and my own Mayor posts.
-- **NOT ESTABLISHED, and not establishable from the channel side**: which *process* made any given post.
-  The identity is the shared key, so `agent:gas-new` posts carry no process attribution. I cannot prove
-  that no other session has ever posted, only that every post I can see matches traffic I can account for.
-- **PROPAGATION ROOT: UNKNOWN.** The key is not in `~/.bashrc` or `~/.profile`. One probe suggested a
-  long-running `gt daemon` process carried it (which would explain inheritance by spawned sessions), but
-  that PID had exited by my next command, so the reading is unrepeatable and I will not present it as the
-  cause. Establishing the root needs a process that is still alive when examined.
+| fact | status |
+|---|---|
+| all 15 resident sessions have `LIVEOP_API_KEY` in their environment | ESTABLISHED |
+| that value **differs from the adapter's binding** in all 15 (`same=NO`, 15/15) | ESTABLISHED |
+| the sessions carry **only** `LIVEOP_API_KEY`, and none of `LIVEOP_API_URL`, `LIVEOP_AGENT_ID`, `LIVEOP_AGENT_INBOX_CHANNEL` | ESTABLISHED |
+| whether the sessions' key resolves to `agent:gas-new` | **UNKNOWN** — deciding it means USING another credential to see what identity the server stamps, which I have not done and am not authorised to do |
+| propagation root | **FOUND**: the tmux server process (pid 3539834, comm `tmux: server`, started 2026-09-12T00:56:09Z) carries a key; every pane inherits it. Server key == Mayor session key, and both differ from the adapter's binding |
+
+So Henry's caution was exactly right: **environment presence alone establishes neither an equal
+credential value nor effective permissions.** Presence is 15/15; equality with the adapter's binding is
+0/15. My v2 conclusion is withdrawn.
+
+**What this does and does not mean.** The sessions cannot post using the adapter's binding, because they
+do not have it. Whether their own key grants the same *identity* is unknown, and an older or rotated key
+for the same agent would still stamp `agent:gas-new`. Until that is resolved it stays an unknown, and
+under the packet's rule an unknown consumer authority blocks cutover.
+
+**Proposed test, NOT run, needs authorisation:** one read-only call using a session's key, observing only
+the `authenticatedAgentId` the server stamps. That answers it definitively and touches nothing. It uses a
+credential that is not the adapter's, so Marc authorises it or it stays unknown. I did not take that
+decision myself.
+
+### Reproducible method
+`docs/evidence/henry-watch-stepc/census.py`, read-only, emits pane pid, kernel start ticks and derived
+UTC start, `GT_ROLE`, key PRESENCE, and the boolean same-as-adapter comparison. **No key value, hash,
+length or prefix is ever emitted.** It restarts nothing, rotates nothing, installs nothing. Run:
+`python3 docs/evidence/henry-watch-stepc/census.py`
 
 ## Enabled launch surfaces
 
@@ -50,23 +64,23 @@ environment census measures environment, not exposure):
 executes live-op CI containers. The remaining enabled units are desktop services.
 
 ### resident agent sessions (owner/session mapping, nothing restarted)
-| tmux session | pane pid | GT_ROLE | created (UTC) |
-|---|---|---|---|
-| be-witness | 3592198 | beadsrig/witness | 2026-09-12T00:57 |
-| gastown-citrine | 1150325 | gastown/polecats/citrine | 2026-09-12T07:57 |
-| gastown-refinery | 3592434 | gastown/refinery | 2026-09-12T00:57 |
-| gastown-witness | 3592187 | gastown/witness | 2026-09-12T00:57 |
-| hq-boot | 1019692 | deacon/boot | 2026-09-16T10:31 |
-| hq-deacon | 3020863 | deacon | 2026-09-14T11:25 |
-| **hq-mayor** | 612458 | **mayor** | 2026-09-21T14:59 |
-| liveop-atom | 3111079 | liveop/polecats/atom | 2026-09-18T22:05 |
-| liveop-foundation | 3733790 | liveop/polecats/foundation | 2026-09-21T17:21 |
-| liveop-guzzle | 2671802 | liveop/polecats/guzzle | 2026-09-21T19:37 |
-| liveop-institute | 3055700 | liveop/polecats/institute | 2026-09-15T21:49 |
-| liveop-refinery | 3559011 | liveop/refinery | 2026-09-12T00:56 |
-| liveop-synth | 2785101 | liveop/polecats/synth | 2026-09-21T19:41 |
-| liveop-witness | 3550527 | liveop/witness | 2026-09-12T00:56 |
-| steward-witness | 3592210 | steward/witness | 2026-09-12T00:57 |
+| tmux session | pane pid | kernel start ticks | process start (UTC) | GT_ROLE |
+|---|---|---|---|---|
+| be-witness | 3592198 | 15871000 | 2026-09-12T00:57:25Z | beadsrig/witness |
+| gastown-citrine | 1150325 | 18391944 | 2026-09-12T07:57:34Z | gastown/polecats/citrine |
+| gastown-refinery | 3592434 | 15871029 | 2026-09-12T00:57:25Z | gastown/refinery |
+| gastown-witness | 3592187 | 15870999 | 2026-09-12T00:57:24Z | gastown/witness |
+| hq-boot | 1019692 | 53877770 | 2026-09-16T10:31:52Z | deacon/boot |
+| hq-deacon | 3020863 | 42056108 | 2026-09-15T01:41:36Z | deacon |
+| hq-mayor | 612458 | 98681143 | 2026-09-21T14:59:06Z | mayor |
+| liveop-atom | 3111079 | 75321255 | 2026-09-18T22:05:47Z | liveop/polecats/atom |
+| liveop-foundation | 3733790 | 99533270 | 2026-09-21T17:21:07Z | liveop/polecats/foundation |
+| liveop-guzzle | 2671802 | 100353209 | 2026-09-21T19:37:47Z | liveop/polecats/guzzle |
+| liveop-institute | 3055700 | 49305845 | 2026-09-15T21:49:53Z | liveop/polecats/institute |
+| liveop-refinery | 3559011 | 15866215 | 2026-09-12T00:56:37Z | liveop/refinery |
+| liveop-synth | 2785101 | 100377676 | 2026-09-21T19:41:51Z | liveop/polecats/synth |
+| liveop-witness | 3550527 | 15864890 | 2026-09-12T00:56:23Z | liveop/witness |
+| steward-witness | 3592210 | 15871000 | 2026-09-12T00:57:25Z | steward/witness |
 
 This is the authoritative owner/session mapping available to me: tmux session name, pane PID, and the
 `GT_ROLE` each session was launched with. There is no run ID or session ID in their routing environment
