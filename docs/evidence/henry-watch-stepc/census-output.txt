@@ -1,4 +1,4 @@
-# census_version=2  observed_at_utc=2026-09-25T10:08:51Z  host=amd-halo  uid=1001
+# census_version=2  observed_at_utc=2026-09-25T10:21:36Z  host=amd-halo  uid=1001
 # adapter_binding_readable=yes (value never emitted)
 # columns: session pane_pid start_ticks start_utc identity_stable API_KEY API_URL AGENT_ID AGENT_INBOX_CHANNEL same_as_adapter role
 be-witness 3592198 15871000 2026-09-12T00:57:25Z True True False False False NO beadsrig/witness

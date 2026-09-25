@@ -186,3 +186,28 @@ Function-level synthetic controls for stale-parent validation:
 ```
 
 **LIMIT STATED RATHER THAN PAPERED OVER:** the END-TO-END recycle needs the stat to change BETWEEN two reads inside one run. A static synthetic file cannot express that, and a FIFO-backed stat deadlocked, so I do NOT claim an end-to-end control for it. What is proven: the validation refuses a mismatched identity, and parent plus start time now come from one read, which removes the window rather than detecting it.
+
+## Census v5 — the control itself leaked to the real host (Henry c2-census-1b16a787)
+
+Henry INTERCEPTED AND BLOCKED a real `tmux -L gt-0016fa list-panes` that my own 'isolated' control attempted, and my suite still returned 0 because the import's SystemExit was swallowed. My no-real-reads claim was FALSE for that path.
+
+| finding | correction |
+|---|---|
+| `function_level_controls` set PROCFS and BINDING but NOT CENSUS_TMUX, so importing census.py fell back to the real tmux | **definitions are now isolated from execution**: census.py's body lives in `main()` under `__main__`, so importing it runs nothing. Verified: 0 subprocess invocations and no output on import |
+| overrides were set and not restored | all THREE are set and restored in a `finally`; verified 0 `CENSUS_*` variables remain set after the run |
+| a forbidden command could be attempted without the suite noticing | the control now ASSERTS none is attempted: `subprocess.run` is guarded and must record zero calls, and `CENSUS_TMUX` points at a stub that touches a marker file if ever invoked — the control asserts that marker does NOT exist |
+### Full control set
+```
+Synthetic controls (no real /proc, binding or tmux):
+  clean                  rc=0 expect=0 PASS  
+  tmux-failure           rc=2 expect=2 PASS  FATAL tmux enumeration failed rc=1: 
+  empty-enumeration      rc=2 expect=2 PASS  FATAL enumerated=0; an empty census is not a clean census
+  binding-unreadable     rc=3 expect=3 PASS  FATAL binding unreadable: FileNotFoundError
+  ancestor-unreadable    rc=5 expect=5 PASS  FATAL incomplete lineage: propagation UNKNOWN, refusing to report a cl
+Function-level synthetic controls for stale-parent validation:
+  import attempted NO command                  PASS
+  forbidden tmux stub never invoked            PASS
+  matching identity -> parent returned         PASS
+  MISMATCHED identity -> refused, no parent    PASS
+  ppid and ticks from ONE snapshot             PASS
+```

@@ -73,36 +73,51 @@ def recycle_pane(proc):
 
 
 def function_level_controls():
-    """Synthetic function-level controls for the stale-parent validation.
+    """Function-level synthetic controls. FULLY ISOLATED.
 
-    The END-TO-END recycle needs the stat to change BETWEEN reads inside one run.
-    A static synthetic file cannot express that, and a FIFO-backed stat deadlocked,
-    so that is NOT claimed as an end-to-end control. What IS proven here: the
-    validation refuses a mismatched identity, and ppid+start_ticks now come from ONE
-    read, which removes the window between them by construction.
+    Importing census.py has no side effects (its body is under __main__), all THREE
+    overrides are set and restored, and a subprocess guard ASSERTS that no command
+    is attempted at all — the leak Henry intercepted was this control falling back
+    to the real `tmux -L gt-0016fa list-panes` (c2-census-1b16a787).
     """
-    import importlib.machinery, importlib.util
+    import importlib.machinery, importlib.util, subprocess as sp
     root = tempfile.mkdtemp(prefix="synth-fn-")
     proc = os.path.join(root, "proc"); os.makedirs(proc)
     open(os.path.join(proc, "stat"), "w").write("btime 1700000000\n")
     binding = os.path.join(root, "b.env"); open(binding, "w").write("LIVEOP_API_KEY=K\n")
+    forbidden = os.path.join(root, "forbidden.sh")
+    open(forbidden, "w").write("#!/bin/sh\ntouch " + os.path.join(root, "INVOKED") + "\nexit 9\n")
+    os.chmod(forbidden, 0o755)
     write_proc(proc, 100, 200, 5000, {"LIVEOP_API_KEY": "K"}, "pane")
-    os.environ["CENSUS_PROCFS"] = proc; os.environ["CENSUS_BINDING"] = binding
-    ld = importlib.machinery.SourceFileLoader("census_fn", "census.py")
-    spec = importlib.util.spec_from_loader(ld.name, ld)
-    m = importlib.util.module_from_spec(spec)
-    import io, contextlib
-    with contextlib.redirect_stdout(io.StringIO()):
-        try: ld.exec_module(m)
-        except SystemExit: pass
-    results = []
-    parent, ok1 = m.ppid_validated(100, 5000)
-    results.append(("matching identity -> parent returned", parent == 200 and ok1))
-    parent, ok2 = m.ppid_validated(100, 4242)
-    results.append(("MISMATCHED identity -> refused, no parent", parent is None and ok2 is False))
-    pp, tt = m.stat_snapshot(100)
-    results.append(("ppid and ticks from ONE snapshot", pp == 200 and tt == 5000))
-    shutil.rmtree(root, ignore_errors=True)
+
+    saved = {k: os.environ.get(k) for k in ("CENSUS_PROCFS", "CENSUS_BINDING", "CENSUS_TMUX")}
+    os.environ["CENSUS_PROCFS"] = proc
+    os.environ["CENSUS_BINDING"] = binding
+    os.environ["CENSUS_TMUX"] = forbidden          # all THREE set
+    attempted = []
+    real_run = sp.run
+    sp.run = lambda *a, **k: attempted.append(a[0] if a else k.get("args")) or real_run(
+        ["true"], capture_output=True, text=True)
+    try:
+        ld = importlib.machinery.SourceFileLoader("census_fn", "census.py")
+        spec = importlib.util.spec_from_loader(ld.name, ld)
+        m = importlib.util.module_from_spec(spec)
+        ld.exec_module(m)                          # inert: body is under __main__
+        results = [
+            ("import attempted NO command", attempted == []),
+            ("forbidden tmux stub never invoked", not os.path.exists(os.path.join(root, "INVOKED"))),
+            ("matching identity -> parent returned", m.ppid_validated(100, 5000) == (200, True)),
+            ("MISMATCHED identity -> refused, no parent", m.ppid_validated(100, 4242) == (None, False)),
+            ("ppid and ticks from ONE snapshot", m.stat_snapshot(100) == (200, 5000)),
+        ]
+    finally:
+        sp.run = real_run
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(root, ignore_errors=True)
     for label, good in results:
         print(f"  {label:44s} {'PASS' if good else 'MISMATCH'}")
     return all(g for _, g in results)
