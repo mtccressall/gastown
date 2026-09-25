@@ -74,7 +74,12 @@ own Gastown mailbox. The Mayor session is the only consumer of `mayor/` mail, an
 recipient of everything this adapter delivers.
 
 ### Shared domains, stated as risks rather than dismissed
-- **credential**: one API key, held only by this adapter and by interactive Mayor commands run by me.
+- **credential**: one API key. **CORRECTED 2026-09-25 — my earlier claim that it was held only by this
+  adapter and my interactive commands was WRONG.** `LIVEOP_API_KEY` is present in the environment of ALL
+  15 resident agent sessions, read from `/proc/<pid>/environ`, so every agent on this host has the
+  CAPABILITY to poll `#dev` and post as `agent:gas-new`. Observed use matches only the adapter and the
+  Mayor, but channel posts carry no process attribution, so that is not provable. The propagation root is
+  UNKNOWN. See REMOTE-INVENTORY.md finding 1; this unknown BLOCKS cutover.
 - **durable state**: `~/gt/.runtime/henry-watch.{state,ledger.json,quarantine.json,gaps.json,lock}`. Sole
   writer is the adapter; the lock serialises ticks against each other.
 - **mail store**: the Dolt town store, shared with every agent. The adapter only appends mail to `mayor/`.
