@@ -459,11 +459,13 @@ def main():
             else:
                 log(f"RECONCILED {mid} absent from the inbox; re-delivering")
         if led.get(mid, {}).get("stage") != "delivered":
-            mark(led, mid, "intent", m["timestamp"])   # fence BEFORE the side effect
-            subject = deliver(m, overflow)
+            # Persist the fence AND the ACK tuple BEFORE the side effect, so a crash
+            # between the mail and the mark leaves enough to reconcile and ACK later
+            # even after the source leaves the poll window (Henry, C2R3).
             if kindclass == "actionable" and meta(m).get("requiresAck") is True:
-                # ACK only what explicitly asks for one, literal true (Henry, C2R2)
-                led.setdefault(mid, {})["ack"] = ack_payload(m)   # survives the window
+                led.setdefault(mid, {})["ack"] = ack_payload(m)
+            mark(led, mid, "intent", m["timestamp"])
+            subject = deliver(m, overflow)
             stage = "delivered" if (kindclass == "actionable"
                                     and led.get(mid, {}).get("ack")) else "informational"
             mark(led, mid, stage, m["timestamp"])
@@ -479,6 +481,23 @@ def main():
             run(["gt", "nudge", "mayor", f"Henry posted {delivered} new message(s) in live-op dev. Check your inbox."])
         except Exception as e:  # noqa: BLE001 - mail is already persisted
             log(f"WARN nudge failed, mail is in the inbox: {e!r}")
+    # RECOVERY SCAN, independent of the current poll window: a crash between the
+    # inbox write and the mark leaves stage=intent, and the source may never appear
+    # in a window again. Reconcile each persisted intent by EXACT message id against
+    # the inbox; found -> delivered (the ACK pass below then retries); absent ->
+    # keep the intent and do NOT ACK (Henry, C2R3).
+    for mid in [k for k, v in led.items() if v.get("stage") == "intent"]:
+        try:
+            landed = already_in_inbox(mid)
+        except Exception as e:  # noqa: BLE001 - an unreadable inbox is not an absence
+            log(f"WARN recovery scan could not read the inbox for {mid}: {e!r}")
+            continue
+        if landed:
+            log(f"RECOVERED {mid} found in the inbox by exact id; marking delivered")
+            mark(led, mid, "delivered")
+        else:
+            log(f"PENDING {mid} intent retained; not in the inbox, not ACKed")
+
     # Receipt-ACK pass: every delivered-but-unacked id, including earlier ticks.
     # A failed ACK is never recorded as sent; it simply retries next tick.
     acked = 0

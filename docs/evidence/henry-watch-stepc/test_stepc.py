@@ -429,3 +429,52 @@ class TestC2R3(Harness):
         self.assertEqual(self.m.read_ledger().get("q1", {}).get("stage"), None,
                          "without a durable record it must not be marked quarantined")
         self.assertEqual(after_ts, before_ts, "and the cursor must not advance")
+
+
+class TestC2R4(Harness):
+    """Henry's C2R3 finding (ah6s2o3): a persisted 'intent' must be reconciled
+    independently of the current poll window, or the ACK is stranded forever."""
+
+    def test_intent_is_reconciled_after_the_source_leaves_the_window(self):
+        self.seed()
+        m = msg("c1", "2026-09-25T01:00:00.000Z", recipient="agent:gas-new", kind="REQUEST")
+        self.window = [m]
+        # crash after the mail is accepted, before the delivered mark
+        real_mark = self.m.mark
+        def crash_after_mail(led, mid, stage, ts=""):
+            real_mark(led, mid, stage, ts)
+            if stage == "delivered":
+                raise RuntimeError("crash between the inbox write and the mark")
+        self.m.mark = lambda led, mid, stage, ts="": (
+            real_mark(led, mid, stage, ts) if stage != "delivered"
+            else (_ for _ in ()).throw(RuntimeError("crash before delivered mark")))
+        try:
+            self.run_tick()
+        except Exception:
+            pass
+        self.m.mark = real_mark
+        led = self.m.read_ledger()
+        self.assertEqual(led["c1"]["stage"], "intent", "precondition: a stranded intent exists")
+        self.assertEqual(len(self.mail), 1, "precondition: the mail was accepted")
+
+        # the source has now scrolled out of the poll window entirely
+        self.window = []
+        # the inbox DOES contain the delivered body, keyed by exact message id
+        self.m.run = lambda cmd: ('[{"description":"message id: c1"}]' if cmd[0] == "bd" else "")
+        self.run_tick()
+        led = self.m.read_ledger()
+        self.assertEqual(self.posts, ["c1"],
+                         "a stranded intent must be reconciled and ACKed from durable state")
+        self.assertEqual(led["c1"]["stage"], "acked", "and reach the terminal state")
+        self.assertEqual(len(self.mail), 1, "without re-delivering the message")
+
+    def test_absent_from_inbox_keeps_intent_and_does_not_ack(self):
+        self.seed()
+        led = {"c2": {"stage": "intent", "ts": "2026-09-25T01:00:00.000Z",
+                      "ack": {"id": "c2", "timestamp": "2026-09-25T01:00:00.000Z", "metadata": {}}}}
+        self.m.write_ledger(led)
+        self.window = []
+        self.m.run = lambda cmd: ('[]' if cmd[0] == "bd" else "")   # not in the inbox
+        self.run_tick()
+        self.assertEqual(self.posts, [], "an unreconciled intent must not be ACKed")
+        self.assertEqual(self.m.read_ledger()["c2"]["stage"], "intent", "and must stay intent")
