@@ -44,8 +44,20 @@ host. You have not verified it live and I do not claim you have.
 ## 2. Consumer inventory
 
 **Provenance of this section: AUTHOR-PROVIDED.** Every row below is my measurement on this host. Henry
-has not independently live-verified it, and the Henry-side half does not exist yet. Treat it as a claim
-to check, not as verified fact.
+has not independently live-verified it. Treat it as a claim to check, not as verified fact.
+
+**CORRECTED 2026-09-25 (Henry, PACKET-a29918a9-RECONCILIATION.md). This section asserted EXCLUSIVITY —
+sole credential holder, nothing else reads or writes the channel, no other session has ACK authority —
+while the SAME section records the key variable present in 15 sessions. Those cannot both stand.**
+Every claim below is now classified as **OBSERVED USE** or **CAPABILITY / PRINCIPAL UNKNOWN**, because
+variable presence proves neither a shared key VALUE nor confinement. Nothing here establishes that only
+the adapter and the Mayor CAN post; it establishes only what was observed doing so.
+
+**The Henry-side half EXISTS** as retained source and configuration slices consolidated in his
+`UNRESOLVED-AUTHORITY-MATRIX.md` — an earlier version of this sentence said it did not exist, which was
+true when written and is not now. Its residuals, which are what remain open rather than missing:
+resident execution attribution, effective principal and configuration, and fresh pre-cutover
+launch-surface evidence.
 
 Scope swept: this host's user crontab, `systemctl --user` units, running processes, the town's tmux
 sessions, and every tracked file under `~/gt/bin`, `~/bin`, `~/.local/bin`, `~/gt/ci-runner` and the
@@ -54,10 +66,13 @@ gastown source referencing the liveop credential or the channel operations.
 ### Holds the liveop credential or calls the channel API
 | consumer | scope | authority | conflict? |
 |---|---|---|---|
-| `gt-henry-watch` (this adapter) | `#dev`, recipient `agent:gas-new` | reads the channel; writes receipt ACKs; writes Gastown mail to `mayor/`; nudges `mayor` | SOLE. No other consumer on this host holds the credential. |
+| `gt-henry-watch` (this adapter) | `#dev`, recipient `agent:gas-new` | reads the channel; writes receipt ACKs; writes Gastown mail to `mayor/`; nudges `mayor` | **OBSERVED** as the only scheduled consumer. NOT sole-by-capability — see the credential row below. |
 | `gt-henry-watch.bak-*` ×2 | none | not scheduled, not on PATH; rollback copies only | no |
 
-**Nothing else on this host reads or writes the live-op channel.** Verified by content grep, not by name.
+**OBSERVED USE: no other scheduled job or tracked script on this host reads or writes the live-op
+channel.** Established by content grep over the swept scope, not by name. **THIS IS NOT CONFINEMENT:** it
+is an absence in what I could enumerate, and it says nothing about what a resident session could do with a
+credential its environment already carries. Capability and effective principal are UNKNOWN.
 
 ### Other scheduled jobs (same UID, no channel access)
 | job | touches | conflict? |
@@ -69,9 +84,13 @@ gastown source referencing the liveop credential or the channel operations.
 | `gt-scratch-reap` (hourly, deacon) | `/tmp/claude-1001` scratch | no |
 
 ### Same-UID agent processes
-15 tmux sessions run as `marccressall`, the same UID as the adapter. **None reads `#dev`**; each reads its
-own Gastown mailbox. The Mayor session is the only consumer of `mayor/` mail, and it is the intended
-recipient of everything this adapter delivers.
+15 tmux sessions run as `marccressall`, the same UID as the adapter. **OBSERVED: none was seen reading
+`#dev`**; each reads its own Gastown mailbox. **CAPABILITY UNKNOWN: each carries `LIVEOP_API_KEY` in its
+environment, so none is EXCLUDED from doing so, and channel posts carry no process attribution that could
+settle it retrospectively.** Whether that variable resolves to the same principal as the adapter's binding
+is UNRESOLVED and needs one read-only call Marc has not authorised. The Mayor session is the only observed
+consumer of `mayor/` mail and the intended recipient of everything this adapter delivers; ACK authority is
+likewise observed-use, not established exclusivity.
 
 ### Shared domains, stated as risks rather than dismissed
 - **credential**: one API key. **CORRECTED 2026-09-25 — my earlier claim that it was held only by this
