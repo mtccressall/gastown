@@ -437,6 +437,29 @@ func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 // very next run — a mass delete, which CLAUDE.md reserves — and it makes the
 // compactor a second path to a deletion that the standing `bd mol wisp gc
 // --closed --force` suspension in the town patrol formulas currently blocks.
+//
+// WHAT "A MASS DELETE" ACTUALLY MEANS HERE, measured 2026-09-26 against the live
+// town store (46,489 ephemeral rows). The sentence above is accurate and it
+// understates the part CLAUDE.md names explicitly, so the census is inline
+// rather than on a bead — whoever weighs this decision reads this comment, not
+// gt-m7z:
+//
+//	DELETE  (closed past TTL)      32,208  including 1,481 gt:message MAIL
+//	                                       and 54 carrying NOTES
+//	PROMOTE (non-closed past TTL)  14,202  including 214 UNREAD MAIL, which
+//	                                       become permanent issues
+//
+// CLAUDE.md reserves mail deletion to Marc by name and attaches a prior data
+// loss to it (gt-tfr). So this interlock is not only protecting "wisps" — it is
+// the only thing keeping an unattended every-cycle patrol step from deleting the
+// town's mail archive.
+//
+// AND THE TIERED TTL POLICY HAS NEVER BEEN IN EFFECT, which changes what step 3
+// below is asking. Only 18 of 46,494 ephemeral rows carry wisp_type at all
+// (values: null and "escalation"), so getTTL falls through to "default" for
+// everything and heartbeat 6h / patrol 24h / recovery 7d are all inert. Step 3
+// is therefore not confirming a policy that has been working; it is choosing one
+// for the first time, against a population that accumulated under a uniform 24h.
 // The compactor is not covered by that suspension only because it cannot see
 // wisps; widening the scan silently lifts a protection left in place on purpose.
 //
