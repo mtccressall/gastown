@@ -233,13 +233,38 @@ func (r *Router) ensureCustomTypes(beadsDir string) error {
 	return nil
 }
 
+// fromLabel builds the sender label, NORMALISED the same way the assignee is.
+//
+// The two fields carried OPPOSITE conventions on the same bead: the assignee got
+// AddressToIdentity (which drops the role segment) while this label got the raw
+// address (which keeps it). Measured 2026-09-27 on one polecat, and they were
+// exact complements:
+//
+//	assignee == "liveop/atom"            211     from:liveop/atom             0
+//	assignee == "liveop/polecats/atom"     0     from:liveop/polecats/atom  211
+//
+// 14 of 43 distinct senders carried the segment, across three rigs, so the split
+// was general rather than one agent's.
+//
+// THE COST WAS A CHECK THAT COULD NOT PASS: CLAUDE.md's mail-parity predicate
+// binds ONE name and uses it as an assignee value in one conjunct and a from-label
+// value in the other, so for a polecat ONE CONJUNCT ALWAYS RETURNED ZERO — and the
+// zero landed in the replies-sent term, manufacturing a debt for a correspondent
+// answered every time (gt-xo2jz).
+//
+// Historical labels keep the old spelling, so a query over existing mail must
+// still tolerate both. This stops the divergence growing; it does not rewrite it.
+func fromLabel(from string) string {
+	return "from:" + AddressToIdentity(from)
+}
+
 func (r *Router) buildLabels(msg *Message) []string {
 	var labels []string
 	labels = append(labels, "gt:message")
 	if msg.Type == TypeEscalation {
 		labels = append(labels, "gt:escalation")
 	}
-	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, fromLabel(msg.From))
 	labels = append(labels, "msg-type:"+string(msg.Type))
 	labels = append(labels, DeliverySendLabels()...)
 	if msg.ThreadID != "" {
@@ -1284,7 +1309,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 	// Build labels for type, from/thread/reply-to/cc plus queue metadata
 	var labels []string
 	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, fromLabel(msg.From))
 	labels = append(labels, "queue:"+queueName)
 	labels = append(labels, DeliverySendLabels()...)
 	if msg.ThreadID != "" {
@@ -1369,7 +1394,7 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	// fan-out copies go through sendToSingle which adds delivery tracking.
 	var labels []string
 	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, fromLabel(msg.From))
 	labels = append(labels, "announce:"+announceName)
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
@@ -1455,7 +1480,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 	// through sendToSingle which adds delivery tracking.
 	var labels []string
 	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, fromLabel(msg.From))
 	labels = append(labels, "channel:"+channelName)
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
