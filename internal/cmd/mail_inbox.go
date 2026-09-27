@@ -70,9 +70,21 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Human-readable output
+	// PRINT THE IDENTITY THAT WAS QUERIED, NOT THE ADDRESS THAT WAS TYPED.
+	//
+	// A polecat's address is "<rig>/polecats/<name>" and AddressToIdentity
+	// normalises it to "<rig>/<name>", which is what the assignee field stores
+	// and what every query below actually used. Printing the raw address made the
+	// header disagree with the store: CLAUDE.md prescribes an EQUALITY predicate
+	// for "your mail", and a reader who fed it the name this line printed got a
+	// clean zero at rc=0 — measured 198 gt:message beads at "liveop/atom" against
+	// 0 at "liveop/polecats/atom" (gt-xo2jz).
+	//
+	// The operator in that prescription was right and the OPERAND was wrong, and
+	// the operand came from this header. Mail delivery and retrieval were never
+	// affected; only the value a reader would copy.
 	fmt.Printf("%s Inbox: %s (%d messages, %d unread)\n\n",
-		style.Bold.Render("📬"), address, total, unread)
+		style.Bold.Render("📬"), mailbox.Identity(), total, unread)
 
 	if len(messages) == 0 {
 		fmt.Printf("  %s\n", style.Dim.Render("(no messages)"))
