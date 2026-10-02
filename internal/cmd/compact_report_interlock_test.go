@@ -43,3 +43,42 @@ func TestDigestIsSilentOnceTheCompactorActs(t *testing.T) {
 		t.Errorf("claimed an interlock while reporting 7 deletions:\n%s", got)
 	}
 }
+
+// PLACEMENT, NOT PRESENCE — and mayor/ is right that the tests above do not cover
+// it. They assert detectAnomalies RETURNS the line; they say nothing about whether
+// it reaches the body the mail actually carries. The received bead it measured was
+// 209 chars — H2, Summary heading, three-row table, and no "hidden" anywhere — so
+// the control it needed had never been in front of it.
+//
+// This asserts the rendered digest, which is what formatDailyDigest returns and
+// what gets mailed. If the line emits only to stdout or JSON, this fails.
+func TestTheInterlockLineReachesTheMAILEDDigestBody(t *testing.T) {
+	// Run the REAL sequence the command runs: detect, assign, then render.
+	// compact_report.go:225 does `report.Anomalies = detectAnomalies(report)`
+	// and formatDailyDigest renders report.Anomalies — my first version of this
+	// test skipped the assignment and failed, which looked like the fix missing
+	// the mail body when it was the test missing a step. mayor/ was right to ask
+	// for placement; the first answer the question produced was my own bug.
+	r := reportWith(60439, 0, 0)
+	r.Anomalies = detectAnomalies(r)
+	body := formatDailyDigest(r)
+
+	if !strings.Contains(body, "### Anomalies") {
+		t.Fatalf("the digest body has no Anomalies section at all:\n%s", body)
+	}
+	for _, want := range []string{"INERT BY DESIGN", "60439", "gastown-mq9", "--include-infra"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the MAILED body is missing %q — a reader gets the zeros with no explanation:\n%s", want, body)
+		}
+	}
+}
+
+// And the negative control for placement: on an ordinary day the body must NOT
+// grow an Anomalies section, or every digest acquires a permanent warning.
+func TestTheMAILEDDigestStaysCleanOnAnOrdinaryDay(t *testing.T) {
+	r := reportWith(0, 3, 1)
+	r.Anomalies = detectAnomalies(r)
+	if body := formatDailyDigest(r); strings.Contains(body, "INERT BY DESIGN") {
+		t.Errorf("the mailed body claims an interlock on a working compactor:\n%s", body)
+	}
+}
