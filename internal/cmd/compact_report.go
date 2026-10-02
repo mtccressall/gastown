@@ -71,6 +71,24 @@ var categoryOrder = []string{"Heartbeats", "Patrols", "Errors", "Untyped"}
 
 const zeroPatrolReportingGap = "0 eligible patrol wisps in the report query/window (patrol health not assessed)"
 
+// compactorInertByDesign explains a 0/0 digest IN THE DIGEST, because three
+// zeros over a 60k population is indistinguishable from a broken probe and a
+// reader has no way to tell from the numbers alone.
+//
+// listWisps deliberately omits --include-infra, so the compactor sees no wisps
+// and reports 0 deleted / 0 promoted every day. That is an interlock, not a
+// defect: enabling it arms a mass delete that CLAUDE.md reserves (gastown-mq9,
+// CLOSED, "decision needed before enabling").
+//
+// WITHOUT THIS LINE THE DIGEST IS UNINTERPRETABLE AND THE QUESTION RECURS. Two
+// separate mayor/ sessions raised the same correct suspicion — "a probe that
+// does not move when the data moves" — days apart, because a respawning agent
+// reads the digest with no memory of the answer. The second had already
+// pre-empted itself with the honest alternative ("nothing may be eligible") and
+// could not exclude it from outside. Neither was careless; the digest simply did
+// not carry its own explanation.
+const compactorInertByDesign = "compactor INERT BY DESIGN — listWisps omits --include-infra, so it scanned 0 of %d ephemeral rows. 0 deleted / 0 promoted is EXPECTED, not a broken probe (gastown-mq9, CLOSED: decision needed before enabling)."
+
 // categoryStats tracks per-category compaction statistics.
 type categoryStats struct {
 	Deleted  int `json:"deleted"`
@@ -84,7 +102,11 @@ type compactReport struct {
 	Categories map[string]*categoryStats `json:"categories"`
 	Promotions []compactAction           `json:"promotions,omitempty"`
 	Anomalies  []string                  `json:"anomalies,omitempty"`
-	Errors     []string                  `json:"errors,omitempty"`
+	// HiddenWisps is the population the compactor could NOT see. It is the
+	// positive control for the zeros beside it: nonzero here with 0/0 above
+	// means the interlock, not a failure.
+	HiddenWisps int      `json:"hidden_wisps"`
+	Errors      []string `json:"errors,omitempty"`
 }
 
 // weeklyRollup aggregates daily reports for trend data.
@@ -262,9 +284,10 @@ func listReportWisps(bd *beads.Beads) ([]*compactIssue, error) {
 // buildReport aggregates compaction results by category.
 func buildReport(dateStr string, result *compactResult, activeWisps []*compactIssue) *compactReport {
 	report := &compactReport{
-		Date:       dateStr,
-		Categories: make(map[string]*categoryStats),
-		Errors:     result.Errors,
+		Date:        dateStr,
+		Categories:  make(map[string]*categoryStats),
+		Errors:      result.Errors,
+		HiddenWisps: result.HiddenWisps,
 	}
 
 	// Initialize all categories
@@ -308,6 +331,17 @@ func wispTypeToCategory(wispType, title string) string {
 // detectAnomalies checks for unusual patterns in the compaction data.
 func detectAnomalies(report *compactReport) []string {
 	var anomalies []string
+	// State the interlock FIRST, so a reader meets the explanation before the
+	// zeros rather than after rediscovering them.
+	acted := 0
+	for _, cat := range categoryOrder {
+		if st := report.Categories[cat]; st != nil {
+			acted += st.Deleted + st.Promoted
+		}
+	}
+	if acted == 0 && report.HiddenWisps > 0 {
+		anomalies = append(anomalies, fmt.Sprintf(compactorInertByDesign, report.HiddenWisps))
+	}
 
 	for _, cat := range categoryOrder {
 		stats := report.Categories[cat]
